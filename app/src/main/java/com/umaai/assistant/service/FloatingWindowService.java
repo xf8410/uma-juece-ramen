@@ -124,6 +124,8 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                 int hp = g.optInt("HP"); if (hp != 0) out.append(" HP").append(hp > 0 ? "+" : "").append(hp);
             }
             int failure = tr.optInt("failure_rate", 0); if (failure > 0) out.append(" 失败").append(failure).append('%');
+            int heads = tr.optInt("heads", 0); if (heads > 0) out.append(" 头").append(heads);
+            int shining = tr.optInt("shining", 0); if (shining > 0) out.append(" 光").append(shining);
         }
         return out.toString();
     }
