@@ -1,13 +1,4 @@
 //! 拉面杯手写策略 — 阈值/系数版（借鉴 hzyhhzy/UmaAi 通用逻辑）
-//!
-//! 核心策略：
-//! 1. 开局前2回合优先普通外出提升心情到绝好调（1.1x 训练倍率）
-//! 2. 体力分段估值：≤50 = 2.0x/点, 50-70 = 1.5x, 70+ = 1.0x
-//! 3. 属性软截断：接近上限时训练价值骤降（statusSoftFunction）
-//! 4. 羁绊独立价值：每个支援卡羁绊<80 时每点 12 分
-//! 5. 失败率分级：>20% 大失败(-500), ≤20% 小失败(-150)
-//! 6. 友人卡分层：未点击=150, 羁绊<60=100, ≥60=40
-//! 7. 库存满优先吃面
 
 use anyhow::Result;
 use rand::prelude::StdRng;
@@ -21,33 +12,22 @@ use umasim::gamedata::EventChoice;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RamenStrategy {
-    // ── 训练决策 ──
     pub head_weight: f64,
     pub shining_weight: f64,
     pub failure_penalty: f64,
     pub big_fail_penalty: f64,
     pub jiban_value: f64,
     pub status_soft_cap: f64,
-
-    // ── 休息/外出 ──
     pub vital_rest_threshold: i32,
     pub motivation_outing_threshold: i32,
     pub friend_outing_score: f64,
     pub outing_motivation_bonus: f64,
-
-    // ── 万能材料管理 ──
     pub special_overflow_threshold: i32,
-
-    // ── 吃面决策 ──
     pub feeling_overflow_threshold: i32,
     pub rmj_urgency_margin: i32,
     pub no_ramen_base_score: f64,
     pub eat_ramen_base_score: f64,
-
-    // ── 友人点击 ──
     pub friend_click_bonus: f64,
-
-    // ── 事件选项 ──
     pub event_vital_bonus: f64,
     pub event_motivation_bonus: f64,
 }
@@ -164,7 +144,6 @@ impl RamenStrategy {
         -targets.iter().sum::<i32>() as f64
     }
 
-    /// 体力分段估值（借鉴 hzyhhzy）
     fn vital_evaluation(vital: i32, max_vital: i32) -> f64 {
         if vital <= 50 { 2.0 * vital as f64 }
         else if vital <= 70 { 100.0 + 1.5 * (vital - 50) as f64 }
@@ -172,7 +151,6 @@ impl RamenStrategy {
         else { Self::vital_evaluation(max_vital, max_vital) }
     }
 
-    /// 属性软截断（借鉴 hzyhhzy statusSoftFunction）
     fn status_soft(x: f64, reserve: f64) -> f64 {
         let r_inv = 1.0 / (2.0 * reserve);
         if x >= 0.0 { 0.0 }
@@ -247,7 +225,7 @@ impl RamenStrategy {
         let fail_rate = game.calc_training_failure_rate(&buffs, train) as f64;
         let value = game.calc_training_value(&buffs, train).unwrap_or_default();
 
-        // ── 属性增益 + 软截断 ──
+        // 属性增益 + 软截断
         let five_status = &game.uma().five_status;
         let five_status_limit = &game.uma().five_status_limit;
         let remain_turn = 78 - game.base.turn;
@@ -255,7 +233,7 @@ impl RamenStrategy {
         let final_bonus = 45.0;
 
         let mut status_score = 0.0;
-        for sta in 0..5 {
+        for sta in 0..5usize {
             let remain = (five_status_limit[sta] - five_status[sta]) as f64 - final_bonus;
             let s0 = Self::status_soft(-remain, reserve);
             let s1 = Self::status_soft(value.status_pt[sta] as f64 - remain, reserve);
@@ -267,9 +245,11 @@ impl RamenStrategy {
             + heads as f64 * self.head_weight
             + shining as f64 * self.shining_weight;
 
-        // ── 羁绊价值 ──
-        for j in 0..5 {
-            let pi = match game.distribution().get(train).and_then(|d| d.get(j)) {
+        // 羁绊价值
+        let dist = game.distribution();
+        let dist_train: &Vec<i32> = dist.get(train).unwrap_or(&Vec::new());
+        for j in 0..5usize {
+            let pi = match dist_train.get(j) {
                 Some(&p) if p >= 0 && (p as usize) < game.persons().len() => p as usize,
                 _ => break,
             };
@@ -278,38 +258,32 @@ impl RamenStrategy {
                 match game.friend.out_state {
                     FriendOutState::UnClicked => score += 150.0,
                     _ => {
-                        let fr = person.friendship;
-                        if fr < 60 { score += 100.0; }
+                        if person.friendship < 60 { score += 100.0; }
                         else { score += 40.0; }
                     }
                 }
             } else if person.person_type == PersonType::Card {
-                let fr = person.friendship;
-                if fr < 80 {
+                if person.friendship < 80 {
                     let mut jiban_add = 7.0;
                     if game.uma().flags.aijiao { jiban_add += 2.0; }
                     if person.is_hint { jiban_add += 5.0; }
-                    jiban_add = jiban_add.min((80 - fr) as f64);
+                    jiban_add = jiban_add.min((80 - person.friendship) as f64);
                     score += jiban_add * self.jiban_value;
                 }
-                if person.is_hint {
-                    score += 8.0;
-                }
+                if person.is_hint { score += 8.0; }
             }
         }
 
         // 友人未点击时额外加分
         if game.friend.out_state == FriendOutState::UnClicked {
-            let has_friend = game.distribution().get(train)
-                .map(|d| d.iter().any(|&p| {
-                    p >= 0 && (p as usize) < game.persons().len()
-                        && game.persons()[p as usize].person_type == PersonType::ScenarioCard
-                }))
-                .unwrap_or(false);
+            let has_friend = dist_train.iter().any(|&p| {
+                p >= 0 && (p as usize) < game.persons().len()
+                    && game.persons()[p as usize].person_type == PersonType::ScenarioCard
+            });
             if has_friend { score += self.friend_click_bonus; }
         }
 
-        // ── 失败率分级 ──
+        // 失败率分级
         if fail_rate > 0.0 {
             let big_fail_prob = if fail_rate > 20.0 { fail_rate } else { 0.0 };
             let fail_value_avg = 0.01 * big_fail_prob * (-self.big_fail_penalty)
@@ -317,7 +291,7 @@ impl RamenStrategy {
             score = 0.01 * fail_rate * fail_value_avg + (1.0 - 0.01 * fail_rate) * score;
         }
 
-        // ── 体力变化 ──
+        // 体力变化
         let vital_after = (game.uma().vital + value.vital).max(0).min(max_vital);
         let vital_change = Self::vital_evaluation(vital_after, max_vital) - vital_before;
         score += vital_change * 0.3;
