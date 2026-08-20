@@ -1,3 +1,4 @@
+// 项目根目录的 build.gradle
 buildscript {
     repositories {
         google()

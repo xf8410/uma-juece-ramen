@@ -3,10 +3,18 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+// Read secrets from secrets.properties (gitignored)
+def secretsProps = new Properties()
+def secretsFile = rootProject.file('secrets.properties')
+if (secretsFile.exists()) {
+    secretsProps.load(new FileInputStream(secretsFile))
+}
+
 android {
     namespace 'com.umaai.assistant'
     compileSdk 34
 
+    // AGP 8+ requires explicit opt-in for BuildConfig
     buildFeatures {
         buildConfig true
     }
@@ -15,13 +23,32 @@ android {
         applicationId "com.umaai.assistant"
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName "0.1.0-ramen"
-        buildConfigField "String", "SCENARIO_ID", '"Ramen"'
+        versionCode 13306
+        versionName "1.33.6"
+
+        // Inject GitHub token at build time — not in source code
+        // ★ 安全警告: Token 编译进 APK 可被反编译提取
+        // 长期方案: 改用后端代理上传，不在 APK 中存储可写 Token
+        // 短期缓解: 使用 fine-grained token, 只允许 uma-data, 最小权限, 短有效期
+        def dataUploadToken = System.getenv("DATA_UPLOAD_TOKEN") ?: secretsProps.getProperty('GITHUB_TOKEN', '')
+        buildConfigField "String", "GITHUB_TOKEN", "\"${dataUploadToken}\""
+    }
+
+    signingConfigs {
+        release {
+            def ksPath = System.getenv("ANDROID_KEYSTORE_PATH")
+            if (ksPath) {
+                storeFile file(ksPath)
+                storePassword System.getenv("ANDROID_STORE_PASSWORD")
+                keyAlias System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword System.getenv("ANDROID_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         release {
+            signingConfig signingConfigs.release
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
@@ -39,9 +66,15 @@ android {
 
 dependencies {
     implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'androidx.documentfile:documentfile:1.0.1'
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.google.android.material:material:1.11.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
     implementation 'org.nanohttpd:nanohttpd:2.3.1'
+    implementation 'androidx.localbroadcastmanager:localbroadcastmanager:1.1.0'
     testImplementation 'junit:junit:4.13.2'
+    // Real org.json for local unit tests: the mockable android.jar stub
+    // throws "not mocked" at runtime, and its JSONException is a checked
+    // exception (Maven org.json's is unchecked since 20231013).
     testImplementation 'org.json:json:20240303'
 }
