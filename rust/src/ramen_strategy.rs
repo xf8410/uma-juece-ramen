@@ -1,11 +1,11 @@
-//! 拉面杯手写策略 — 阈值/系数版（最小新增：仅 vital_eval + 外出加分）
+//! 拉面杯手写策略。
 
 use anyhow::Result;
 use rand::prelude::StdRng;
 use serde::{Deserialize, Serialize};
 
 use umasim::game::{
-    FriendOutState, Game, PersonType, Trainer,
+    FriendOutState, Game, Person, PersonType, Trainer,
     ramen::{Operation, RamenAction, RamenGame, RamenStage, TrainingType},
 };
 use umasim::gamedata::EventChoice;
@@ -59,50 +59,80 @@ impl Default for RamenStrategy {
 
 impl Trainer<RamenGame> for RamenStrategy {
     fn select_action(
-        &self, game: &RamenGame, actions: &[RamenAction], _rng: &mut StdRng,
+        &self,
+        game: &RamenGame,
+        actions: &[RamenAction],
+        _rng: &mut StdRng,
     ) -> Result<usize> {
-        if actions.len() <= 1 { return Ok(0); }
+        if actions.len() <= 1 {
+            return Ok(0);
+        }
         let scores: Vec<f64> = actions.iter().map(|a| self.score_action(game, a)).collect();
-        let best = scores.iter().enumerate()
+        let best = scores
+            .iter()
+            .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i).unwrap_or(0);
+            .map(|(i, _)| i)
+            .unwrap_or(0);
         Ok(best)
     }
 
     fn select_choice(
-        &self, game: &RamenGame, choices: &[Vec<EventChoice>], _rng: &mut StdRng,
+        &self,
+        game: &RamenGame,
+        choices: &[Vec<EventChoice>],
+        _rng: &mut StdRng,
     ) -> Result<usize> {
-        if choices.is_empty() { return Ok(0); }
+        if choices.is_empty() {
+            return Ok(0);
+        }
         let vital = game.uma().vital;
         let motivation = game.uma().motivation;
         let five_status = &game.uma().five_status;
-        let min_stat_idx = (0..5usize).min_by(|&a, &b| five_status[a].cmp(&five_status[b])).unwrap_or(0);
+        let min_stat_idx = (0..5usize)
+            .min_by(|&a, &b| five_status[a].cmp(&five_status[b]))
+            .unwrap_or(0);
         let vital_low = vital < self.vital_rest_threshold;
         let motivation_low = motivation < self.motivation_outing_threshold;
-        let scores: Vec<f64> = choices.iter().map(|option| {
-            if option.is_empty() { return 0.0; }
-            let choice = &option[0];
-            let v = &choice.value;
-            let mut score = 0.0;
-            if vital_low && v.vital > 0 { score += self.event_vital_bonus; }
-            if motivation_low && v.motivation > 0 { score += self.event_motivation_bonus; }
-            if !vital_low && !motivation_low {
-                if v.status_pt.len() > min_stat_idx && v.status_pt[min_stat_idx] > 0 {
-                    score += v.status_pt[min_stat_idx] as f64;
+        let scores: Vec<f64> = choices
+            .iter()
+            .map(|option| {
+                if option.is_empty() {
+                    return 0.0;
                 }
-                for i in 0..5 {
-                    if i != min_stat_idx && v.status_pt.len() > i && v.status_pt[i] > 0 {
-                        score += v.status_pt[i] as f64 * 0.3;
+                let v = &option[0].value;
+                let mut score = 0.0;
+                if vital_low && v.vital > 0 {
+                    score += self.event_vital_bonus;
+                }
+                if motivation_low && v.motivation > 0 {
+                    score += self.event_motivation_bonus;
+                }
+                if !vital_low && !motivation_low {
+                    if v.status_pt[min_stat_idx] > 0 {
+                        score += v.status_pt[min_stat_idx] as f64;
+                    }
+                    for i in 0..5 {
+                        if i != min_stat_idx && v.status_pt[i] > 0 {
+                            score += v.status_pt[i] as f64 * 0.3;
+                        }
                     }
                 }
-            }
-            if v.vital > 0 && !vital_low { score += v.vital as f64 * 0.5; }
-            if v.motivation > 0 && !motivation_low { score += v.motivation as f64 * 0.5; }
-            score
-        }).collect();
-        let best = scores.iter().enumerate()
+                if v.vital > 0 && !vital_low {
+                    score += v.vital as f64 * 0.5;
+                }
+                if v.motivation > 0 && !motivation_low {
+                    score += v.motivation as f64 * 0.5;
+                }
+                score
+            })
+            .collect();
+        let best = scores
+            .iter()
+            .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i).unwrap_or(0);
+            .map(|(i, _)| i)
+            .unwrap_or(0);
         Ok(best)
     }
 }
@@ -111,7 +141,7 @@ impl RamenStrategy {
     fn score_action(&self, game: &RamenGame, action: &RamenAction) -> f64 {
         match game.stage {
             RamenStage::RamenSelect => self.score_ramen_select(game, action),
-            RamenStage::SpecialSelect => self.score_special_select(game, action),
+            RamenStage::SpecialSelect => self.score_special_select(action),
             RamenStage::Train => self.score_train(game, action),
             _ => 0.0,
         }
@@ -122,72 +152,87 @@ impl RamenStrategy {
         if action.ramen.is_none() {
             let overflow_penalty = if stock_total >= self.feeling_overflow_threshold {
                 (stock_total - self.feeling_overflow_threshold) as f64 * 20.0
-            } else { 0.0 };
+            } else {
+                0.0
+            };
             return self.no_ramen_base_score - overflow_penalty;
         }
         let mut score = self.eat_ramen_base_score;
-        if stock_total >= self.feeling_overflow_threshold { score += 30.0; }
+        if stock_total >= self.feeling_overflow_threshold {
+            score += 30.0;
+        }
         let year = game.current_year() as usize;
         let pt = game.ramen.scenario_pt;
         let rmj_targets = [1500, 3000, 3500];
         if year < rmj_targets.len() {
-            let target = rmj_targets[year];
-            let gap = target - pt;
-            if gap > 0 && gap <= self.rmj_urgency_margin { score += 40.0; }
-            if gap <= 0 { score += 10.0; }
+            let gap = rmj_targets[year] - pt;
+            if gap > 0 && gap <= self.rmj_urgency_margin {
+                score += 40.0;
+            }
+            if gap <= 0 {
+                score += 10.0;
+            }
         }
         score
     }
 
-    fn score_special_select(&self, _game: &RamenGame, action: &RamenAction) -> f64 {
+    fn score_special_select(&self, action: &RamenAction) -> f64 {
         let targets = action.special_targets.unwrap_or([0, 0, 0]);
         -targets.iter().sum::<i32>() as f64
     }
 
     fn vital_eval(vital: i32, max_vital: i32) -> f64 {
-        let v = vital.max(0).min(max_vital.max(0));
-        if v <= 50 { 2.0 * v as f64 }
-        else if v <= 70 { 100.0 + 1.5 * (v - 50) as f64 }
-        else { 130.0 + (v - 70) as f64 }
+        let v = vital.clamp(0, max_vital.max(0));
+        if v <= 50 {
+            2.0 * v as f64
+        } else if v <= 70 {
+            100.0 + 1.5 * (v - 50) as f64
+        } else {
+            130.0 + (v - 70) as f64
+        }
     }
 
     fn score_train(&self, game: &RamenGame, action: &RamenAction) -> f64 {
         let vital = game.uma().vital;
         let max_vital = game.uma().max_vital;
         let motivation = game.uma().motivation;
-        let turn = game.base.turn;
-        let is_early = turn < 2;
+        let is_early = game.base.turn < 2;
         let not_best = motivation < 5;
         let vital_before = Self::vital_eval(vital, max_vital);
 
         match &action.operation {
-            Operation::Train(train_type) => {
-                self.score_training(game, *train_type)
-            }
+            Operation::Train(train_type) => self.score_training(game, *train_type),
             Operation::Rest => {
                 let vital_after = (vital + 50).min(max_vital);
                 let gain = Self::vital_eval(vital_after, max_vital) - vital_before;
                 let mut score = gain * 0.5;
-                if is_early && vital > 15 { score *= 0.3; }
+                if is_early && vital > 15 {
+                    score *= 0.3;
+                }
                 score
             }
             Operation::NormalOuting => {
                 let deficit = (self.motivation_outing_threshold - motivation).max(0) as f64;
                 let mut score = 20.0 + deficit * 25.0;
-                if not_best { score += self.outing_motivation_bonus; }
-                if is_early && not_best { score += 80.0; }
+                if not_best {
+                    score += self.outing_motivation_bonus;
+                }
+                if is_early && not_best {
+                    score += 80.0;
+                }
                 score
             }
             Operation::FriendOuting => {
-                let special = game.ramen.special_feeling;
-                let all_used = game.friend.out_used.iter().all(|&b| b);
-                if all_used { return 0.0; }
-                if special >= self.special_overflow_threshold {
+                if game.friend.out_used.iter().all(|&b| b) {
+                    return 0.0;
+                }
+                if game.ramen.special_feeling >= self.special_overflow_threshold {
                     return self.friend_outing_score * 0.1;
                 }
                 let mut score = self.friend_outing_score;
-                let used = game.friend.out_used.iter().filter(|&&b| b).count();
-                if used < 2 { score += 15.0; }
+                if game.friend.out_used.iter().filter(|&&b| b).count() < 2 {
+                    score += 15.0;
+                }
                 if is_early && game.friend.out_state == FriendOutState::UnClicked {
                     score += 30.0;
                 }
@@ -204,15 +249,23 @@ impl RamenStrategy {
 
     fn score_training(&self, game: &RamenGame, train_type: TrainingType) -> f64 {
         let train = train_type as usize;
+        let person_indices: Vec<usize> = game
+            .distribution()
+            .get(train)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&p| p >= 0 && (p as usize) < game.persons().len())
+            .map(|p| p as usize)
+            .collect();
 
-        let heads = game.distribution().get(train)
-            .map(|d| d.iter().filter(|&&p| {
-                p >= 0 && (p as usize) < game.persons().len()
-                    && game.persons()[p as usize].person_type != PersonType::Reporter
-                    && game.persons()[p as usize].person_type != PersonType::Yayoi
-            }).count())
-            .unwrap_or(0);
-
+        let heads = person_indices
+            .iter()
+            .filter(|&&p| {
+                let ty = game.persons()[p].person_type();
+                ty != PersonType::Reporter && ty != PersonType::Yayoi
+            })
+            .count();
         let shining = game.shining_count(train);
         let buffs = game.calc_training_buff(train).unwrap_or_default();
         let fail_rate = game.calc_training_failure_rate(&buffs, train) as f64;
@@ -224,14 +277,44 @@ impl RamenStrategy {
             + shining as f64 * self.shining_weight
             - fail_rate * self.failure_penalty;
 
+        for &index in &person_indices {
+            let person = &game.persons()[index];
+            match person.person_type() {
+                PersonType::ScenarioCard => {
+                    score += match game.friend.out_state {
+                        FriendOutState::UnClicked => 150.0,
+                        _ if person.friendship() < 60 => 100.0,
+                        _ => 40.0,
+                    };
+                }
+                PersonType::Card if person.friendship() < 80 => {
+                    let mut gain: f64 = 7.0;
+                    if game.uma().flags.aijiao {
+                        gain += 2.0;
+                    }
+                    if person.hint() {
+                        gain += 5.0;
+                    }
+                    gain = gain.min((80 - person.friendship()) as f64);
+                    score += gain * self.jiban_value;
+                    if person.hint() {
+                        score += 8.0;
+                    }
+                }
+                PersonType::Card if person.hint() => {
+                    score += 8.0;
+                }
+                _ => {}
+            }
+        }
+
         if game.friend.out_state == FriendOutState::UnClicked {
-            let has_friend = game.distribution().get(train)
-                .map(|d| d.iter().any(|&p| {
-                    p >= 0 && (p as usize) < game.persons().len()
-                        && game.persons()[p as usize].person_type == PersonType::ScenarioCard
-                }))
-                .unwrap_or(false);
-            if has_friend { score += self.friend_click_bonus; }
+            let has_friend = person_indices
+                .iter()
+                .any(|&p| game.persons()[p].person_type() == PersonType::ScenarioCard);
+            if has_friend {
+                score += self.friend_click_bonus;
+            }
         }
 
         score
