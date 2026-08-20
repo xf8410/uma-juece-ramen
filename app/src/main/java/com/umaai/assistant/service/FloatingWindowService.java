@@ -91,7 +91,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         turnView.setText(turn > 0 ? "第" + turn + "回合" : "拉面杯");
         String ramenAdvice = RamenDecisionSupport.recommend(summary);
         String ai = summary.optJSONObject("ai") != null
-                ? summary.optJSONObject("ai").optString("best", "") : "";
+                ? translateAction(summary.optJSONObject("ai").optString("best", "")) : "";
         recommendView.setText(ai.isEmpty() ? ramenAdvice : "插件推荐：" + ai + " | " + ramenAdvice);
         recommendView.setTextColor(0xFF00FF88);
         statusView.setText("速" + stats.optInt("speed") + " 耐" + stats.optInt("stamina")
@@ -115,7 +115,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
             if (tr == null) continue;
             JSONObject g = tr.optJSONObject("gains");
             if (out.length() > 0) out.append('\n');
-            out.append(shortName(tr.optString("name", "?"))).append(':');
+            out.append(translateAction(tr.optString("name", "?"))).append(':');
             if (g != null) {
                 appendGain(out, "速", g.optInt("Speed")); appendGain(out, "耐", g.optInt("Stamina"));
                 appendGain(out, "力", g.optInt("Power")); appendGain(out, "根", g.optInt("Guts"));
@@ -128,10 +128,22 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     }
 
     private static void appendGain(StringBuilder out, String label, int value) { if (value != 0) out.append(' ').append(label).append(value > 0 ? "+" : "").append(value); }
-    private static String shortName(String name) {
-        if ("Speed".equalsIgnoreCase(name)) return "速"; if ("Stamina".equalsIgnoreCase(name)) return "耐";
-        if ("Power".equalsIgnoreCase(name)) return "力"; if ("Guts".equalsIgnoreCase(name)) return "根";
-        if ("Wisdom".equalsIgnoreCase(name)) return "智"; return name;
+    private static String translateAction(String name) {
+        if (name == null || name.isEmpty()) return name;
+        switch (name.toLowerCase()) {
+            case "speed": return "速";
+            case "stamina": return "耐";
+            case "power": return "力";
+            case "guts": return "根";
+            case "wisdom": case "wiz": return "智";
+            case "rest": return "休息";
+            case "outgoing": case "outing": return "外出";
+            case "outing2": return "外出2";
+            case "outing3": return "外出3";
+            case "outing4": return "外出4";
+            case "kakushimi": return "隐味";
+            default: return name;
+        }
     }
 
     private void createPanel() {

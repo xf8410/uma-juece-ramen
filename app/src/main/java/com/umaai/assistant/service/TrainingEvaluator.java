@@ -5,7 +5,7 @@ import org.json.JSONObject;
 
 /** Fallback only: ranks final runtime gains already calculated by hlpatch. */
 public final class TrainingEvaluator {
-    private static final String[] NAMES = {"Speed", "Stamina", "Power", "Guts", "Wisdom"};
+    private static final String[] NAMES = {"Speed", "Stamina", "Power", "Guts", "Wiz"};
     private static final String[] LABELS = {"速", "耐", "力", "根", "智"};
 
     public String recommend(JSONObject summary) {
