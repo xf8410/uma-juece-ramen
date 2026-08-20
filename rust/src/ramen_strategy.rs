@@ -8,7 +8,7 @@ use rand::prelude::StdRng;
 use serde::{Deserialize, Serialize};
 
 use umasim::game::{
-    BaseAction, Game, PersonType, Trainer,
+    FriendOutState, Game, PersonType, Trainer,
     ramen::{Operation, RamenAction, RamenGame, RamenStage, TrainingType},
 };
 use umasim::gamedata::EventChoice;
@@ -16,38 +16,56 @@ use umasim::gamedata::EventChoice;
 /// 可调参数集
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RamenStrategy {
-    /// 体力低于此值时优先休息
-    pub vital_rest_threshold: i32,
-    /// 干劲低于此值时优先外出
-    pub motivation_outing_threshold: i32,
+    // ── 训练决策 ──
     /// 每个人头的评分权重
     pub head_weight: f64,
-    /// 每个发光的评分权重
+    /// 每个发光的评分权重（发光训练比普通训练多填诀窍槽→多材料→多吃面→多RMJ PT）
     pub shining_weight: f64,
     /// 失败率惩罚系数
     pub failure_penalty: f64,
+
+    // ── 休息/外出 ──
+    /// 体力低于此值时优先休息
+    pub vital_rest_threshold: i32,
+    /// 干劲低于此值时优先普通外出（回干劲，不给材料）
+    pub motivation_outing_threshold: i32,
+    /// 友人外出的基础分（给万能材料×2 + 友人事件，与普通外出完全不同）
+    pub friend_outing_score: f64,
+
+    // ── 万能材料管理 ──
+    /// 万能材料达到此值时不再友人外出（避免溢出）
+    pub special_overflow_threshold: i32,
+
+    // ── 吃面决策 ──
     /// 诀窍库存总数达到此值时优先吃面（避免 FIFO 溢出）
     pub feeling_overflow_threshold: i32,
     /// 距离 RMJ 目标差此值以内时优先吃面
     pub rmj_urgency_margin: i32,
-    /// 不吃面时的基础分（不吃面是保守默认）
+    /// 不吃面时的基础分
     pub no_ramen_base_score: f64,
     /// 吃面时的基础分
     pub eat_ramen_base_score: f64,
+
+    // ── 友人点击 ──
+    /// 友人未点击时，有友人的训练加分（友人必须先点一次才能解锁外出）
+    pub friend_click_bonus: f64,
 }
 
 impl Default for RamenStrategy {
     fn default() -> Self {
         Self {
+            head_weight: 15.0,
+            shining_weight: 40.0,
+            failure_penalty: 2.0,
             vital_rest_threshold: 30,
             motivation_outing_threshold: 4,
-            head_weight: 15.0,
-            shining_weight: 30.0,
-            failure_penalty: 2.0,
+            friend_outing_score: 60.0,
+            special_overflow_threshold: 3,
             feeling_overflow_threshold: 8,
             rmj_urgency_margin: 300,
             no_ramen_base_score: 100.0,
             eat_ramen_base_score: 50.0,
+            friend_click_bonus: 25.0,
         }
     }
 }
@@ -63,7 +81,6 @@ impl Trainer<RamenGame> for RamenStrategy {
             return Ok(0);
         }
 
-        // 按当前阶段评分
         let scores: Vec<f64> = actions
             .iter()
             .map(|a| self.score_action(game, a))
@@ -85,7 +102,7 @@ impl Trainer<RamenGame> for RamenStrategy {
         _choices: &[Vec<EventChoice>],
         _rng: &mut StdRng,
     ) -> Result<usize> {
-        Ok(0) // 事件选项选第一个
+        Ok(0)
     }
 }
 
@@ -95,17 +112,16 @@ impl RamenStrategy {
             RamenStage::RamenSelect => self.score_ramen_select(game, action),
             RamenStage::SpecialSelect => self.score_special_select(game, action),
             RamenStage::Train => self.score_train(game, action),
-            _ => self.score_generic(game, action),
+            _ => 0.0,
         }
     }
 
-    /// RamenSelect 阶段：评估吃哪碗面（含不吃）
+    /// RamenSelect：评估吃哪碗面（含不吃）
     fn score_ramen_select(&self, game: &RamenGame, action: &RamenAction) -> f64 {
         let stock_total: i32 = game.ramen.feeling_stock.iter().sum();
 
         if action.ramen.is_none() {
             // 不吃面
-            // 库存快满了还选择不吃 → 扣分
             let overflow_penalty = if stock_total >= self.feeling_overflow_threshold {
                 (stock_total - self.feeling_overflow_threshold) as f64 * 20.0
             } else {
@@ -133,22 +149,21 @@ impl RamenStrategy {
                 score += 40.0;
             }
             if gap <= 0 {
-                score += 10.0; // 已达标，吃面仍有 PT 价值
+                score += 10.0;
             }
         }
 
         score
     }
 
-    /// SpecialSelect 阶段：选最少隐藏风味用量
+    /// SpecialSelect：选最少隐藏风味用量
     fn score_special_select(&self, _game: &RamenGame, action: &RamenAction) -> f64 {
         let targets = action.special_targets.unwrap_or([0, 0, 0]);
         let used: i32 = targets.iter().sum();
-        // 越少隐藏风味越好（节省资源）
         -used as f64
     }
 
-    /// Train 阶段：评估训练/休息/外出/比赛等
+    /// Train：评估训练/休息/外出/比赛等
     fn score_train(&self, game: &RamenGame, action: &RamenAction) -> f64 {
         let vital = game.uma().vital;
         let motivation = game.uma().motivation;
@@ -158,15 +173,41 @@ impl RamenStrategy {
                 self.score_training(game, *train_type)
             }
             Operation::Rest => {
-                // 体力越低休息越值
                 let deficit = (self.vital_rest_threshold - vital).max(0) as f64;
                 50.0 + deficit * 3.0
             }
-            Operation::NormalOuting | Operation::FriendOuting => {
+            // 普通外出：回干劲，不给材料，与友人外出完全不同
+            Operation::NormalOuting => {
                 let deficit = (self.motivation_outing_threshold - motivation).max(0) as f64;
                 20.0 + deficit * 25.0
             }
-            Operation::Race => 10.0, // 比赛一般不如训练
+            // 友人外出：给万能材料×2 + 友人事件，与普通外出完全不同
+            Operation::FriendOuting => {
+                let special = game.ramen.special_feeling;
+                let used = game.friend.out_used.iter().filter(|&&b| b).count();
+                let all_used = game.friend.out_used.iter().all(|&b| b);
+
+                // 已用完所有5次外出 → 0分
+                if all_used {
+                    return 0.0;
+                }
+
+                // 万能材料快满了 → 友人外出会溢出 → 大幅扣分
+                if special >= self.special_overflow_threshold {
+                    return self.friend_outing_score * 0.1;
+                }
+
+                // 友人外出给万能材料×2，外加友人事件
+                let mut score = self.friend_outing_score;
+
+                // 早期优先友人外出（积累万能材料）
+                if used < 2 {
+                    score += 15.0;
+                }
+
+                score
+            }
+            Operation::Race => 10.0,
             Operation::Clinic => {
                 if game.uma().flags.ill { 80.0 } else { 0.0 }
             }
@@ -179,7 +220,7 @@ impl RamenStrategy {
     fn score_training(&self, game: &RamenGame, train_type: TrainingType) -> f64 {
         let train = train_type as usize;
 
-        // 人头数和发光数
+        // 人头数（排除理事长和记者）
         let heads = game.distribution().get(train)
             .map(|d| d.iter().filter(|&&p| {
                 p >= 0 && (p as usize) < game.persons().len()
@@ -187,24 +228,39 @@ impl RamenStrategy {
                     && game.persons()[p as usize].person_type != PersonType::Yayoi
             }).count())
             .unwrap_or(0);
+
+        // 发光数（闪彩圈训练比普通训练多填诀窍槽→多材料→多吃面→多RMJ PT）
         let shining = game.shining_count(train);
 
         // 失败率
         let buffs = game.calc_training_buff(train).unwrap_or_default();
         let fail_rate = game.calc_training_failure_rate(&buffs, train);
 
-        // 训练值（含拉面 buff）
+        // 训练值（含拉面buff）
         let value = game.calc_training_value(&buffs, train).unwrap_or_default();
         let total_gain: i32 = value.status_pt.iter().sum();
 
-        // 评分 = 原始收益 + 人头权重 + 发光权重 - 失败率惩罚
-        total_gain as f64
+        // 基础评分 = 原始收益 + 人头权重 + 发光权重 - 失败率惩罚
+        let mut score = total_gain as f64
             + heads as f64 * self.head_weight
             + shining as f64 * self.shining_weight
-            - fail_rate as f64 * self.failure_penalty
-    }
+            - fail_rate as f64 * self.failure_penalty;
 
-    fn score_generic(&self, _game: &RamenGame, _action: &RamenAction) -> f64 {
-        0.0
+        // 友人点击加成：友人未点击时，有友人的训练加分
+        // 友人必须先点一次才能解锁外出事件
+        if game.friend.out_state == FriendOutState::UnClicked {
+            // 检查这个训练位置是否有友人卡（ScenarioCard）
+            let has_friend = game.distribution().get(train)
+                .map(|d| d.iter().any(|&p| {
+                    p >= 0 && (p as usize) < game.persons().len()
+                        && game.persons()[p as usize].person_type == PersonType::ScenarioCard
+                }))
+                .unwrap_or(false);
+            if has_friend {
+                score += self.friend_click_bonus;
+            }
+        }
+
+        score
     }
 }
