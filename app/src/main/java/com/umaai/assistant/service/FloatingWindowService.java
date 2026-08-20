@@ -90,13 +90,14 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         int turn = summary.optInt("turn", -1);
         turnView.setText(turn > 0 ? "第" + turn + "回合" : "拉面杯");
         String ramenAdvice = RamenDecisionSupport.recommend(summary);
-        String ai = summary.optJSONObject("ai") != null
-                ? translateAction(summary.optJSONObject("ai").optString("best", "")) : "";
-        recommendView.setText(ai.isEmpty() ? ramenAdvice : "插件推荐：" + ai + " | " + ramenAdvice);
-        recommendView.setTextColor(0xFF00FF88);
+        recommendView.setText(ramenAdvice);
+        recommendView.setTextColor(0xFFFFFFFF);
+        int totalStat = stats.optInt("speed") + stats.optInt("stamina")
+                + stats.optInt("power") + stats.optInt("guts") + stats.optInt("wiz");
         statusView.setText("速" + stats.optInt("speed") + " 耐" + stats.optInt("stamina")
                 + " 力" + stats.optInt("power") + " 根" + stats.optInt("guts")
-                + " 智" + stats.optInt("wiz") + " Pt" + stats.optInt("skill_point")
+                + " 智" + stats.optInt("wiz") + " 总计" + totalStat
+                + " Pt" + stats.optInt("skill_point")
                 + "\n体力" + stats.optInt("vital") + "/" + stats.optInt("max_vital")
                 + " 干劲" + stats.optString("motivation", "?"));
         ramenView.setText(RamenDecisionSupport.stateLine(summary));
