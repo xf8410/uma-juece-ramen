@@ -38,6 +38,8 @@ jobs:
 
   simulate:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Setup Rust
@@ -70,9 +72,27 @@ jobs:
           cp -r ${{ github.workspace }}/gamedata .
           cp -r ${{ github.workspace }}/rust .
           N="${{ github.event.inputs.sim_count || '100' }}"
-          OUTPUT=$(cargo run --release --manifest-path rust/Cargo.toml --bin ramen_batch -- "$N" 2>&1 || echo "SIM_FAILED")
-          echo "$OUTPUT"
-          echo "$OUTPUT" >> "$GITHUB_STEP_SUMMARY"
+          cargo run --release --manifest-path rust/Cargo.toml --bin ramen_batch -- "$N" 2>&1 | tee /tmp/sim_output.txt || echo "SIM_FAILED" >> /tmp/sim_output.txt
+      - name: Write results to repo
+        run: |
+          cd ${{ github.workspace }}
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p docs
+          {
+            echo "# 模拟结果"
+            echo ""
+            echo "- 时间: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "- 局数: ${{ github.event.inputs.sim_count || '100' }}"
+            echo "- 参数: \`${{ github.event.inputs.strategy_json || '默认' }}\`"
+            echo ""
+            echo '```'"
+            cat /tmp/sim_output.txt
+            echo '```'
+          } > docs/sim_results.md
+          git add docs/sim_results.md
+          git commit -m "[skip ci] 模拟结果" || true
+          git push
 
   android:
     runs-on: ubuntu-latest
