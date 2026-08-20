@@ -49,6 +49,12 @@ pub struct RamenStrategy {
     // ── 友人点击 ──
     /// 友人未点击时，有友人的训练加分（友人必须先点一次才能解锁外出）
     pub friend_click_bonus: f64,
+
+    // ── 事件选项 ──
+    /// 事件选项给体力的加分
+    pub event_vital_bonus: f64,
+    /// 事件选项给干劲的加分
+    pub event_motivation_bonus: f64,
 }
 
 impl Default for RamenStrategy {
@@ -66,6 +72,8 @@ impl Default for RamenStrategy {
             no_ramen_base_score: 100.0,
             eat_ramen_base_score: 50.0,
             friend_click_bonus: 25.0,
+            event_vital_bonus: 30.0,
+            event_motivation_bonus: 40.0,
         }
     }
 }
@@ -96,13 +104,84 @@ impl Trainer<RamenGame> for RamenStrategy {
         Ok(best)
     }
 
+    /// 事件选项：优先选有体力和干劲的；都不缺就选最缺的属性
     fn select_choice(
         &self,
-        _game: &RamenGame,
-        _choices: &[Vec<EventChoice>],
+        game: &RamenGame,
+        choices: &[Vec<EventChoice>],
         _rng: &mut StdRng,
     ) -> Result<usize> {
-        Ok(0)
+        if choices.is_empty() {
+            return Ok(0);
+        }
+
+        let vital = game.uma().vital;
+        let motivation = game.uma().motivation;
+        let five_status = &game.uma().five_status;
+
+        // 找当前最低属性（0=速 1=耐 2=力 3=根 4=智）
+        let min_stat_idx = (0..5usize)
+            .min_by(|&a, &b| five_status[a].cmp(&five_status[b]))
+            .unwrap_or(0);
+
+        let vital_low = vital < self.vital_rest_threshold;
+        let motivation_low = motivation < self.motivation_outing_threshold;
+
+        let scores: Vec<f64> = choices
+            .iter()
+            .map(|option| {
+                if option.is_empty() {
+                    return 0.0;
+                }
+
+                // 取第一个分支做代表（简化：不按概率加权）
+                let choice = &option[0];
+                let v = &choice.value;
+
+                let mut score = 0.0;
+
+                // 体力或干劲低时，优先选给体力/干劲的
+                if vital_low && v.vital > 0 {
+                    score += self.event_vital_bonus;
+                }
+                if motivation_low && v.motivation > 0 {
+                    score += self.event_motivation_bonus;
+                }
+
+                // 体力和干劲都不缺时，优先选给最缺属性的
+                if !vital_low && !motivation_low {
+                    // 给最缺属性的加分
+                    if v.status_pt.len() > min_stat_idx && v.status_pt[min_stat_idx] > 0 {
+                        score += v.status_pt[min_stat_idx] as f64;
+                    }
+                    // 也给其他属性一点分（不是 0 就有价值）
+                    for i in 0..5 {
+                        if i != min_stat_idx && v.status_pt.len() > i && v.status_pt[i] > 0 {
+                            score += v.status_pt[i] as f64 * 0.3;
+                        }
+                    }
+                }
+
+                // 无论什么情况，体力/干劲都有基础价值
+                if v.vital > 0 && !vital_low {
+                    score += v.vital as f64 * 0.5;
+                }
+                if v.motivation > 0 && !motivation_low {
+                    score += v.motivation as f64 * 0.5;
+                }
+
+                score
+            })
+            .collect();
+
+        let best = scores
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        Ok(best)
     }
 }
 
@@ -121,7 +200,6 @@ impl RamenStrategy {
         let stock_total: i32 = game.ramen.feeling_stock.iter().sum();
 
         if action.ramen.is_none() {
-            // 不吃面
             let overflow_penalty = if stock_total >= self.feeling_overflow_threshold {
                 (stock_total - self.feeling_overflow_threshold) as f64 * 20.0
             } else {
@@ -130,15 +208,12 @@ impl RamenStrategy {
             return self.no_ramen_base_score - overflow_penalty;
         }
 
-        // 吃面
         let mut score = self.eat_ramen_base_score;
 
-        // 库存接近上限 → 吃面加分
         if stock_total >= self.feeling_overflow_threshold {
             score += 30.0;
         }
 
-        // 接近 RMJ 目标 → 吃面加分
         let year = game.current_year() as usize;
         let pt = game.ramen.scenario_pt;
         let rmj_targets = [1500, 3000, 3500];
@@ -184,10 +259,8 @@ impl RamenStrategy {
             // 友人外出：给万能材料×2 + 友人事件，与普通外出完全不同
             Operation::FriendOuting => {
                 let special = game.ramen.special_feeling;
-                let used = game.friend.out_used.iter().filter(|&&b| b).count();
                 let all_used = game.friend.out_used.iter().all(|&b| b);
 
-                // 已用完所有5次外出 → 0分
                 if all_used {
                     return 0.0;
                 }
@@ -197,14 +270,11 @@ impl RamenStrategy {
                     return self.friend_outing_score * 0.1;
                 }
 
-                // 友人外出给万能材料×2，外加友人事件
                 let mut score = self.friend_outing_score;
-
-                // 早期优先友人外出（积累万能材料）
+                let used = game.friend.out_used.iter().filter(|&&b| b).count();
                 if used < 2 {
                     score += 15.0;
                 }
-
                 score
             }
             Operation::Race => 10.0,
@@ -240,16 +310,13 @@ impl RamenStrategy {
         let value = game.calc_training_value(&buffs, train).unwrap_or_default();
         let total_gain: i32 = value.status_pt.iter().sum();
 
-        // 基础评分 = 原始收益 + 人头权重 + 发光权重 - 失败率惩罚
         let mut score = total_gain as f64
             + heads as f64 * self.head_weight
             + shining as f64 * self.shining_weight
             - fail_rate as f64 * self.failure_penalty;
 
         // 友人点击加成：友人未点击时，有友人的训练加分
-        // 友人必须先点一次才能解锁外出事件
         if game.friend.out_state == FriendOutState::UnClicked {
-            // 检查这个训练位置是否有友人卡（ScenarioCard）
             let has_friend = game.distribution().get(train)
                 .map(|d| d.iter().any(|&p| {
                     p >= 0 && (p as usize) < game.persons().len()
