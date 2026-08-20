@@ -245,13 +245,16 @@ impl RamenStrategy {
             + heads as f64 * self.head_weight
             + shining as f64 * self.shining_weight;
 
-        // 羁绊价值
+        // 羁绊价值 — 用 Option 避免悬垂引用
         let dist = game.distribution();
-        let dist_train: &Vec<i32> = dist.get(train).unwrap_or(&Vec::new());
+        let dist_train: Option<&Vec<i32>> = dist.get(train);
         for j in 0..5usize {
-            let pi = match dist_train.get(j) {
-                Some(&p) if p >= 0 && (p as usize) < game.persons().len() => p as usize,
-                _ => break,
+            let pi = match dist_train {
+                Some(d) => match d.get(j) {
+                    Some(&p) if p >= 0 && (p as usize) < game.persons().len() => p as usize,
+                    _ => break,
+                },
+                None => break,
             };
             let person = &game.persons()[pi];
             if person.person_type == PersonType::ScenarioCard {
@@ -276,10 +279,13 @@ impl RamenStrategy {
 
         // 友人未点击时额外加分
         if game.friend.out_state == FriendOutState::UnClicked {
-            let has_friend = dist_train.iter().any(|&p| {
-                p >= 0 && (p as usize) < game.persons().len()
-                    && game.persons()[p as usize].person_type == PersonType::ScenarioCard
-            });
+            let has_friend = match dist_train {
+                Some(d) => d.iter().any(|&p| {
+                    p >= 0 && (p as usize) < game.persons().len()
+                        && game.persons()[p as usize].person_type == PersonType::ScenarioCard
+                }),
+                None => false,
+            };
             if has_friend { score += self.friend_click_bonus; }
         }
 
