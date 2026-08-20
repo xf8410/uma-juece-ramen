@@ -34,23 +34,33 @@ struct ParamDef {
 }
 
 static PARAMS: &[ParamDef] = &[
+    // ── 训练决策 ──
     ParamDef { name: "head_weight",              min: 0.0,   max: 100.0, initial: 15.0,  is_int: false },
     ParamDef { name: "shining_weight",           min: 0.0,   max: 200.0, initial: 40.0,  is_int: false },
-    ParamDef { name: "failure_penalty",          min: 0.0,   max: 20.0,  initial: 2.0,   is_int: false },
+    ParamDef { name: "failure_penalty",          min: 10.0,  max: 500.0, initial: 150.0, is_int: false },
+    ParamDef { name: "big_fail_penalty",         min: 100.0, max: 2000.0, initial: 500.0, is_int: false },
+    ParamDef { name: "jiban_value",              min: 0.0,   max: 100.0, initial: 12.0,  is_int: false },
+    ParamDef { name: "status_soft_cap",          min: 10.0,  max: 100.0, initial: 40.0,  is_int: false },
+    // ── 休息/外出 ──
     ParamDef { name: "vital_rest_threshold",     min: 10.0,  max: 60.0,  initial: 30.0,  is_int: true  },
-    ParamDef { name: "motivation_outing_thresh", min: 1.0,   max: 5.0,   initial: 4.0,   is_int: true  },
+    ParamDef { name: "motivation_outing_thresh", min: 3.0,   max: 5.0,   initial: 5.0,   is_int: true  },
     ParamDef { name: "friend_outing_score",      min: 0.0,   max: 200.0, initial: 60.0,  is_int: false },
+    ParamDef { name: "outing_motivation_bonus",  min: 0.0,   max: 400.0, initial: 200.0, is_int: false },
+    // ── 万能材料 ──
     ParamDef { name: "special_overflow_thresh",  min: 1.0,   max: 4.0,   initial: 3.0,   is_int: true  },
+    // ── 吃面 ──
     ParamDef { name: "feeling_overflow_thresh",  min: 3.0,   max: 15.0,  initial: 8.0,   is_int: true  },
     ParamDef { name: "rmj_urgency_margin",        min: 100.0, max: 500.0, initial: 300.0, is_int: true  },
     ParamDef { name: "no_ramen_base_score",      min: 0.0,   max: 200.0, initial: 100.0, is_int: false },
     ParamDef { name: "eat_ramen_base_score",     min: 0.0,   max: 200.0, initial: 50.0,  is_int: false },
+    // ── 友人 ──
     ParamDef { name: "friend_click_bonus",       min: 0.0,   max: 100.0, initial: 25.0,  is_int: false },
+    // ── 事件 ──
     ParamDef { name: "event_vital_bonus",        min: 0.0,   max: 100.0, initial: 30.0,  is_int: false },
     ParamDef { name: "event_motivation_bonus",   min: 0.0,   max: 100.0, initial: 40.0,  is_int: false },
 ];
 
-const DIMS: usize = 14;
+const DIMS: usize = 18;
 
 // ── 共用工具 ──────────────────────────────────────────────
 
@@ -59,28 +69,34 @@ fn vec_to_strategy(vec: &[f64]) -> RamenStrategy {
         head_weight: vec[0],
         shining_weight: vec[1],
         failure_penalty: vec[2],
-        vital_rest_threshold: vec[3] as i32,
-        motivation_outing_threshold: vec[4] as i32,
-        friend_outing_score: vec[5],
-        special_overflow_threshold: vec[6] as i32,
-        feeling_overflow_threshold: vec[7] as i32,
-        rmj_urgency_margin: vec[8] as i32,
-        no_ramen_base_score: vec[9],
-        eat_ramen_base_score: vec[10],
-        friend_click_bonus: vec[11],
-        event_vital_bonus: vec[12],
-        event_motivation_bonus: vec[13],
+        big_fail_penalty: vec[3],
+        jiban_value: vec[4],
+        status_soft_cap: vec[5],
+        vital_rest_threshold: vec[6] as i32,
+        motivation_outing_threshold: vec[7] as i32,
+        friend_outing_score: vec[8],
+        outing_motivation_bonus: vec[9],
+        special_overflow_threshold: vec[10] as i32,
+        feeling_overflow_threshold: vec[11] as i32,
+        rmj_urgency_margin: vec[12] as i32,
+        no_ramen_base_score: vec[13],
+        eat_ramen_base_score: vec[14],
+        friend_click_bonus: vec[15],
+        event_vital_bonus: vec[16],
+        event_motivation_bonus: vec[17],
     }
 }
 
 fn strategy_to_vec(s: &RamenStrategy) -> Vec<f64> {
     vec![
         s.head_weight, s.shining_weight, s.failure_penalty,
+        s.big_fail_penalty, s.jiban_value, s.status_soft_cap,
         s.vital_rest_threshold as f64, s.motivation_outing_threshold as f64,
-        s.friend_outing_score, s.special_overflow_threshold as f64,
+        s.friend_outing_score, s.outing_motivation_bonus,
+        s.special_overflow_threshold as f64,
         s.feeling_overflow_threshold as f64, s.rmj_urgency_margin as f64,
-        s.no_ramen_base_score, s.eat_ramen_base_score, s.friend_click_bonus,
-        s.event_vital_bonus, s.event_motivation_bonus,
+        s.no_ramen_base_score, s.eat_ramen_base_score,
+        s.friend_click_bonus, s.event_vital_bonus, s.event_motivation_bonus,
     ]
 }
 
@@ -141,7 +157,6 @@ fn denormalize(nvec: &[f64]) -> Vec<f64> {
     vec
 }
 
-/// 读取上次优化结果作为起点，没有则用默认参数
 fn read_initial_params() -> Vec<f64> {
     let path = std::env::var("STRATEGY_IN")
         .unwrap_or_else(|_| "strategy_optimized.json".to_string());
@@ -149,8 +164,7 @@ fn read_initial_params() -> Vec<f64> {
         Ok(json) => {
             match serde_json::from_str::<RamenStrategy>(&json) {
                 Ok(strategy) => {
-                    let v = strategy_to_vec(&strategy);
-                    let mut p = v.clone();
+                    let mut p = strategy_to_vec(&strategy);
                     clamp_vec(&mut p);
                     println!("从 {} 加载上次优化结果作为起点", path);
                     p
@@ -168,7 +182,6 @@ fn read_initial_params() -> Vec<f64> {
     }
 }
 
-/// 写入最优参数到文件，供下次迭代和 APK 打包使用
 fn write_best_params(params: &[f64]) {
     let strategy = vec_to_strategy(params);
     let json = serde_json::to_string_pretty(&strategy).unwrap_or_default();
@@ -197,9 +210,6 @@ fn print_results(baseline: f64, best: f64, best_params: &[f64], elapsed: std::ti
     println!();
     println!("最优参数 (RAMEN_STRATEGY):");
     println!("{}", best_json_compact);
-    println!();
-    println!("最优参数 (格式化):");
-    println!("{}", best_json_pretty);
     println!();
     println!("参数变化:");
     println!("  {:<28} {:>10} → {:>10}  Δ", "参数", "起点", "优化");
