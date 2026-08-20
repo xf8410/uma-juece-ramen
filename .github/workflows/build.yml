@@ -16,7 +16,7 @@ on:
         type: string
       opt_mode:
         description: '优化模式（cmaes / bayes，留空=不跑优化）'
-        default: 'bayes'
+        default: ''
         type: string
       opt_arg1:
         description: 'CMA-ES=代数 / Bayes=初始采样数'
@@ -95,6 +95,8 @@ jobs:
   optimize:
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.opt_mode != '' && github.event.inputs.opt_mode != '0'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Setup Rust
@@ -121,6 +123,9 @@ jobs:
       - name: Build optimizer
         run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_optimize
       - name: Run optimization
+        env:
+          STRATEGY_IN: ${{ github.workspace }}/rust/strategy_optimized.json
+          STRATEGY_OUT: ${{ github.workspace }}/rust/strategy_optimized.json
         run: |
           cd /tmp
           cp -r ${{ github.workspace }}/gamedata .
@@ -131,6 +136,14 @@ jobs:
           GAMES="${{ github.event.inputs.opt_games || '50' }}"
           cargo run --release --manifest-path rust/Cargo.toml --bin ramen_optimize -- "$MODE" "$ARG1" "$ARG2" "$GAMES" 2>&1 | tee /tmp/opt_output.txt || echo "OPT_FAILED" >> /tmp/opt_output.txt
           cat /tmp/opt_output.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit optimized strategy
+        run: |
+          cd ${{ github.workspace }}
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add rust/strategy_optimized.json || true
+          git commit -m "[skip ci] 优化策略参数 $(date -u '+%Y-%m-%d %H:%M')" || true
+          git push || true
 
   android:
     runs-on: ubuntu-latest
@@ -192,6 +205,14 @@ jobs:
           for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
             curl -sSL "$BASE/$f" -o "app/src/main/assets/gamedata/$f" || echo "WARN: $f"
           done
+      - name: Copy optimized strategy to assets
+        run: |
+          if [ -f rust/strategy_optimized.json ]; then
+            cp rust/strategy_optimized.json app/src/main/assets/strategy_optimized.json
+            echo "优化策略已打包进 APK"
+          else
+            echo "无优化策略文件，APK 用默认参数"
+          fi
       - name: Create local.properties
         run: echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
       - name: Build APK
