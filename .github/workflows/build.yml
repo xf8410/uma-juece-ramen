@@ -14,16 +14,20 @@ on:
         description: '策略参数 JSON（留空用默认）'
         default: ''
         type: string
-      opt_generations:
-        description: 'CMA-ES 优化代数（0=不跑优化，默认10）'
+      opt_mode:
+        description: '优化模式（cmaes / bayes，留空=不跑优化）'
+        default: ''
+        type: string
+      opt_arg1:
+        description: 'CMA-ES=代数 / Bayes=初始采样数'
         default: '10'
         type: string
-      opt_pop:
-        description: 'CMA-ES 种群大小'
+      opt_arg2:
+        description: 'CMA-ES=种群 / Bayes=迭代次数'
         default: '8'
         type: string
       opt_games:
-        description: 'CMA-ES 每次评估局数'
+        description: '每次评估局数'
         default: '50'
         type: string
 
@@ -89,7 +93,7 @@ jobs:
           cat /tmp/sim_output.txt >> "$GITHUB_STEP_SUMMARY"
 
   optimize:
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.opt_generations != '0' && github.event.inputs.opt_generations != ''
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.opt_mode != '' && github.event.inputs.opt_mode != '0'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -116,15 +120,16 @@ jobs:
           done
       - name: Build optimizer
         run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_optimize
-      - name: Run CMA-ES optimization
+      - name: Run optimization
         run: |
           cd /tmp
           cp -r ${{ github.workspace }}/gamedata .
           cp -r ${{ github.workspace }}/rust .
-          GENS="${{ github.event.inputs.opt_generations || '10' }}"
-          POP="${{ github.event.inputs.opt_pop || '8' }}"
+          MODE="${{ github.event.inputs.opt_mode }}"
+          ARG1="${{ github.event.inputs.opt_arg1 || '10' }}"
+          ARG2="${{ github.event.inputs.opt_arg2 || '8' }}"
           GAMES="${{ github.event.inputs.opt_games || '50' }}"
-          cargo run --release --manifest-path rust/Cargo.toml --bin ramen_optimize -- "$GENS" "$POP" "$GAMES" 2>&1 | tee /tmp/opt_output.txt || echo "OPT_FAILED" >> /tmp/opt_output.txt
+          cargo run --release --manifest-path rust/Cargo.toml --bin ramen_optimize -- "$MODE" "$ARG1" "$ARG2" "$GAMES" 2>&1 | tee /tmp/opt_output.txt || echo "OPT_FAILED" >> /tmp/opt_output.txt
           cat /tmp/opt_output.txt >> "$GITHUB_STEP_SUMMARY"
 
   android:
