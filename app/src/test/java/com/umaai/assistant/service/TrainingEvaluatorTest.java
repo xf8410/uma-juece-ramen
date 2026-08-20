@@ -37,7 +37,7 @@ public class TrainingEvaluatorTest {
                 "{\"name\":\"Stamina\",\"is_enable\":1,\"failure_rate\":10,\"heads\":2,\"shining\":2," +
                 "\"gains\":{\"Speed\":0,\"Stamina\":14,\"Power\":6,\"Guts\":0,\"Wiz\":0,\"SkillPt\":12,\"HP\":-8}}," +
                 "{\"name\":\"Speed\",\"is_enable\":1,\"failure_rate\":10,\"heads\":3,\"shining\":0," +
-                "\"gains\":{\"Speed\":18,\"Stamina\":0,\"Power\":0,\"Guts\":0,\"Guts\":0,\"Wiz\":0,\"SkillPt\":12,\"HP\":-8}}]}");
+                "\"gains\":{\"Speed\":18,\"Stamina\":0,\"Power\":0,\"Guts\":0,\"Wiz\":0,\"SkillPt\":12,\"HP\":-8}}]}");
         String recommendation = evaluator.recommend(summary);
         assertTrue(recommendation, recommendation.contains("耐"));
     }
