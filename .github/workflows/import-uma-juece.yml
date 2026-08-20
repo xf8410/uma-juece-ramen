@@ -10,7 +10,7 @@ on:
       target_branch:
         description: Existing workbench branch receiving the snapshot
         required: true
-        default: workbench/import-uma-juece
+        default: workbench/port-pc-ramen-planners
 
 permissions:
   contents: write
@@ -51,7 +51,6 @@ jobs:
             --exclude='.local/' \
             --exclude='.github/workflows/import-uma-juece.yml' \
             /tmp/uma-juece/ ./
-          # Keep this importer available until the snapshot PR is complete.
           test -f .github/workflows/import-uma-juece.yml
 
       - name: Record source provenance
