@@ -4,6 +4,9 @@
 //!   cargo run --release --bin ramen_optimize -- cmaes [generations] [pop_size] [games_per_eval]
 //!   cargo run --release --bin ramen_optimize -- bayes [n_init] [n_iter] [games_per_eval]
 //!   默认: cmaes 10 8 50
+//!
+//! 迭代：如果 STRATEGY_IN 指向的 strategy_optimized.json 存在，以上次结果为起点。
+//! 输出：最优参数写入 STRATEGY_OUT 指向的文件。
 
 use std::env;
 use std::time::Instant;
@@ -70,6 +73,17 @@ fn vec_to_strategy(vec: &[f64]) -> RamenStrategy {
     }
 }
 
+fn strategy_to_vec(s: &RamenStrategy) -> Vec<f64> {
+    vec![
+        s.head_weight, s.shining_weight, s.failure_penalty,
+        s.vital_rest_threshold as f64, s.motivation_outing_threshold as f64,
+        s.friend_outing_score, s.special_overflow_threshold as f64,
+        s.feeling_overflow_threshold as f64, s.rmj_urgency_margin as f64,
+        s.no_ramen_base_score, s.eat_ramen_base_score, s.friend_click_bonus,
+        s.event_vital_bonus, s.event_motivation_bonus,
+    ]
+}
+
 fn clamp_vec(vec: &mut [f64]) {
     for i in 0..DIMS {
         if vec[i] < PARAMS[i].min { vec[i] = PARAMS[i].min; }
@@ -108,7 +122,6 @@ fn sample_random(rng: &mut StdRng) -> Vec<f64> {
     vec
 }
 
-/// 归一化到 [0,1]
 fn normalize(vec: &[f64]) -> Vec<f64> {
     vec.iter().enumerate()
         .map(|(i, &v)| {
@@ -118,7 +131,6 @@ fn normalize(vec: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-/// 反归一化
 fn denormalize(nvec: &[f64]) -> Vec<f64> {
     let mut vec = vec![0.0; DIMS];
     for i in 0..DIMS {
@@ -127,6 +139,45 @@ fn denormalize(nvec: &[f64]) -> Vec<f64> {
         if PARAMS[i].is_int { vec[i] = vec[i].round(); }
     }
     vec
+}
+
+/// 读取上次优化结果作为起点，没有则用默认参数
+fn read_initial_params() -> Vec<f64> {
+    let path = std::env::var("STRATEGY_IN")
+        .unwrap_or_else(|_| "strategy_optimized.json".to_string());
+    match std::fs::read_to_string(&path) {
+        Ok(json) => {
+            match serde_json::from_str::<RamenStrategy>(&json) {
+                Ok(strategy) => {
+                    let v = strategy_to_vec(&strategy);
+                    let mut p = v.clone();
+                    clamp_vec(&mut p);
+                    println!("从 {} 加载上次优化结果作为起点", path);
+                    p
+                }
+                Err(_) => {
+                    println!("{} 解析失败，用默认参数", path);
+                    PARAMS.iter().map(|p| p.initial).collect()
+                }
+            }
+        }
+        Err(_) => {
+            println!("无上次优化结果（{}），用默认参数", path);
+            PARAMS.iter().map(|p| p.initial).collect()
+        }
+    }
+}
+
+/// 写入最优参数到文件，供下次迭代和 APK 打包使用
+fn write_best_params(params: &[f64]) {
+    let strategy = vec_to_strategy(params);
+    let json = serde_json::to_string_pretty(&strategy).unwrap_or_default();
+    let path = std::env::var("STRATEGY_OUT")
+        .unwrap_or_else(|_| "strategy_optimized.json".to_string());
+    match std::fs::write(&path, json) {
+        Ok(_) => println!("最优策略已写入: {}", path),
+        Err(e) => println!("策略写入失败 ({}): {}", path, e),
+    }
 }
 
 fn print_results(baseline: f64, best: f64, best_params: &[f64], elapsed: std::time::Duration, mode: &str, total_games: usize) {
@@ -151,7 +202,7 @@ fn print_results(baseline: f64, best: f64, best_params: &[f64], elapsed: std::ti
     println!("{}", best_json_pretty);
     println!();
     println!("参数变化:");
-    println!("  {:<28} {:>10} → {:>10}  Δ", "参数", "默认", "优化");
+    println!("  {:<28} {:>10} → {:>10}  Δ", "参数", "起点", "优化");
     for (i, p) in PARAMS.iter().enumerate() {
         let old = p.initial;
         let new = best_params[i];
@@ -174,7 +225,8 @@ fn cmaes_optimize(generations: usize, pop_size: usize, games_per_eval: usize) {
     let upper: Vec<f64> = PARAMS.iter().map(|p| p.max).collect();
     let is_int: Vec<bool> = PARAMS.iter().map(|p| p.is_int).collect();
 
-    let mut mean: Vec<f64> = PARAMS.iter().map(|p| p.initial).collect();
+    let init_params = read_initial_params();
+    let mut mean: Vec<f64> = init_params.clone();
     let mut sigma: Vec<f64> = PARAMS.iter().map(|p| (p.max - p.min) * 0.15).collect();
 
     println!("评估基线 ({} 局)...", games_per_eval);
@@ -239,11 +291,11 @@ fn cmaes_optimize(generations: usize, pop_size: usize, games_per_eval: usize) {
     let elapsed = start.elapsed();
     let total = pop_size * games_per_eval * generations + games_per_eval;
     print_results(baseline_score, best_score, &best_params, elapsed, "CMA-ES", total);
+    write_best_params(&best_params);
 }
 
 // ── 贝叶斯优化 ────────────────────────────────────────────
 
-/// 解线性方程组 Ax=b（高斯消元 + 部分主元）
 fn solve_linear_system(a: &mut [Vec<f64>], b: &mut [f64]) -> Vec<f64> {
     let n = b.len();
     for k in 0..n {
@@ -268,39 +320,28 @@ fn solve_linear_system(a: &mut [Vec<f64>], b: &mut [f64]) -> Vec<f64> {
     x
 }
 
-/// Ridge 回归拟合线性代理模型 f(x) ≈ w0 + w·x
 fn fit_linear(X: &[Vec<f64>], y: &[f64]) -> Vec<f64> {
     let n = X.len();
-    let d = DIMS;
-    let m = d + 1; // +1 for intercept
-
-    // XtX (m×m) + Xt y (m)
+    let m = DIMS + 1;
     let mut a = vec![vec![0.0; m]; m];
     let mut b = vec![0.0; m];
-
     for i in 0..n {
-        // augmented row: [1, x0, x1, ..., x13]
         let row: Vec<f64> = std::iter::once(1.0).chain(X[i].iter().copied()).collect();
         for j in 0..m {
             for k in 0..m { a[j][k] += row[j] * row[k]; }
             b[j] += row[j] * y[i];
         }
     }
-
-    // L2 正则化
     for i in 0..m { a[i][i] += 1.0; }
-
     solve_linear_system(&mut a, &mut b)
 }
 
-/// 线性模型预测
 fn predict_linear(w: &[f64], x: &[f64]) -> f64 {
     let mut y = w[0];
     for i in 0..DIMS { y += w[i + 1] * x[i]; }
     y
 }
 
-/// 到训练集最近点的距离 → 不确定性
 fn uncertainty(x: &[f64], train: &[Vec<f64>]) -> f64 {
     let mut min_d2 = f64::MAX;
     for xi in train {
@@ -310,7 +351,6 @@ fn uncertainty(x: &[f64], train: &[Vec<f64>]) -> f64 {
     min_d2.sqrt()
 }
 
-/// UCB 采集函数：mean + κ * σ
 fn ucb(w: &[f64], x: &[f64], train: &[Vec<f64>], kappa: f64) -> f64 {
     let mean = predict_linear(w, x);
     let sigma = uncertainty(x, train);
@@ -318,17 +358,16 @@ fn ucb(w: &[f64], x: &[f64], train: &[Vec<f64>], kappa: f64) -> f64 {
 }
 
 fn bayesian_optimize(n_init: usize, n_iter: usize, games_per_eval: usize) {
-    // 评估基线
-    let default_vec: Vec<f64> = PARAMS.iter().map(|p| p.initial).collect();
+    let init_params = read_initial_params();
+
     println!("评估基线 ({} 局)...", games_per_eval);
-    let baseline_score = evaluate(&default_vec, games_per_eval);
+    let baseline_score = evaluate(&init_params, games_per_eval);
     println!("基线均分: {:.0}\n", baseline_score);
 
     let mut samples: Vec<(Vec<f64>, f64)> = Vec::new();
 
-    // 1. 初始随机采样（含默认参数）
     println!("初始采样 ({} 个点)...", n_init);
-    samples.push((default_vec.clone(), baseline_score));
+    samples.push((init_params.clone(), baseline_score));
     let remaining = n_init.saturating_sub(1);
     let init_start = Instant::now();
     let init_results: Vec<(Vec<f64>, f64)> = (0..remaining)
@@ -348,21 +387,17 @@ fn bayesian_optimize(n_init: usize, n_iter: usize, games_per_eval: usize) {
 
     let start = Instant::now();
 
-    // 2. 贝叶斯优化迭代
     for iter in 0..n_iter {
-        // 拟合代理模型
         let X: Vec<Vec<f64>> = samples.iter().map(|(v, _)| normalize(v)).collect();
         let y: Vec<f64> = samples.iter().map(|(_, s)| *s).collect();
         let w = fit_linear(&X, &y);
 
-        // 残差标准差 → 自适应 κ
         let residuals: Vec<f64> = X.iter().zip(y.iter())
             .map(|(x, &yv)| yv - predict_linear(&w, x))
             .collect();
         let resid_std = (residuals.iter().map(|r| r * r).sum::<f64>() / residuals.len().max(1) as f64).sqrt();
         let kappa = resid_std * 2.0;
 
-        // 采集函数优化：随机搜索 2000 个候选
         let n_candidates = 2000;
         let train_norm: Vec<Vec<f64>> = X.clone();
 
@@ -370,12 +405,9 @@ fn bayesian_optimize(n_init: usize, n_iter: usize, games_per_eval: usize) {
             .into_par_iter()
             .map(|_| {
                 let mut rng = StdRng::from_os_rng();
-                // 50% 全局随机，50% 在当前最优点附近采样
                 let mut nvec = if rng.random::<f64>() < 0.5 {
-                    // 全局
                     (0..DIMS).map(|_| rng.random::<f64>()).collect::<Vec<_>>()
                 } else {
-                    // 局部：在最佳点附近采样
                     let best_norm = normalize(&best_params);
                     let scale = 0.15;
                     (0..DIMS).map(|i| {
@@ -388,12 +420,10 @@ fn bayesian_optimize(n_init: usize, n_iter: usize, games_per_eval: usize) {
             })
             .collect();
 
-        // 选 UCB 最高的候选
         let (best_nvec, _) = candidates.iter()
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap();
 
-        // 评估
         let new_vec = denormalize(best_nvec);
         let new_score = evaluate(&new_vec, games_per_eval);
         samples.push((new_vec.clone(), new_score));
@@ -412,6 +442,7 @@ fn bayesian_optimize(n_init: usize, n_iter: usize, games_per_eval: usize) {
     let elapsed = start.elapsed();
     let total = (n_init + n_iter) * games_per_eval;
     print_results(baseline_score, best_score, &best_params, elapsed, "贝叶斯优化", total);
+    write_best_params(&best_params);
 }
 
 // ── main ──────────────────────────────────────────────────
@@ -435,7 +466,6 @@ fn main() {
             bayesian_optimize(n_init, n_iter, games);
         }
         _ => {
-            // CMA-ES（兼容旧用法：第一个参数是 generations）
             let gens = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
             let pop = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
             let games = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(50);
