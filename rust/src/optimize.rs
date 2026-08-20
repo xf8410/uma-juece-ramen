@@ -9,6 +9,7 @@
 use std::env;
 use std::time::Instant;
 
+use rand::prelude::*;
 use rayon::prelude::*;
 
 use uma_jni::ramen_strategy::RamenStrategy;
@@ -41,7 +42,7 @@ static PARAMS: &[ParamDef] = &[
     ParamDef { name: "friend_outing_score",      min: 0.0,   max: 200.0, initial: 60.0,  is_int: false },
     ParamDef { name: "special_overflow_thresh",  min: 1.0,   max: 4.0,   initial: 3.0,   is_int: true  },
     ParamDef { name: "feeling_overflow_thresh",  min: 3.0,   max: 15.0,  initial: 8.0,   is_int: true  },
-    ParamDef { name: "rmj_urgency_margin",       min: 100.0, max: 500.0, initial: 300.0, is_int: true  },
+    ParamDef { name: "rmj_urgency_margin",        min: 100.0, max: 500.0, initial: 300.0, is_int: true  },
     ParamDef { name: "no_ramen_base_score",      min: 0.0,   max: 200.0, initial: 100.0, is_int: false },
     ParamDef { name: "eat_ramen_base_score",     min: 0.0,   max: 200.0, initial: 50.0,  is_int: false },
     ParamDef { name: "friend_click_bonus",       min: 0.0,   max: 100.0, initial: 25.0,  is_int: false },
@@ -76,7 +77,7 @@ fn evaluate(vec: &[f64], n: usize) -> f64 {
         .into_par_iter()
         .filter_map(|_| {
             let mut game = RamenGame::newgame(TEST_UMA, &TEST_DECK, TEST_INHERIT).ok()?;
-            let mut rng = rand::rngs::StdRng::from_os_rng();
+            let mut rng = StdRng::from_os_rng();
             game.run_full_game(&strategy, &mut rng).ok()?;
             Some(game.uma().calc_score())
         })
@@ -89,9 +90,9 @@ fn evaluate(vec: &[f64], n: usize) -> f64 {
 }
 
 /// Box-Muller 变换生成标准正态分布随机数
-fn sample_normal(rng: &mut rand::rngs::StdRng) -> f64 {
-    let u1: f64 = rng.random().max(1e-10);
-    let u2: f64 = rng.random();
+fn sample_normal(rng: &mut StdRng) -> f64 {
+    let u1: f64 = rng.random::<f64>().max(1e-10);
+    let u2: f64 = rng.random::<f64>();
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
 }
 
@@ -134,7 +135,7 @@ fn main() {
         let offspring: Vec<(Vec<f64>, f64)> = (0..pop_size)
             .into_par_iter()
             .map(|_| {
-                let mut rng = rand::rngs::StdRng::from_os_rng();
+                let mut rng = StdRng::from_os_rng();
                 let mut vec = vec![0.0; dims];
                 for i in 0..dims {
                     vec[i] = mean[i] + sigma[i] * sample_normal(&mut rng);
