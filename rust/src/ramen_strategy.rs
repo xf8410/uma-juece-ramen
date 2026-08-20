@@ -1,4 +1,4 @@
-//! 拉面杯手写策略 — 最小版（仅验证 18 参数结构编译通过）
+//! 拉面杯手写策略 — 阈值/系数版（借鉴 hzyhhzy 通用逻辑）
 
 use anyhow::Result;
 use rand::prelude::StdRng;
@@ -144,26 +144,46 @@ impl RamenStrategy {
         -targets.iter().sum::<i32>() as f64
     }
 
+    fn vital_eval(vital: i32, max_vital: i32) -> f64 {
+        if vital <= 50 { 2.0 * vital as f64 }
+        else if vital <= 70 { 100.0 + 1.5 * (vital - 50) as f64 }
+        else if vital <= max_vital { 130.0 + (vital - 70) as f64 }
+        else if max_vital <= 50 { 2.0 * max_vital as f64 }
+        else if max_vital <= 70 { 100.0 + 1.5 * (max_vital - 50) as f64 }
+        else { 130.0 + (max_vital - 70) as f64 }
+    }
+
+    fn status_soft(x: f64, reserve: f64) -> f64 {
+        let r_inv = 1.0 / (2.0 * reserve);
+        if x >= 0.0 { 0.0 }
+        else if x > -reserve { -x * x * r_inv }
+        else { x + 0.5 * reserve }
+    }
+
     fn score_train(&self, game: &RamenGame, action: &RamenAction) -> f64 {
         let vital = game.uma().vital;
+        let max_vital = game.uma().max_vital;
         let motivation = game.uma().motivation;
         let turn = game.base.turn;
         let is_early = turn < 2;
         let not_best = motivation < 5;
+        let vital_before = Self::vital_eval(vital, max_vital);
 
         match &action.operation {
             Operation::Train(train_type) => {
-                self.score_training(game, *train_type)
+                self.score_training(game, *train_type, vital_before, max_vital)
             }
             Operation::Rest => {
-                let deficit = (self.vital_rest_threshold - vital).max(0) as f64;
-                let mut score = 50.0 + deficit * 3.0;
+                let vital_after = (vital + 50).min(max_vital);
+                let gain = Self::vital_eval(vital_after, max_vital) - vital_before;
+                let mut score = gain * 0.5;
                 if is_early && vital > 15 { score *= 0.3; }
                 score
             }
             Operation::NormalOuting => {
                 let deficit = (self.motivation_outing_threshold - motivation).max(0) as f64;
                 let mut score = 20.0 + deficit * 25.0;
+                if not_best { score += self.outing_motivation_bonus; }
                 if is_early && not_best { score += 80.0; }
                 score
             }
@@ -191,7 +211,7 @@ impl RamenStrategy {
         }
     }
 
-    fn score_training(&self, game: &RamenGame, train_type: TrainingType) -> f64 {
+    fn score_training(&self, game: &RamenGame, train_type: TrainingType, vital_before: f64, max_vital: i32) -> f64 {
         let train = train_type as usize;
 
         let heads = game.distribution().get(train)
@@ -213,6 +233,48 @@ impl RamenStrategy {
             + shining as f64 * self.shining_weight
             - fail_rate * self.failure_penalty;
 
+        // 属性软截断
+        let five_status = &game.uma().five_status;
+        let five_status_limit = &game.uma().five_status_limit;
+        let remain_turn = 78 - game.base.turn;
+        let reserve = self.status_soft_cap * remain_turn as f64 / 78.0;
+        let final_bonus = 45.0;
+        for sta in 0..5usize {
+            let remain = (five_status_limit[sta] - five_status[sta]) as f64 - final_bonus;
+            if remain < 0.0 {
+                score -= 6.0 * (-remain).min(reserve);
+            }
+        }
+
+        // 羁绊价值
+        let dist_train = game.distribution().get(train);
+        if let Some(d) = dist_train {
+            for j in 0..d.len() {
+                let pi = d[j];
+                if pi < 0 || (pi as usize) >= game.persons().len() { continue; }
+                let person = &game.persons()[pi as usize];
+                if person.person_type == PersonType::ScenarioCard {
+                    match game.friend.out_state {
+                        FriendOutState::UnClicked => score += 150.0,
+                        _ => {
+                            if person.friendship < 60 { score += 100.0; }
+                            else { score += 40.0; }
+                        }
+                    }
+                } else if person.person_type == PersonType::Card {
+                    if person.friendship < 80 {
+                        let mut jiban_add = 7.0;
+                        if game.uma().flags.aijiao { jiban_add += 2.0; }
+                        if person.is_hint { jiban_add += 5.0; }
+                        jiban_add = jiban_add.min((80 - person.friendship) as f64);
+                        score += jiban_add * self.jiban_value;
+                    }
+                    if person.is_hint { score += 8.0; }
+                }
+            }
+        }
+
+        // 友人未点击时额外加分
         if game.friend.out_state == FriendOutState::UnClicked {
             let has_friend = game.distribution().get(train)
                 .map(|d| d.iter().any(|&p| {
@@ -222,6 +284,11 @@ impl RamenStrategy {
                 .unwrap_or(false);
             if has_friend { score += self.friend_click_bonus; }
         }
+
+        // 体力变化
+        let vital_after = (game.uma().vital + value.vital).max(0).min(max_vital);
+        let vital_change = Self::vital_eval(vital_after, max_vital) - vital_before;
+        score += vital_change * 0.3;
 
         score
     }
