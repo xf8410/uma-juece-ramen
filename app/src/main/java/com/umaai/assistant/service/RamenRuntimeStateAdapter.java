@@ -3,10 +3,7 @@ package com.umaai.assistant.service;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.util.LinkedHashSet;
-import java.util.Set;
-
-/** Parses facts from hlpatch /summary without filling missing fields from heuristics. */
+/** Compatibility projection for existing hlpatch Ramen summary fields. */
 public final class RamenRuntimeStateAdapter {
     private RamenRuntimeStateAdapter() {}
 
@@ -23,7 +20,7 @@ public final class RamenRuntimeStateAdapter {
                 RamenUpstreamData.FEELING_CAPACITY);
         Integer special = boundedInt(ramen, "special_feeling_num", 0,
                 RamenUpstreamData.SPECIAL_FEELING_CAPACITY);
-        int[] regionIds = uniqueIntArray(ramen.optJSONArray("selected_region_ids"), 1, 20);
+        int[] regionIds = intArray(ramen.optJSONArray("selected_region_ids"), 1, 20);
         int[] regionIndices = null;
         if (regionIds != null) {
             regionIndices = new int[regionIds.length];
@@ -40,7 +37,7 @@ public final class RamenRuntimeStateAdapter {
                 special != null ? RamenRuntimeState.Source.OBSERVED : RamenRuntimeState.Source.UNKNOWN,
                 regionIds != null ? RamenRuntimeState.Source.OBSERVED : RamenRuntimeState.Source.UNKNOWN,
                 regionIndices != null ? RamenRuntimeState.Source.DERIVED_ID_CONVERSION : RamenRuntimeState.Source.UNKNOWN,
-                RamenRuntimeState.Source.UNKNOWN,
+                gauges != null ? RamenRuntimeState.Source.OBSERVED : RamenRuntimeState.Source.UNKNOWN,
                 queue != null ? RamenRuntimeState.Source.OBSERVED : RamenRuntimeState.Source.UNKNOWN,
                 null);
     }
@@ -71,29 +68,19 @@ public final class RamenRuntimeStateAdapter {
 
     private static int[] fixedIntArray(JSONArray values, int size, int min, int max) {
         if (values == null || values.length() != size) return null;
-        int[] out = new int[size];
-        for (int i = 0; i < size; i++) {
+        return intArray(values, min, max);
+    }
+
+    private static int[] intArray(JSONArray values, int min, int max) {
+        if (values == null) return null;
+        int[] out = new int[values.length()];
+        for (int i = 0; i < values.length(); i++) {
             Object raw = values.opt(i);
             if (!(raw instanceof Number)) return null;
             int value = ((Number) raw).intValue();
             if (value < min || value > max) return null;
             out[i] = value;
         }
-        return out;
-    }
-
-    private static int[] uniqueIntArray(JSONArray values, int min, int max) {
-        if (values == null) return null;
-        Set<Integer> unique = new LinkedHashSet<>();
-        for (int i = 0; i < values.length(); i++) {
-            Object raw = values.opt(i);
-            if (!(raw instanceof Number)) return null;
-            int value = ((Number) raw).intValue();
-            if (value < min || value > max || !unique.add(value)) return null;
-        }
-        int[] out = new int[unique.size()];
-        int i = 0;
-        for (Integer value : unique) out[i++] = value;
         return out;
     }
 
