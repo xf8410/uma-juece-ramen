@@ -16,10 +16,14 @@ import java.io.OutputStream;
  *
  * Loads libuma_jni.so, initializes gamedata, and exposes native search.
  * Falls back gracefully if the native library is not available.
+ *
+ * If assets/strategy_optimized.json exists (produced by CMA-ES/Bayes CI),
+ * it is loaded as the strategy parameter set for all searches.
  */
 public final class UmaNativeBridge {
     private static boolean loaded = false;
     private static boolean initialized = false;
+    private static JSONObject optimizedStrategy = null;
 
     static {
         try {
@@ -37,10 +41,11 @@ public final class UmaNativeBridge {
     public static boolean isLoaded() { return loaded; }
     public static boolean isInitialized() { return initialized; }
     public static boolean isAvailable() { return loaded && initialized; }
+    public static boolean hasOptimizedStrategy() { return optimizedStrategy != null; }
 
     /**
      * Copy gamedata from assets to internal storage, then call nativeInit.
-     * Returns true if initialization succeeded.
+     * Also loads strategy_optimized.json from assets if present.
      */
     public static boolean init(Context context) {
         if (!loaded) return false;
@@ -50,7 +55,7 @@ public final class UmaNativeBridge {
         File gamedataDir = new File(dataDir, "gamedata");
         gamedataDir.mkdirs();
 
-        // Copy gamedata files from assets if not present
+        // Copy gamedata files from assets
         String[] files = {
             "constants.json", "cardDB.json", "umaDB.json",
             "text_data_dict.json", "events.json", "scenario_ramen.json",
@@ -65,11 +70,19 @@ public final class UmaNativeBridge {
                     byte[] buf = new byte[8192];
                     int len;
                     while ((len = is.read(buf)) != -1) os.write(buf, 0, len);
-                } catch (Exception e) {
-                    // Asset might not exist (e.g. scenario_onsen.json); skip
-                }
+                } catch (Exception e) { /* skip */ }
             }
         }
+
+        // Load optimized strategy from assets (CMA-ES/Bayes CI output)
+        try (InputStream is = am.open("strategy_optimized.json")) {
+            byte[] buf = new byte[is.available()];
+            is.read(buf);
+            String json = new String(buf, "UTF-8").trim();
+            if (!json.isEmpty()) {
+                optimizedStrategy = new JSONObject(json);
+            }
+        } catch (Exception e) { /* no optimized strategy, use default */ }
 
         try {
             String result = nativeInit(dataDir.getAbsolutePath());
@@ -84,12 +97,7 @@ public final class UmaNativeBridge {
 
     /**
      * Run flat Monte Carlo search for the current turn.
-     *
-     * @param summary  hlpatch /summary JSON
-     * @param umaId    character ID (e.g. 102601)
-     * @param cards    6 card idranks (e.g. [302424, 302894, ...])
-     * @param searchN  simulations per action (e.g. 32)
-     * @return JSONObject with search results, or null if unavailable
+     * Uses optimized strategy if loaded, otherwise JNI defaults.
      */
     public static JSONObject search(JSONObject summary, int umaId, int[] cards, int searchN) {
         if (!isAvailable()) return null;
@@ -100,9 +108,13 @@ public final class UmaNativeBridge {
             for (int c : cards) cardsArr.put(c);
             config.put("cards", cardsArr);
             config.put("search_n", searchN);
-            // Default inherit (can be overridden via config later)
             config.put("blue_count", new JSONArray("[15,3,0,0,0]"));
             config.put("extra_count", new JSONArray("[0,30,0,0,30,30]"));
+
+            // Inject optimized strategy if available
+            if (optimizedStrategy != null) {
+                config.put("strategy", optimizedStrategy);
+            }
 
             String result = nativeSearch(summary.toString(), config.toString());
             return new JSONObject(result);
