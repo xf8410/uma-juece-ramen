@@ -1,11 +1,11 @@
-//! 拉面杯手写策略 — 阈值/系数版（逐步加入 hzyhhzy 逻辑）
+//! 拉面杯手写策略 — 阈值/系数版（最小新增：仅 vital_eval + 外出加分）
 
 use anyhow::Result;
 use rand::prelude::StdRng;
 use serde::{Deserialize, Serialize};
 
 use umasim::game::{
-    FriendOutState, Game, Person, PersonType, Trainer,
+    FriendOutState, Game, PersonType, Trainer,
     ramen::{Operation, RamenAction, RamenGame, RamenStage, TrainingType},
 };
 use umasim::gamedata::EventChoice;
@@ -162,7 +162,7 @@ impl RamenStrategy {
 
         match &action.operation {
             Operation::Train(train_type) => {
-                self.score_training(game, *train_type, vital_before, max_vital)
+                self.score_training(game, *train_type)
             }
             Operation::Rest => {
                 let vital_after = (vital + 50).min(max_vital);
@@ -202,7 +202,7 @@ impl RamenStrategy {
         }
     }
 
-    fn score_training(&self, game: &RamenGame, train_type: TrainingType, vital_before: f64, max_vital: i32) -> f64 {
+    fn score_training(&self, game: &RamenGame, train_type: TrainingType) -> f64 {
         let train = train_type as usize;
 
         let heads = game.distribution().get(train)
@@ -224,46 +224,15 @@ impl RamenStrategy {
             + shining as f64 * self.shining_weight
             - fail_rate * self.failure_penalty;
 
-        // 羁绊价值 — 用 Person trait 方法访问
-        let person_indices: Vec<i32> = game.distribution().get(train)
-            .map(|d| d.iter().copied().filter(|&p| p >= 0).collect())
-            .unwrap_or_default();
-        for &pi in &person_indices {
-            if (pi as usize) >= game.persons().len() { continue; }
-            let person = &game.persons()[pi as usize];
-            if person.person_type() == PersonType::ScenarioCard {
-                match game.friend.out_state {
-                    FriendOutState::UnClicked => score += 150.0,
-                    _ => {
-                        if person.friendship() < 60 { score += 100.0; }
-                        else { score += 40.0; }
-                    }
-                }
-            } else if person.person_type() == PersonType::Card {
-                if person.friendship() < 80 {
-                    let mut jiban_add = 7.0;
-                    if game.uma().flags.aijiao { jiban_add += 2.0; }
-                    if person.hint() { jiban_add += 5.0; }
-                    jiban_add = jiban_add.min((80 - person.friendship()) as f64);
-                    score += jiban_add * self.jiban_value;
-                }
-                if person.hint() { score += 8.0; }
-            }
-        }
-
-        // 友人未点击时额外加分
         if game.friend.out_state == FriendOutState::UnClicked {
-            let has_friend = person_indices.iter().any(|&p| {
-                (p as usize) < game.persons().len()
-                    && game.persons()[p as usize].person_type() == PersonType::ScenarioCard
-            });
+            let has_friend = game.distribution().get(train)
+                .map(|d| d.iter().any(|&p| {
+                    p >= 0 && (p as usize) < game.persons().len()
+                        && game.persons()[p as usize].person_type == PersonType::ScenarioCard
+                }))
+                .unwrap_or(false);
             if has_friend { score += self.friend_click_bonus; }
         }
-
-        // 体力变化
-        let vital_after = (game.uma().vital + value.vital).max(0).min(max_vital);
-        let vital_change = Self::vital_eval(vital_after, max_vital) - vital_before;
-        score += vital_change * 0.3;
 
         score
     }
