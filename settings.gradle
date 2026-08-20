@@ -1,13 +1,11 @@
-// 插件仓库管理：指定 Gradle 插件的下载源
 pluginManagement {
     repositories {
-        google()              // Google 的 Maven 仓库
-        mavenCentral()        // Maven 中央仓库
-        gradlePluginPortal()  // Gradle 插件门户
+        google()
+        mavenCentral()
+        gradlePluginPortal()
     }
 }
 
-// 依赖仓库管理：指定项目依赖的下载源
 dependencyResolutionManagement {
     repositories {
         google()
@@ -15,8 +13,5 @@ dependencyResolutionManagement {
     }
 }
 
-// 项目名称（显示在 Android Studio 中）
-rootProject.name = "uma-helper"
-
-// 包含 app 模块（即 app 文件夹下的项目）
+rootProject.name = "uma-juece-ramen"
 include ':app'

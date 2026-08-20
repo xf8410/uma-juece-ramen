@@ -1,33 +1,85 @@
-name: Restore Ramen repository baseline
+name: Import uma-juece source snapshot
 
 on:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Source branch, tag, or commit
+        required: true
+        default: main
+      target_branch:
+        description: Existing workbench branch receiving the snapshot
+        required: true
+        default: workbench/import-uma-juece
 
 permissions:
   contents: write
 
 jobs:
-  restore:
+  import:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out current workbench branch
+      - name: Validate target branch
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          case "$TARGET_BRANCH" in
+            workbench/*) ;;
+            *) echo "target_branch must start with workbench/" >&2; exit 1 ;;
+          esac
+
+      - name: Check out destination branch
         uses: actions/checkout@v4
         with:
-          ref: workbench/port-pc-ramen-planners
+          ref: ${{ inputs.target_branch }}
           fetch-depth: 0
 
-      - name: Restore exact main working tree
+      - name: Clone source snapshot
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
         run: |
-          git fetch origin main
-          git rm -r --ignore-unmatch .
-          git checkout origin/main -- .
-          git clean -fd
+          git clone --depth 1 --branch "$SOURCE_REF" https://github.com/xf8410/uma-juece.git /tmp/uma-juece
 
-      - name: Commit restored Ramen-only baseline
+      - name: Replace destination working tree
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name .git ! -name .github -exec rm -rf {} +
+          find .github -mindepth 1 -maxdepth 1 ! -name workflows -exec rm -rf {} + 2>/dev/null || true
+          mkdir -p .github/workflows
+          find .github/workflows -mindepth 1 -maxdepth 1 ! -name import-uma-juece.yml -exec rm -rf {} +
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.local/' \
+            --exclude='.github/workflows/import-uma-juece.yml' \
+            /tmp/uma-juece/ ./
+          # Keep this importer available until the snapshot PR is complete.
+          test -f .github/workflows/import-uma-juece.yml
+
+      - name: Record source provenance
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          SOURCE_SHA=$(git -C /tmp/uma-juece rev-parse HEAD)
+          cat > SOURCE_SNAPSHOT.md <<EOF
+          # Source snapshot
+
+          - Source repository: https://github.com/xf8410/uma-juece
+          - Requested ref: \`${SOURCE_REF}\`
+          - Imported commit: \`${SOURCE_SHA}\`
+          - Purpose: 拉面杯专用 Android 决策浮窗的独立开发基线
+          - Rules/mechanics upstream: https://github.com/xulai1001/umaai-rs
+          EOF
+
+      - name: Commit imported snapshot
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -A
-          git diff --cached --exit-code && exit 0
-          git commit -m "fix: restore ramen-only application baseline"
-          git push origin HEAD:workbench/port-pc-ramen-planners
+          if git diff --cached --quiet; then
+            echo "No source changes to import"
+            exit 0
+          fi
+          SOURCE_SHA=$(git -C /tmp/uma-juece rev-parse --short=12 HEAD)
+          git commit -m "chore: import uma-juece snapshot ${SOURCE_SHA}"
+          git push origin "HEAD:${TARGET_BRANCH}"

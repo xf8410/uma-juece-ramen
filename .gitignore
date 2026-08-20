@@ -1,23 +1,21 @@
-# Build secrets — never commit
+# Build secrets
 secrets.properties
+local.properties
 
-# Android
+# Android/Gradle
 *.apk
 *.aab
 *.ap_
 *.dex
 build/
 .gradle/
-local.properties
 *.iml
 .idea/
 captures/
 .externalNativeBuild/
 .cxx/
 
-# Keystore
+# Signing and logs
 *.jks
 *.keystore
-
-# Logs
 *.log

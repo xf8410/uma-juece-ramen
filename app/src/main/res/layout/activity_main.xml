@@ -1,156 +1,57 @@
 <?xml version="1.0" encoding="utf-8"?>
-<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:padding="16dp"
-    android:background="#1A1A1A">
+    android:background="#1A1A1A"
+    android:gravity="center_horizontal"
+    android:orientation="vertical"
+    android:padding="24dp">
 
     <TextView
-        android:id="@+id/tv_title"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_centerHorizontal="true"
-        android:layout_marginTop="40dp"
-        android:text="赛马娘决策小黑板"
-        android:textColor="#00FF88"
-        android:textSize="20sp"
+        android:layout_marginTop="48dp"
+        android:text="拉面杯决策小黑板"
+        android:textColor="#FFAA44"
+        android:textSize="22sp"
         android:textStyle="bold" />
 
-    <!-- 剧本选择 -->
-    <LinearLayout
-        android:id="@+id/scenario_row"
-        android:layout_width="match_parent"
+    <TextView
+        android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_below="@+id/tv_title"
-        android:layout_marginTop="20dp"
-        android:orientation="horizontal"
-        android:gravity="center_vertical">
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="剧本："
-            android:textColor="#AAAAAA"
-            android:textSize="14sp" />
-
-        <Spinner
-            android:id="@+id/spinner_scenario"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:background="#2A2A2A"
-            android:popupBackground="#333333" />
-
-    </LinearLayout>
+        android:layout_marginTop="8dp"
+        android:text="专用版本 · 固定剧本 Ramen"
+        android:textColor="#AAAAAA"
+        android:textSize="13sp" />
 
     <Button
         android:id="@+id/btn_start_float"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="启动悬浮窗"
-        android:layout_below="@+id/scenario_row"
-        android:layout_centerHorizontal="true"
-        android:layout_marginTop="16dp" />
-
-    <Button
-        android:id="@+id/btn_test_fake"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="小黑板测试"
-        android:layout_below="@+id/btn_start_float"
-        android:layout_centerHorizontal="true"
-        android:layout_marginTop="12dp" />
+        android:layout_marginTop="28dp"
+        android:text="启动拉面杯浮窗" />
 
     <Button
         android:id="@+id/btn_test_http"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="测试本地通信"
-        android:layout_below="@+id/btn_test_fake"
-        android:layout_centerHorizontal="true"
-        android:layout_marginTop="12dp" />
+        android:layout_marginTop="12dp"
+        android:text="测试本地通信" />
 
     <Button
         android:id="@+id/btn_stop_float"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="停止悬浮窗"
-        android:layout_below="@+id/btn_test_http"
-        android:layout_centerHorizontal="true"
-        android:layout_marginTop="12dp" />
-
-    <LinearLayout
-        android:id="@+id/data_collection_row"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_below="@+id/btn_stop_float"
         android:layout_marginTop="12dp"
-        android:orientation="horizontal"
-        android:gravity="center_vertical">
-
-        <TextView
-            android:id="@+id/tv_data_status"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:textColor="#88CC88"
-            android:textSize="12sp"
-            android:text="本局状态：请查看悬浮窗" />
-
-        <Button
-            android:id="@+id/btn_upload_data"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="封存并上传本局"
-            android:textSize="11sp"
-            android:padding="4dp" />
-
-    </LinearLayout>
-
-    <LinearLayout
-        android:id="@+id/local_backup_row"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_below="@+id/data_collection_row"
-        android:layout_marginTop="8dp"
-        android:gravity="center"
-        android:orientation="horizontal">
-
-        <Button
-            android:id="@+id/btn_choose_backup"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="选择本地目录"
-            android:textSize="11sp" />
-
-        <Button
-            android:id="@+id/btn_backup_now"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
-            android:text="立即备份"
-            android:textSize="11sp" />
-    </LinearLayout>
-
-    <TextView
-        android:id="@+id/tv_backup_status"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_below="@+id/local_backup_row"
-        android:gravity="center"
-        android:text="本地备份：未选择目录"
-        android:textColor="#88CC88"
-        android:textSize="11sp" />
+        android:text="停止悬浮窗" />
 
     <TextView
         android:id="@+id/tv_status"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_below="@+id/tv_backup_status"
-        android:layout_centerHorizontal="true"
-        android:layout_marginTop="12dp"
-        android:textColor="#888888"
-        android:textSize="14sp"
-        android:text="本地通信：未启动" />
-
-</RelativeLayout>
+        android:layout_marginTop="20dp"
+        android:gravity="center"
+        android:text="本地通信：未启动"
+        android:textColor="#88CC88"
+        android:textSize="13sp" />
+</LinearLayout>
