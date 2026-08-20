@@ -83,18 +83,23 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-      - name: Install NDK
-        run: |
-          yes | sdkmanager "ndk;27.2.12479018" || true
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> $GITHUB_ENV
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked || true
+      - name: Find NDK
+        run: |
+          NDK_DIR=$(ls -d /usr/local/lib/android/sdk/ndk/*/ 2>/dev/null | head -1)
+          if [ -z "$NDK_DIR" ]; then
+            echo "No NDK found, installing..."
+            yes | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager "ndk;27.2.12479018" 2>/dev/null || true
+            NDK_DIR="/usr/local/lib/android/sdk/ndk/27.2.12479018/"
+          fi
+          NDK_DIR="${NDK_DIR%/}"
+          echo "NDK at: $NDK_DIR"
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -105,7 +110,6 @@ jobs:
           key: cargo-android-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
           restore-keys: cargo-android-${{ runner.os }}-
       - name: Build native library
-        id: build-native
         continue-on-error: true
         run: |
           cd rust
@@ -115,6 +119,7 @@ jobs:
           mkdir -p app/src/main/jniLibs/arm64-v8a
           if [ -f rust/target/aarch64-linux-android/release/libuma_jni.so ]; then
             cp rust/target/aarch64-linux-android/release/libuma_jni.so app/src/main/jniLibs/arm64-v8a/
+            echo "Native library copied"
           else
             echo "No .so — APK will use fallback TrainingEvaluator"
           fi
@@ -125,6 +130,8 @@ jobs:
           for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
             curl -sSL "$BASE/$f" -o "app/src/main/assets/gamedata/$f" || echo "WARN: $f"
           done
+      - name: Create local.properties
+        run: echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
       - name: Build APK
         run: ./gradlew assembleDebug --no-daemon 2>&1
       - name: Run tests
