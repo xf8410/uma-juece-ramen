@@ -98,7 +98,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                 + " 力" + stats.optInt("power") + " 根" + stats.optInt("guts")
                 + " 智" + stats.optInt("wiz") + " 总计" + totalStat
                 + " Pt" + stats.optInt("skill_point")
-                + "\n体力" + stats.optInt("vital") + "/" + stats.optInt("max_vital")
+                +"\n体力" + stats.optInt("vital") + "/" + stats.optInt("max_vital")
                 + " 干劲" + stats.optString("motivation", "?"));
         ramenView.setText(RamenDecisionSupport.stateLine(summary));
         trainingsView.setText(renderTrainings(summary.optJSONArray("trainings"))
@@ -124,6 +124,8 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                 int hp = g.optInt("HP"); if (hp != 0) out.append(" HP").append(hp > 0 ? "+" : "").append(hp);
             }
             int failure = tr.optInt("failure_rate", 0); if (failure > 0) out.append(" 失败").append(failure).append('%');
+            int heads = tr.optInt("heads", 0); if (heads > 0) out.append(" 头").append(heads);
+            int shining = tr.optInt("shining", 0); if (shining > 0) out.append(" 光").append(shining);
         }
         return out.toString();
     }
