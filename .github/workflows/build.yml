@@ -16,7 +16,7 @@ on:
         type: string
       opt_mode:
         description: '优化模式（cmaes / bayes，留空=不跑优化）'
-        default: ''
+        default: 'bayes'
         type: string
       opt_arg1:
         description: 'CMA-ES=代数 / Bayes=初始采样数'
@@ -24,7 +24,7 @@ on:
         type: string
       opt_arg2:
         description: 'CMA-ES=种群 / Bayes=迭代次数'
-        default: '8'
+        default: '20'
         type: string
       opt_games:
         description: '每次评估局数'
