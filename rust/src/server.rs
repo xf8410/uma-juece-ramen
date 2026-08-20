@@ -1,13 +1,7 @@
 //! 云端搜索服务器 — 手机发状态，云端跑蒙特卡洛，返回推荐
-//!
-//! POST /search  { "state": {...}, "config": {...} }  → SearchResult
-//! GET  /health  → {"ok":true}
-//!
-//! 环境变量：
-//!   PORT=8080  监听端口
-//!   STRATEGY_IN=strategy_optimized.json  优化策略文件路径
+//! (暂未启用，需部署后取消注释 Cargo.toml 中的 [[bin]] ramen_server)
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 
 use rand::{SeedableRng, rngs::StdRng};
@@ -116,7 +110,6 @@ fn main() {
             let req = String::from_utf8_lossy(&buf[..n]);
 
             let (status, body) = if req.contains("POST /search") {
-                // Extract JSON body from HTTP request
                 let body_start = req.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
                 let json_body = &req[body_start..];
                 let result = handle_search(json_body, &strategy);
@@ -133,7 +126,6 @@ fn main() {
                 "HTTP/1.1 {}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 status, body.len(), body
             );
-            use std::io::Write;
             let mut stream = stream;
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
