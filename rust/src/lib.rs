@@ -47,6 +47,7 @@ pub struct RuntimeStats {
     #[serde(default)] pub vital: i32,
     #[serde(default)] pub max_vital: i32,
     /// 干劲：hlpatch 可能返回整数或字符串 "Best"/"Good"/"Normal"/"Bad"/"Worst"
+    /// 上游约定：0=绝不调, 1=不调, 2=普通, 3=好调, 4=绝好调（越大越好）
     #[serde(default, deserialize_with = "deserialize_motivation")]
     pub motivation: i32,
 }
@@ -95,37 +96,25 @@ pub struct ActionScore {
 
 // ── Custom deserializer for motivation ─────────────────────────────
 
-/// 接受整数或字符串，将干劲名称映射为整数索引：
-/// 0=絶好調(Best), 1=好調(Good), 2=普通(Normal), 3=不調(Bad), 4=絶不調(Worst)
+/// 接受整数或字符串，映射为上游约定：0=绝不调 ~ 4=绝好调
 fn deserialize_motivation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
     use serde::de::Error;
-
     let v: serde_json::Value = Deserialize::deserialize(d)?;
     match v {
-        serde_json::Value::Number(n) => {
-            Ok(n.as_i64().unwrap_or(0) as i32)
-        }
+        serde_json::Value::Number(n) => Ok(n.as_i64().unwrap_or(2) as i32),
         serde_json::Value::String(s) => {
             let lower = s.to_lowercase();
             let val = match lower.as_str() {
-                "best" | "perfect" | "絶好調" | "絶好" | "绝好调" | "绝好" => 0,
-                "good" | "好調" | "好" | "好调" => 1,
+                "best" | "perfect" | "絶好調" | "絶好" | "绝好调" | "绝好" => 4,
+                "good" | "好調" | "好" | "好调" => 3,
                 "normal" | "普通" => 2,
-                "bad" | "不調" | "不" | "不调" => 3,
-                "worst" | "絶不調" | "絶不" | "绝不调" | "绝不" => 4,
-                _ => {
-                    // 尝试解析为数字字符串
-                    if let Ok(n) = s.parse::<i32>() {
-                        n
-                    } else {
-                        log::warn!("未知干劲值: {s}, 默认 0");
-                        0
-                    }
-                }
+                "bad" | "不調" | "不" | "不调" => 1,
+                "worst" | "絶不調" | "絶不" | "绝不调" | "绝不" => 0,
+                _ => s.parse::<i32>().unwrap_or(2),
             };
             Ok(val)
         }
-        _ => Ok(0),
+        _ => Ok(2),
     }
 }
 
@@ -261,7 +250,6 @@ pub fn run_flat_search(game: &RamenGame, search_n: usize, strategy: &ramen_strat
                     continue;
                 }
 
-                // Run remaining game with the handwritten strategy
                 let _ = sim_game.run_full_game(strategy, &mut rng);
 
                 let score = sim_game.uma().calc_score() as f64;
