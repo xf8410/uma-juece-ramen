@@ -5,7 +5,7 @@ use rand::prelude::StdRng;
 use serde::{Deserialize, Serialize};
 
 use umasim::game::{
-    FriendOutState, Game, PersonType, Trainer,
+    FriendOutState, Game, Person, PersonType, Trainer,
     ramen::{Operation, RamenAction, RamenGame, RamenStage, TrainingType},
 };
 use umasim::gamedata::EventChoice;
@@ -224,30 +224,30 @@ impl RamenStrategy {
             + shining as f64 * self.shining_weight
             - fail_rate * self.failure_penalty;
 
-        // 羁绊价值 — 收集 person indices 后统一访问避免借用问题
+        // 羁绊价值 — 用 Person trait 方法访问
         let person_indices: Vec<i32> = game.distribution().get(train)
             .map(|d| d.iter().copied().filter(|&p| p >= 0).collect())
             .unwrap_or_default();
         for &pi in &person_indices {
             if (pi as usize) >= game.persons().len() { continue; }
             let person = &game.persons()[pi as usize];
-            if person.person_type == PersonType::ScenarioCard {
+            if person.person_type() == PersonType::ScenarioCard {
                 match game.friend.out_state {
                     FriendOutState::UnClicked => score += 150.0,
                     _ => {
-                        if person.friendship < 60 { score += 100.0; }
+                        if person.friendship() < 60 { score += 100.0; }
                         else { score += 40.0; }
                     }
                 }
-            } else if person.person_type == PersonType::Card {
-                if person.friendship < 80 {
+            } else if person.person_type() == PersonType::Card {
+                if person.friendship() < 80 {
                     let mut jiban_add = 7.0;
                     if game.uma().flags.aijiao { jiban_add += 2.0; }
-                    if person.is_hint { jiban_add += 5.0; }
-                    jiban_add = jiban_add.min((80 - person.friendship) as f64);
+                    if person.hint() { jiban_add += 5.0; }
+                    jiban_add = jiban_add.min((80 - person.friendship()) as f64);
                     score += jiban_add * self.jiban_value;
                 }
-                if person.is_hint { score += 8.0; }
+                if person.hint() { score += 8.0; }
             }
         }
 
@@ -255,7 +255,7 @@ impl RamenStrategy {
         if game.friend.out_state == FriendOutState::UnClicked {
             let has_friend = person_indices.iter().any(|&p| {
                 (p as usize) < game.persons().len()
-                    && game.persons()[p as usize].person_type == PersonType::ScenarioCard
+                    && game.persons()[p as usize].person_type() == PersonType::ScenarioCard
             });
             if has_friend { score += self.friend_click_bonus; }
         }
