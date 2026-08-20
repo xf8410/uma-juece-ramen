@@ -152,6 +152,8 @@ jobs:
           done
       - name: Create local.properties
         run: echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
+      - name: Generate Gradle wrapper
+        run: gradle wrapper --gradle-version 8.5
       - name: Build APK
         run: ./gradlew assembleDebug --no-daemon 2>&1
       - name: Run tests
