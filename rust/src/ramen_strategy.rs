@@ -24,16 +24,16 @@ pub struct RamenStrategy {
     // ── 训练决策 ──
     pub head_weight: f64,
     pub shining_weight: f64,
-    pub failure_penalty: f64,       // 小失败期望值（≤20%失败率）
-    pub big_fail_penalty: f64,       // 大失败期望值（>20%失败率）
-    pub jiban_value: f64,           // 每点羁绊的价值
-    pub status_soft_cap: f64,       // 属性软截断保留空间
+    pub failure_penalty: f64,
+    pub big_fail_penalty: f64,
+    pub jiban_value: f64,
+    pub status_soft_cap: f64,
 
     // ── 休息/外出 ──
     pub vital_rest_threshold: i32,
     pub motivation_outing_threshold: i32,
     pub friend_outing_score: f64,
-    pub outing_motivation_bonus: f64, // 心情未满时外出加分
+    pub outing_motivation_bonus: f64,
 
     // ── 万能材料管理 ──
     pub special_overflow_threshold: i32,
@@ -79,10 +79,7 @@ impl Default for RamenStrategy {
 
 impl Trainer<RamenGame> for RamenStrategy {
     fn select_action(
-        &self,
-        game: &RamenGame,
-        actions: &[RamenAction],
-        _rng: &mut StdRng,
+        &self, game: &RamenGame, actions: &[RamenAction], _rng: &mut StdRng,
     ) -> Result<usize> {
         if actions.len() <= 1 { return Ok(0); }
         let scores: Vec<f64> = actions.iter().map(|a| self.score_action(game, a)).collect();
@@ -102,7 +99,6 @@ impl Trainer<RamenGame> for RamenStrategy {
         let min_stat_idx = (0..5usize).min_by(|&a, &b| five_status[a].cmp(&five_status[b])).unwrap_or(0);
         let vital_low = vital < self.vital_rest_threshold;
         let motivation_low = motivation < self.motivation_outing_threshold;
-
         let scores: Vec<f64> = choices.iter().map(|option| {
             if option.is_empty() { return 0.0; }
             let choice = &option[0];
@@ -124,7 +120,6 @@ impl Trainer<RamenGame> for RamenStrategy {
             if v.motivation > 0 && !motivation_low { score += v.motivation as f64 * 0.5; }
             score
         }).collect();
-
         let best = scores.iter().enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i).unwrap_or(0);
@@ -178,7 +173,6 @@ impl RamenStrategy {
     }
 
     /// 属性软截断（借鉴 hzyhhzy statusSoftFunction）
-    /// x = gain - remaining; x>=0 无空间返回0; x<0 有空间返回正值
     fn status_soft(x: f64, reserve: f64) -> f64 {
         let r_inv = 1.0 / (2.0 * reserve);
         if x >= 0.0 { 0.0 }
@@ -186,7 +180,6 @@ impl RamenStrategy {
         else { x + 0.5 * reserve }
     }
 
-    /// Train 阶段：评估训练/休息/外出/比赛
     fn score_train(&self, game: &RamenGame, action: &RamenAction) -> f64 {
         let vital = game.uma().vital;
         let max_vital = game.uma().max_vital;
@@ -201,7 +194,6 @@ impl RamenStrategy {
                 self.score_training(game, *train_type, vital_before, max_vital)
             }
             Operation::Rest => {
-                // 体力分段估值：休息回复 ~50 体力
                 let vital_after = (vital + 50).min(max_vital);
                 let gain = Self::vital_evaluation(vital_after, max_vital) - vital_before;
                 let mut score = gain * 0.5;
@@ -239,11 +231,9 @@ impl RamenStrategy {
         }
     }
 
-    /// 训练评分：属性增益（含软截断）+ 羁绊 + 人头 + 发光 - 失败期望
     fn score_training(&self, game: &RamenGame, train_type: TrainingType, vital_before: f64, max_vital: i32) -> f64 {
         let train = train_type as usize;
 
-        // 人头数（排除理事长和记者）
         let heads = game.distribution().get(train)
             .map(|d| d.iter().filter(|&&p| {
                 p >= 0 && (p as usize) < game.persons().len()
@@ -254,7 +244,7 @@ impl RamenStrategy {
 
         let shining = game.shining_count(train);
         let buffs = game.calc_training_buff(train).unwrap_or_default();
-        let fail_rate = game.calc_training_failure_rate(&buffs, train);
+        let fail_rate = game.calc_training_failure_rate(&buffs, train) as f64;
         let value = game.calc_training_value(&buffs, train).unwrap_or_default();
 
         // ── 属性增益 + 软截断 ──
@@ -277,7 +267,7 @@ impl RamenStrategy {
             + heads as f64 * self.head_weight
             + shining as f64 * self.shining_weight;
 
-        // ── 羁绊价值（借鉴 hzyhhzy）──
+        // ── 羁绊价值 ──
         for j in 0..5 {
             let pi = match game.distribution().get(train).and_then(|d| d.get(j)) {
                 Some(&p) if p >= 0 && (p as usize) < game.persons().len() => p as usize,
@@ -285,7 +275,6 @@ impl RamenStrategy {
             };
             let person = &game.persons()[pi];
             if person.person_type == PersonType::ScenarioCard {
-                // 友人卡分层
                 match game.friend.out_state {
                     FriendOutState::UnClicked => score += 150.0,
                     _ => {
@@ -295,7 +284,6 @@ impl RamenStrategy {
                     }
                 }
             } else if person.person_type == PersonType::Card {
-                // 普通支援卡羁绊
                 let fr = person.friendship;
                 if fr < 80 {
                     let mut jiban_add = 7.0;
@@ -304,7 +292,6 @@ impl RamenStrategy {
                     jiban_add = jiban_add.min((80 - fr) as f64);
                     score += jiban_add * self.jiban_value;
                 }
-                // Hint 加分
                 if person.is_hint {
                     score += 8.0;
                 }
@@ -322,7 +309,7 @@ impl RamenStrategy {
             if has_friend { score += self.friend_click_bonus; }
         }
 
-        // ── 失败率分级（借鉴 hzyhhzy）──
+        // ── 失败率分级 ──
         if fail_rate > 0.0 {
             let big_fail_prob = if fail_rate > 20.0 { fail_rate } else { 0.0 };
             let fail_value_avg = 0.01 * big_fail_prob * (-self.big_fail_penalty)
