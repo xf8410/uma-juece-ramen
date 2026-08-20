@@ -1,4 +1,4 @@
-//! 拉面杯手写策略 — 阈值/系数版（借鉴 hzyhhzy/UmaAi 通用逻辑）
+//! 拉面杯手写策略 — 最小版（仅验证 18 参数结构编译通过）
 
 use anyhow::Result;
 use rand::prelude::StdRng;
@@ -37,7 +37,7 @@ impl Default for RamenStrategy {
         Self {
             head_weight: 15.0,
             shining_weight: 40.0,
-            failure_penalty: 150.0,
+            failure_penalty: 2.0,
             big_fail_penalty: 500.0,
             jiban_value: 12.0,
             status_soft_cap: 40.0,
@@ -144,44 +144,26 @@ impl RamenStrategy {
         -targets.iter().sum::<i32>() as f64
     }
 
-    fn vital_evaluation(vital: i32, max_vital: i32) -> f64 {
-        if vital <= 50 { 2.0 * vital as f64 }
-        else if vital <= 70 { 100.0 + 1.5 * (vital - 50) as f64 }
-        else if vital <= max_vital { 130.0 + 1.0 * (vital - 70) as f64 }
-        else { Self::vital_evaluation(max_vital, max_vital) }
-    }
-
-    fn status_soft(x: f64, reserve: f64) -> f64 {
-        let r_inv = 1.0 / (2.0 * reserve);
-        if x >= 0.0 { 0.0 }
-        else if x > -reserve { -x * x * r_inv }
-        else { x + 0.5 * reserve }
-    }
-
     fn score_train(&self, game: &RamenGame, action: &RamenAction) -> f64 {
         let vital = game.uma().vital;
-        let max_vital = game.uma().max_vital;
         let motivation = game.uma().motivation;
         let turn = game.base.turn;
         let is_early = turn < 2;
         let not_best = motivation < 5;
-        let vital_before = Self::vital_evaluation(vital, max_vital);
 
         match &action.operation {
             Operation::Train(train_type) => {
-                self.score_training(game, *train_type, vital_before, max_vital)
+                self.score_training(game, *train_type)
             }
             Operation::Rest => {
-                let vital_after = (vital + 50).min(max_vital);
-                let gain = Self::vital_evaluation(vital_after, max_vital) - vital_before;
-                let mut score = gain * 0.5;
+                let deficit = (self.vital_rest_threshold - vital).max(0) as f64;
+                let mut score = 50.0 + deficit * 3.0;
                 if is_early && vital > 15 { score *= 0.3; }
                 score
             }
             Operation::NormalOuting => {
                 let deficit = (self.motivation_outing_threshold - motivation).max(0) as f64;
                 let mut score = 20.0 + deficit * 25.0;
-                if not_best { score += self.outing_motivation_bonus; }
                 if is_early && not_best { score += 80.0; }
                 score
             }
@@ -209,7 +191,7 @@ impl RamenStrategy {
         }
     }
 
-    fn score_training(&self, game: &RamenGame, train_type: TrainingType, vital_before: f64, max_vital: i32) -> f64 {
+    fn score_training(&self, game: &RamenGame, train_type: TrainingType) -> f64 {
         let train = train_type as usize;
 
         let heads = game.distribution().get(train)
@@ -224,83 +206,22 @@ impl RamenStrategy {
         let buffs = game.calc_training_buff(train).unwrap_or_default();
         let fail_rate = game.calc_training_failure_rate(&buffs, train) as f64;
         let value = game.calc_training_value(&buffs, train).unwrap_or_default();
+        let total_gain: i32 = value.status_pt.iter().sum();
 
-        // 属性增益 + 软截断
-        let five_status = &game.uma().five_status;
-        let five_status_limit = &game.uma().five_status_limit;
-        let remain_turn = 78 - game.base.turn;
-        let reserve = self.status_soft_cap * remain_turn as f64 / 78.0;
-        let final_bonus = 45.0;
-
-        let mut status_score = 0.0;
-        for sta in 0..5usize {
-            let remain = (five_status_limit[sta] - five_status[sta]) as f64 - final_bonus;
-            let s0 = Self::status_soft(-remain, reserve);
-            let s1 = Self::status_soft(value.status_pt[sta] as f64 - remain, reserve);
-            status_score += 6.0 * (s1 - s0);
-        }
-        let pt_score = value.status_pt[5] as f64 * 2.0;
-
-        let mut score = status_score + pt_score
+        let mut score = total_gain as f64
             + heads as f64 * self.head_weight
-            + shining as f64 * self.shining_weight;
+            + shining as f64 * self.shining_weight
+            - fail_rate * self.failure_penalty;
 
-        // 羁绊价值 — 用 Option 避免悬垂引用
-        let dist = game.distribution();
-        let dist_train: Option<&Vec<i32>> = dist.get(train);
-        for j in 0..5usize {
-            let pi = match dist_train {
-                Some(d) => match d.get(j) {
-                    Some(&p) if p >= 0 && (p as usize) < game.persons().len() => p as usize,
-                    _ => break,
-                },
-                None => break,
-            };
-            let person = &game.persons()[pi];
-            if person.person_type == PersonType::ScenarioCard {
-                match game.friend.out_state {
-                    FriendOutState::UnClicked => score += 150.0,
-                    _ => {
-                        if person.friendship < 60 { score += 100.0; }
-                        else { score += 40.0; }
-                    }
-                }
-            } else if person.person_type == PersonType::Card {
-                if person.friendship < 80 {
-                    let mut jiban_add = 7.0;
-                    if game.uma().flags.aijiao { jiban_add += 2.0; }
-                    if person.is_hint { jiban_add += 5.0; }
-                    jiban_add = jiban_add.min((80 - person.friendship) as f64);
-                    score += jiban_add * self.jiban_value;
-                }
-                if person.is_hint { score += 8.0; }
-            }
-        }
-
-        // 友人未点击时额外加分
         if game.friend.out_state == FriendOutState::UnClicked {
-            let has_friend = match dist_train {
-                Some(d) => d.iter().any(|&p| {
+            let has_friend = game.distribution().get(train)
+                .map(|d| d.iter().any(|&p| {
                     p >= 0 && (p as usize) < game.persons().len()
                         && game.persons()[p as usize].person_type == PersonType::ScenarioCard
-                }),
-                None => false,
-            };
+                }))
+                .unwrap_or(false);
             if has_friend { score += self.friend_click_bonus; }
         }
-
-        // 失败率分级
-        if fail_rate > 0.0 {
-            let big_fail_prob = if fail_rate > 20.0 { fail_rate } else { 0.0 };
-            let fail_value_avg = 0.01 * big_fail_prob * (-self.big_fail_penalty)
-                + (1.0 - 0.01 * big_fail_prob) * (-self.failure_penalty);
-            score = 0.01 * fail_rate * fail_value_avg + (1.0 - 0.01 * fail_rate) * score;
-        }
-
-        // 体力变化
-        let vital_after = (game.uma().vital + value.vital).max(0).min(max_vital);
-        let vital_change = Self::vital_evaluation(vital_after, max_vital) - vital_before;
-        score += vital_change * 0.3;
 
         score
     }
