@@ -1,4 +1,4 @@
-//! 拉面杯手写策略 — 阈值/系数版（借鉴 hzyhhzy 通用逻辑）
+//! 拉面杯手写策略 — 阈值/系数版（逐步加入 hzyhhzy 逻辑）
 
 use anyhow::Result;
 use rand::prelude::StdRng;
@@ -145,19 +145,10 @@ impl RamenStrategy {
     }
 
     fn vital_eval(vital: i32, max_vital: i32) -> f64 {
-        if vital <= 50 { 2.0 * vital as f64 }
-        else if vital <= 70 { 100.0 + 1.5 * (vital - 50) as f64 }
-        else if vital <= max_vital { 130.0 + (vital - 70) as f64 }
-        else if max_vital <= 50 { 2.0 * max_vital as f64 }
-        else if max_vital <= 70 { 100.0 + 1.5 * (max_vital - 50) as f64 }
-        else { 130.0 + (max_vital - 70) as f64 }
-    }
-
-    fn status_soft(x: f64, reserve: f64) -> f64 {
-        let r_inv = 1.0 / (2.0 * reserve);
-        if x >= 0.0 { 0.0 }
-        else if x > -reserve { -x * x * r_inv }
-        else { x + 0.5 * reserve }
+        let v = vital.max(0).min(max_vital.max(0));
+        if v <= 50 { 2.0 * v as f64 }
+        else if v <= 70 { 100.0 + 1.5 * (v - 50) as f64 }
+        else { 130.0 + (v - 70) as f64 }
     }
 
     fn score_train(&self, game: &RamenGame, action: &RamenAction) -> f64 {
@@ -233,55 +224,39 @@ impl RamenStrategy {
             + shining as f64 * self.shining_weight
             - fail_rate * self.failure_penalty;
 
-        // 属性软截断
-        let five_status = &game.uma().five_status;
-        let five_status_limit = &game.uma().five_status_limit;
-        let remain_turn = 78 - game.base.turn;
-        let reserve = self.status_soft_cap * remain_turn as f64 / 78.0;
-        let final_bonus = 45.0;
-        for sta in 0..5usize {
-            let remain = (five_status_limit[sta] - five_status[sta]) as f64 - final_bonus;
-            if remain < 0.0 {
-                score -= 6.0 * (-remain).min(reserve);
-            }
-        }
-
-        // 羁绊价值
-        let dist_train = game.distribution().get(train);
-        if let Some(d) = dist_train {
-            for j in 0..d.len() {
-                let pi = d[j];
-                if pi < 0 || (pi as usize) >= game.persons().len() { continue; }
-                let person = &game.persons()[pi as usize];
-                if person.person_type == PersonType::ScenarioCard {
-                    match game.friend.out_state {
-                        FriendOutState::UnClicked => score += 150.0,
-                        _ => {
-                            if person.friendship < 60 { score += 100.0; }
-                            else { score += 40.0; }
-                        }
+        // 羁绊价值 — 收集 person indices 后统一访问避免借用问题
+        let person_indices: Vec<i32> = game.distribution().get(train)
+            .map(|d| d.iter().copied().filter(|&p| p >= 0).collect())
+            .unwrap_or_default();
+        for &pi in &person_indices {
+            if (pi as usize) >= game.persons().len() { continue; }
+            let person = &game.persons()[pi as usize];
+            if person.person_type == PersonType::ScenarioCard {
+                match game.friend.out_state {
+                    FriendOutState::UnClicked => score += 150.0,
+                    _ => {
+                        if person.friendship < 60 { score += 100.0; }
+                        else { score += 40.0; }
                     }
-                } else if person.person_type == PersonType::Card {
-                    if person.friendship < 80 {
-                        let mut jiban_add = 7.0;
-                        if game.uma().flags.aijiao { jiban_add += 2.0; }
-                        if person.is_hint { jiban_add += 5.0; }
-                        jiban_add = jiban_add.min((80 - person.friendship) as f64);
-                        score += jiban_add * self.jiban_value;
-                    }
-                    if person.is_hint { score += 8.0; }
                 }
+            } else if person.person_type == PersonType::Card {
+                if person.friendship < 80 {
+                    let mut jiban_add = 7.0;
+                    if game.uma().flags.aijiao { jiban_add += 2.0; }
+                    if person.is_hint { jiban_add += 5.0; }
+                    jiban_add = jiban_add.min((80 - person.friendship) as f64);
+                    score += jiban_add * self.jiban_value;
+                }
+                if person.is_hint { score += 8.0; }
             }
         }
 
         // 友人未点击时额外加分
         if game.friend.out_state == FriendOutState::UnClicked {
-            let has_friend = game.distribution().get(train)
-                .map(|d| d.iter().any(|&p| {
-                    p >= 0 && (p as usize) < game.persons().len()
-                        && game.persons()[p as usize].person_type == PersonType::ScenarioCard
-                }))
-                .unwrap_or(false);
+            let has_friend = person_indices.iter().any(|&p| {
+                (p as usize) < game.persons().len()
+                    && game.persons()[p as usize].person_type == PersonType::ScenarioCard
+            });
             if has_friend { score += self.friend_click_bonus; }
         }
 
