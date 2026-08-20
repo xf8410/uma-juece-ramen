@@ -14,6 +14,18 @@ on:
         description: '策略参数 JSON（留空用默认）'
         default: ''
         type: string
+      opt_generations:
+        description: 'CMA-ES 优化代数（0=不跑优化）'
+        default: '0'
+        type: string
+      opt_pop:
+        description: 'CMA-ES 种群大小'
+        default: '8'
+        type: string
+      opt_games:
+        description: 'CMA-ES 每次评估局数'
+        default: '50'
+        type: string
 
 jobs:
   rust-check:
@@ -33,6 +45,8 @@ jobs:
           restore-keys: rust-${{ runner.os }}-
       - name: Build batch runner
         run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_batch
+      - name: Build optimizer
+        run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_optimize
       - name: Build JNI lib
         run: cargo build --manifest-path rust/Cargo.toml --lib
 
@@ -72,6 +86,45 @@ jobs:
           N="${{ github.event.inputs.sim_count || '100' }}"
           cargo run --release --manifest-path rust/Cargo.toml --bin ramen_batch -- "$N" 2>&1 | tee /tmp/sim_output.txt || echo "SIM_FAILED" >> /tmp/sim_output.txt
           cat /tmp/sim_output.txt >> "$GITHUB_STEP_SUMMARY"
+
+  optimize:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.opt_generations != '0' && github.event.inputs.opt_generations != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: rust-opt-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
+          restore-keys: |
+            rust-opt-${{ runner.os }}-
+            rust-sim-${{ runner.os }}-
+            rust-${{ runner.os }}-
+      - name: Download gamedata
+        run: |
+          mkdir -p gamedata
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+            curl -sSL "$BASE/$f" -o "gamedata/$f" || echo "WARN: $f"
+          done
+      - name: Build optimizer
+        run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_optimize
+      - name: Run CMA-ES optimization
+        run: |
+          cd /tmp
+          cp -r ${{ github.workspace }}/gamedata .
+          cp -r ${{ github.workspace }}/rust .
+          GENS="${{ github.event.inputs.opt_generations || '10' }}"
+          POP="${{ github.event.inputs.opt_pop || '8' }}"
+          GAMES="${{ github.event.inputs.opt_games || '50' }}"
+          cargo run --release --manifest-path rust/Cargo.toml --bin ramen_optimize -- "$GENS" "$POP" "$GAMES" 2>&1 | tee /tmp/opt_output.txt || echo "OPT_FAILED" >> /tmp/opt_output.txt
+          cat /tmp/opt_output.txt >> "$GITHUB_STEP_SUMMARY"
 
   android:
     runs-on: ubuntu-latest
