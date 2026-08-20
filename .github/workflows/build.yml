@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       sim_count:
-        description: '模拟局数'
+        description: '模拟局数（0=不跑模拟）'
         default: '100'
         type: string
       strategy_json:
@@ -15,8 +15,8 @@ on:
         default: ''
         type: string
       opt_generations:
-        description: 'CMA-ES 优化代数（0=不跑优化）'
-        default: '0'
+        description: 'CMA-ES 优化代数（0=不跑优化，默认10）'
+        default: '10'
         type: string
       opt_pop:
         description: 'CMA-ES 种群大小'
@@ -51,6 +51,7 @@ jobs:
         run: cargo build --manifest-path rust/Cargo.toml --lib
 
   simulate:
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.sim_count != '0'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
