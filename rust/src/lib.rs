@@ -46,7 +46,9 @@ pub struct RuntimeStats {
     #[serde(default)] pub skill_point: i32,
     #[serde(default)] pub vital: i32,
     #[serde(default)] pub max_vital: i32,
-    #[serde(default)] pub motivation: i32,
+    /// 干劲：hlpatch 可能返回整数或字符串 "Best"/"Good"/"Normal"/"Bad"/"Worst"
+    #[serde(default, deserialize_with = "deserialize_motivation")]
+    pub motivation: i32,
 }
 
 #[derive(Deserialize)]
@@ -89,6 +91,42 @@ pub struct ActionScore {
     pub action_display: String,
     pub score_mean: f64,
     pub count: usize,
+}
+
+// ── Custom deserializer for motivation ─────────────────────────────
+
+/// 接受整数或字符串，将干劲名称映射为整数索引：
+/// 0=絶好調(Best), 1=好調(Good), 2=普通(Normal), 3=不調(Bad), 4=絶不調(Worst)
+fn deserialize_motivation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+    use serde::de::Error;
+
+    let v: serde_json::Value = Deserialize::deserialize(d)?;
+    match v {
+        serde_json::Value::Number(n) => {
+            Ok(n.as_i64().unwrap_or(0) as i32)
+        }
+        serde_json::Value::String(s) => {
+            let lower = s.to_lowercase();
+            let val = match lower.as_str() {
+                "best" | "perfect" | "絶好調" | "絶好" | "绝好调" | "绝好" => 0,
+                "good" | "好調" | "好" | "好调" => 1,
+                "normal" | "普通" => 2,
+                "bad" | "不調" | "不" | "不调" => 3,
+                "worst" | "絶不調" | "絶不" | "绝不调" | "绝不" => 4,
+                _ => {
+                    // 尝试解析为数字字符串
+                    if let Ok(n) = s.parse::<i32>() {
+                        n
+                    } else {
+                        log::warn!("未知干劲值: {s}, 默认 0");
+                        0
+                    }
+                }
+            };
+            Ok(val)
+        }
+        _ => Ok(0),
+    }
 }
 
 // ── State injection ──────────────────────────────────────────────────
