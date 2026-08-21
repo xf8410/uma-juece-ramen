@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   upstream-all-tests:
     name: Upstream umaai-rs all library tests
@@ -52,9 +55,33 @@ jobs:
             test -s "gamedata/$f"
           done
       - name: Test all Rust targets (warnings denied)
+        id: rust_tests
+        continue-on-error: true
         env:
           RUSTFLAGS: -D warnings
-        run: cargo test --release --manifest-path rust/Cargo.toml --all-targets
+        run: |
+          set -o pipefail
+          cargo test --release --manifest-path rust/Cargo.toml --all-targets 2>&1 | tee strict-rust.log
+      - name: Publish exact Rust failure diagnostics
+        if: steps.rust_tests.outcome == 'failure' && github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          {
+            echo '# Strict Rust test diagnostics'
+            echo
+            echo '```text'
+            cat strict-rust.log
+            echo '```'
+          } > reports/strict-rust-failure.md
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add reports/strict-rust-failure.md
+          git commit -m 'test: 保存严格Rust失败诊断 [skip ci]'
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+      - name: Enforce Rust test result
+        if: steps.rust_tests.outcome == 'failure'
+        run: exit 1
 
   android-tests-and-build:
     name: Android unit tests, native build, APK build
