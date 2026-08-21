@@ -41,6 +41,24 @@ jobs:
             curl --fail --silent --show-error --location "$BASE/$f" -o "gamedata/$f"
             test -s "gamedata/$f"
           done
+      - name: Make A use the strategy packaged by the Android app
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('rust/src/policy_ab.rs')
+          text = path.read_text()
+          old = 'let old = RamenStrategy::default();'
+          new = '''let old: RamenStrategy = serde_json::from_str(
+                  &fs::read_to_string("rust/strategy_optimized.json")?
+              )?;'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one strategy constructor, found {text.count(old)}')
+          text = text.replace(old, new)
+          text = text.replace('A：本仓库原手写策略', 'A：Android APK 当前打包的优化策略')
+          text = text.replace('A 原策略', 'A APK优化策略')
+          path.write_text(text)
+          PY
       - name: Build
         run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_policy_ab
       - name: Run same-seed all-composition A-B
@@ -50,7 +68,7 @@ jobs:
           cat policy_ab.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v6
         with:
-          name: ramen-policy-ab-report
+          name: ramen-policy-ab-packaged-strategy-report
           path: policy_ab.md
           if-no-files-found: error
       - name: Publish aggregate report to branch
@@ -60,13 +78,14 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p reports
-          cp policy_ab.md "reports/policy_ab_${RUNS}_seed_${SEED}.md"
+          cp policy_ab.md "reports/policy_ab_packaged_${RUNS}_seed_${SEED}.md"
+          git checkout -- rust/src/policy_ab.rs
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add reports/
           if git diff --cached --quiet; then
             echo 'Aggregate report is unchanged.'
           else
-            git commit -m "results: 保存101构成策略A-B聚合结果 [skip ci]"
+            git commit -m "results: 保存APK策略101构成A-B结果 [skip ci]"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
