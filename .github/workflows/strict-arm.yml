@@ -1,0 +1,47 @@
+name: Strict ARM Native Build
+
+on:
+  push:
+    branches: ['workbench/strict-arm-native-build']
+  workflow_dispatch:
+
+jobs:
+  arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Find NDK
+        run: |
+          NDK_DIR=$(ls -d /usr/local/lib/android/sdk/ndk/*/ 2>/dev/null | head -1)
+          if [ -z "$NDK_DIR" ]; then
+            yes | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager "ndk;27.2.12479018"
+            NDK_DIR="/usr/local/lib/android/sdk/ndk/27.2.12479018/"
+          fi
+          echo "ANDROID_NDK_HOME=${NDK_DIR%/}" >> "$GITHUB_ENV"
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: strict-arm64-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
+          restore-keys: strict-arm64-${{ runner.os }}-
+      - name: Build ARM64 JNI library
+        working-directory: rust
+        run: cargo ndk -t arm64-v8a build --release --lib
+      - name: Verify ARM64 JNI library
+        run: |
+          test -s rust/target/aarch64-linux-android/release/libuma_jni.so
+          file rust/target/aarch64-linux-android/release/libuma_jni.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libuma-jni-arm64-v8a
+          path: rust/target/aarch64-linux-android/release/libuma_jni.so
+          if-no-files-found: error
