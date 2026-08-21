@@ -1,9 +1,10 @@
-//! 同种子 A/B：本仓库旧策略 vs umaai-rs 最新 RamenPolicy。
-//! 默认 100 局；只输出聚合指标，不保存完整轨迹。
+//! 同种子、多卡组 A/B：本仓库旧策略 vs umaai-rs 最新 RamenPolicy。
+//! 默认每套每种策略 100 局；只输出聚合指标，不保存完整轨迹。
 
-use std::{env, time::Instant};
+use std::{collections::BTreeMap, env, fs, time::Instant};
 
 use rand::{SeedableRng, rngs::StdRng};
+use serde::Deserialize;
 use umasim::game::{Game, InheritInfo, Trainer, ramen::RamenGame};
 use umasim::gamedata::init_global;
 use umasim::trainer::RamenHandwrittenTrainer;
@@ -11,11 +12,52 @@ use umasim::trainer::RamenHandwrittenTrainer;
 use uma_jni::ramen_strategy::RamenStrategy;
 
 const UMA: u32 = 102601;
-const DECK: [u32; 6] = [302424, 302894, 303044, 302924, 303024, 303054];
+const FRIEND: u32 = 303054;
 const INHERIT: InheritInfo = InheritInfo {
     blue_count: [12, 0, 0, 0, 6],
     extra_count: [10, 0, 0, 20, 20, 40],
 };
+const TYPE_NAMES: [&str; 5] = ["速", "耐", "力", "根", "智"];
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct RawCard {
+    card_id: u32,
+    card_name: String,
+    rarity: i32,
+    card_type: usize,
+    card_value: Vec<RawValue>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct RawValue {
+    bonus: Vec<i32>,
+    initial_bonus: Vec<i32>,
+    you_qing: f64,
+    gan_jing: f64,
+    xun_lian: f64,
+    initial_ji_ban: f64,
+    de_yi_lv: f64,
+    sai_hou: f64,
+    wiz_vital_bonus: f64,
+    fail_rate_drop: f64,
+    vital_cost_drop: f64,
+}
+
+#[derive(Clone)]
+struct Card {
+    idrank: u32,
+    name: String,
+    card_type: usize,
+    proxy: f64,
+}
+
+#[derive(Clone)]
+struct Deck {
+    name: String,
+    cards: [u32; 6],
+}
 
 #[derive(Default)]
 struct Aggregate {
@@ -39,7 +81,8 @@ impl Aggregate {
         for i in 0..5 {
             self.status_sum[i] += game.uma().five_status[i] as i64;
         }
-        let pt = game.uma().total_pt();
+        // 这里严格使用训练技能 PT，不使用本年度拉面 PT，也不使用 total_pt 聚合值。
+        let pt = game.uma().skill_pt;
         self.skill_pt_sum += pt as i64;
         self.rmj_all += usize::from(game.ramen.rmj_results.iter().take(3).all(|&x| x));
         self.friend_all += usize::from(game.friend.out_used.iter().all(|&x| x));
@@ -55,32 +98,139 @@ impl Aggregate {
         self.pt_10000 += usize::from(pt >= 10000);
     }
 
-    fn print(&mut self, name: &str, requested: usize, elapsed: f64) {
+    fn summary(&mut self) -> Summary {
         self.scores.sort_unstable();
         let n = self.scores.len();
-        let mean = if n == 0 { 0.0 } else { self.scores.iter().map(|&x| x as f64).sum::<f64>() / n as f64 };
-        let median = self.scores.get(n / 2).copied().unwrap_or(0);
-        let p10 = self.scores.get(n.saturating_sub(1) / 10).copied().unwrap_or(0);
-        let pct = |x: usize| if n == 0 { 0.0 } else { x as f64 * 100.0 / n as f64 };
-        let status: Vec<f64> = self.status_sum.iter().map(|&x| if n == 0 { 0.0 } else { x as f64 / n as f64 }).collect();
-        println!("## {name}");
-        println!("- 完成/异常：{n}/{}，运行耗时：{elapsed:.2}s", requested, self.failed_runs);
-        println!("- 评分：均值 {mean:.0}，中位 {median}，P10 {p10}");
-        println!("- 五维均值：速 {:.0} / 耐 {:.0} / 力 {:.0} / 根 {:.0} / 智 {:.0}", status[0], status[1], status[2], status[3], status[4]);
-        println!("- 训练技能PT均值：{:.0}；≥8000：{:.1}%；≥10000：{:.1}%", if n == 0 { 0.0 } else { self.skill_pt_sum as f64 / n as f64 }, pct(self.pt_8000), pct(self.pt_10000));
-        println!("- 速≥2200：{:.1}%；智≥1800：{:.1}%；耐力根均≥1400：{:.1}%；全部KPI：{:.1}%", pct(self.target_speed), pct(self.target_wisdom), pct(self.target_others), pct(self.target_all));
-        println!("- 三年RMJ全通：{:.1}%；友人五次外出完成：{:.1}%\n", pct(self.rmj_all), pct(self.friend_all));
+        let div = n.max(1) as f64;
+        Summary {
+            n,
+            failed: self.failed_runs,
+            score_mean: self.scores.iter().map(|&x| x as f64).sum::<f64>() / div,
+            score_median: self.scores.get(n / 2).copied().unwrap_or(0),
+            score_p10: self.scores.get(n.saturating_sub(1) / 10).copied().unwrap_or(0),
+            status: std::array::from_fn(|i| self.status_sum[i] as f64 / div),
+            skill_pt: self.skill_pt_sum as f64 / div,
+            rmj_all: self.rmj_all as f64 * 100.0 / div,
+            friend_all: self.friend_all as f64 * 100.0 / div,
+            speed: self.target_speed as f64 * 100.0 / div,
+            wisdom: self.target_wisdom as f64 * 100.0 / div,
+            others: self.target_others as f64 * 100.0 / div,
+            all: self.target_all as f64 * 100.0 / div,
+            pt8000: self.pt_8000 as f64 * 100.0 / div,
+            pt10000: self.pt_10000 as f64 * 100.0 / div,
+        }
     }
 }
 
-fn run<T: Trainer<RamenGame>>(trainer: &T, runs: usize, seed: u64) -> Aggregate {
+struct Summary {
+    n: usize,
+    failed: usize,
+    score_mean: f64,
+    score_median: i32,
+    score_p10: i32,
+    status: [f64; 5],
+    skill_pt: f64,
+    rmj_all: f64,
+    friend_all: f64,
+    speed: f64,
+    wisdom: f64,
+    others: f64,
+    all: f64,
+    pt8000: f64,
+    pt10000: f64,
+}
+
+fn sum(v: &[i32]) -> f64 {
+    v.iter().map(|&x| x as f64).sum()
+}
+
+fn load_cards(path: &str) -> anyhow::Result<Vec<Card>> {
+    let raw: BTreeMap<String, RawCard> = serde_json::from_str(&fs::read_to_string(path)?)?;
+    Ok(raw
+        .into_values()
+        .filter_map(|c| {
+            if c.rarity != 3 || c.card_type >= 5 || c.card_value.len() < 5 {
+                return None;
+            }
+            let v = &c.card_value[4];
+            // 仅用于选择各类型代表卡；真正优劣由完整育成 A/B 决定。
+            let proxy = v.xun_lian * 3.0
+                + v.you_qing * 2.0
+                + v.de_yi_lv * 0.35
+                + v.gan_jing * 0.25
+                + v.initial_ji_ban * 0.45
+                + v.sai_hou * 1.5
+                + v.wiz_vital_bonus * 8.0
+                + v.fail_rate_drop
+                + v.vital_cost_drop
+                + sum(&v.bonus) * 16.0
+                + sum(&v.initial_bonus) * 0.4;
+            Some(Card {
+                idrank: c.card_id * 10 + 4,
+                name: c.card_name,
+                card_type: c.card_type,
+                proxy,
+            })
+        })
+        .collect())
+}
+
+fn build_deck(cards: &[Card], counts: [usize; 5]) -> anyhow::Result<Deck> {
+    let mut ids = Vec::with_capacity(6);
+    for (t, &count) in counts.iter().enumerate() {
+        let mut pool: Vec<&Card> = cards.iter().filter(|c| c.card_type == t).collect();
+        pool.sort_by(|a, b| b.proxy.total_cmp(&a.proxy));
+        if pool.len() < count {
+            anyhow::bail!("类型 {} 的候选卡不足 {} 张", TYPE_NAMES[t], count);
+        }
+        ids.extend(pool.into_iter().take(count).map(|c| c.idrank));
+    }
+    ids.push(FRIEND);
+    let cards: [u32; 6] = ids.try_into().map_err(|_| anyhow::anyhow!("卡组必须为6张"))?;
+    let name = counts
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| **n > 0)
+        .map(|(i, n)| format!("{}{}", n, TYPE_NAMES[i]))
+        .collect::<Vec<_>>()
+        .join("");
+    Ok(Deck { name: format!("{name}+1友"), cards })
+}
+
+fn representative_decks(cards: &[Card]) -> anyhow::Result<Vec<Deck>> {
+    // 覆盖：上游基准、力卡、根卡、四种训练卡、五种训练卡、双智。
+    let compositions = [
+        [3, 1, 0, 0, 1],
+        [2, 1, 1, 0, 1],
+        [2, 1, 0, 1, 1],
+        [1, 1, 1, 1, 1],
+        [1, 1, 1, 0, 2],
+        [1, 1, 0, 1, 2],
+    ];
+    compositions.into_iter().map(|c| build_deck(cards, c)).collect()
+}
+
+fn deck_detail(deck: &Deck, cards: &[Card]) -> String {
+    deck.cards
+        .iter()
+        .map(|id| {
+            if *id == FRIEND {
+                return format!("{id} 固定友人");
+            }
+            let name = cards.iter().find(|c| c.idrank == *id).map(|c| c.name.as_str()).unwrap_or("?");
+            format!("{id} {name}")
+        })
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+fn run<T: Trainer<RamenGame>>(trainer: &T, deck: &Deck, runs: usize, seed: u64) -> Aggregate {
     let mut out = Aggregate::default();
-    let started = Instant::now();
     for i in 0..runs {
         let s = seed + i as u64;
         let mut decision_rng = StdRng::seed_from_u64(s);
         let rule_rng = StdRng::seed_from_u64(s ^ 0x9E37_79B9_7F4A_7C15);
-        match RamenGame::newgame(UMA, &DECK, INHERIT) {
+        match RamenGame::newgame(UMA, &deck.cards, INHERIT) {
             Ok(mut game) => {
                 game.set_internal_rng(rule_rng);
                 if game.run_full_game(trainer, &mut decision_rng).is_ok() {
@@ -92,8 +242,25 @@ fn run<T: Trainer<RamenGame>>(trainer: &T, runs: usize, seed: u64) -> Aggregate 
             Err(_) => out.failed_runs += 1,
         }
     }
-    eprintln!("{} 局完成，{:.2}s", out.scores.len(), started.elapsed().as_secs_f64());
     out
+}
+
+fn print_row(deck: &str, strategy: &str, s: &Summary) {
+    println!(
+        "|{deck}|{strategy}|{}/{}|{:.0}|{}|{}|{:.0}/{:.0}/{:.0}/{:.0}/{:.0}|{:.0}|{:.1}%|{:.1}%|{:.1}%|{:.1}%|{:.1}%|",
+        s.n,
+        s.failed,
+        s.score_mean,
+        s.score_median,
+        s.score_p10,
+        s.status[0], s.status[1], s.status[2], s.status[3], s.status[4],
+        s.skill_pt,
+        s.pt8000,
+        s.all,
+        s.rmj_all,
+        s.friend_all,
+        s.speed.min(s.wisdom).min(s.others),
+    );
 }
 
 fn main() -> anyhow::Result<()> {
@@ -101,16 +268,31 @@ fn main() -> anyhow::Result<()> {
     let runs = args.get(1).and_then(|x| x.parse().ok()).unwrap_or(100);
     let seed = args.get(2).and_then(|x| x.parse().ok()).unwrap_or(42);
     init_global()?;
+    let cards = load_cards(&env::var("CARD_DB").unwrap_or_else(|_| "gamedata/cardDB.json".into()))?;
+    let decks = representative_decks(&cards)?;
 
-    println!("# 拉面杯手写策略同种子 A/B\n\n- 局数：每种策略 {runs}\n- 基础种子：{seed}\n- 使用同一马娘、卡组、因子与逐局种子\n- A：本仓库原手写策略；B：umaai-rs 最新 RamenPolicy\n");
+    println!("# 拉面杯多卡组手写策略同种子 A/B\n");
+    println!("- 每套每种策略：{runs} 局；基础种子：{seed}");
+    println!("- A：本仓库原手写策略；B：umaai-rs 最新 RamenPolicy");
+    println!("- 两策略在每套卡组使用相同逐局种子；训练技能PT严格读取 `uma.skill_pt`。\n");
+    println!("|卡组|策略|完成/异常|均分|中位|P10|五维均值 速/耐/力/根/智|技能PT均值|PT≥8000|全部属性KPI|RMJ全通|友人走完|属性分项最低达成率|");
+    println!("|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|");
 
-    let start_a = Instant::now();
-    let mut a = run(&RamenStrategy::default(), runs, seed);
-    let elapsed_a = start_a.elapsed().as_secs_f64();
-    let start_b = Instant::now();
-    let mut b = run(&RamenHandwrittenTrainer::new(), runs, seed);
-    let elapsed_b = start_b.elapsed().as_secs_f64();
-    a.print("A：原手写策略", runs, elapsed_a);
-    b.print("B：上游最新手写策略", runs, elapsed_b);
+    let old = RamenStrategy::default();
+    let new = RamenHandwrittenTrainer::new();
+    let started = Instant::now();
+    for (i, deck) in decks.iter().enumerate() {
+        eprintln!("[{}/{}] {} A/B", i + 1, decks.len(), deck.name);
+        let mut a = run(&old, deck, runs, seed);
+        let mut b = run(&new, deck, runs, seed);
+        print_row(&deck.name, "A 原策略", &a.summary());
+        print_row(&deck.name, "B 上游新策略", &b.summary());
+    }
+    println!("\n总耗时：{:.2}s\n", started.elapsed().as_secs_f64());
+    println!("## 卡组明细\n");
+    for deck in &decks {
+        println!("- **{}**：{}", deck.name, deck_detail(deck, &cards));
+    }
+    println!("\n> 注：代表卡按 cardDB 满破面板代理值选取，仅用于构造不同类型卡组；最终比较依据是完整育成结果。固有未实现的卡仍需在报告解释时单独审计。\n");
     Ok(())
 }
