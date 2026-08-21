@@ -1,0 +1,52 @@
+name: Ramen Policy A-B
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: '每种策略局数'
+        required: true
+        default: '100'
+        type: string
+      seed:
+        description: '基础随机种子'
+        required: true
+        default: '42'
+        type: string
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ramen-policy-ab-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
+          restore-keys: ramen-policy-ab-${{ runner.os }}-
+      - name: Download pinned gamedata
+        run: |
+          set -euo pipefail
+          mkdir -p gamedata
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/62dacd592eeceb3ee0ce0401f2f28bf484a69fa3/gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+            curl --fail --silent --show-error --location "$BASE/$f" -o "gamedata/$f"
+            test -s "gamedata/$f"
+          done
+      - name: Build
+        run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_policy_ab
+      - name: Run same-seed A-B
+        run: |
+          set -euo pipefail
+          rust/target/release/ramen_policy_ab '${{ inputs.runs }}' '${{ inputs.seed }}' 2>&1 | tee policy_ab.md
+          cat policy_ab.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ramen-policy-ab-report
+          path: policy_ab.md
+          if-no-files-found: error
