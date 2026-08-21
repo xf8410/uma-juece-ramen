@@ -15,12 +15,7 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 
-/**
- * JNI bridge + cloud search.
- *
- * If CLOUD_URL is set, search runs on the cloud server (手机发状态 → 云端算 → 返回推荐).
- * Falls back to local JNI if cloud is unavailable.
- */
+/** JNI bridge + cloud search, with local JNI fallback. */
 public final class UmaNativeBridge {
     private static boolean loaded = false;
     private static boolean initialized = false;
@@ -69,7 +64,7 @@ public final class UmaNativeBridge {
                     byte[] buf = new byte[8192];
                     int len;
                     while ((len = is.read(buf)) != -1) os.write(buf, 0, len);
-                } catch (Exception e) { }
+                } catch (Exception ignored) { }
             }
         }
 
@@ -78,7 +73,7 @@ public final class UmaNativeBridge {
             is.read(buf);
             String json = new String(buf, "UTF-8").trim();
             if (!json.isEmpty()) optimizedStrategy = new JSONObject(json);
-        } catch (Exception e) { }
+        } catch (Exception ignored) { }
 
         try {
             String result = nativeInit(dataDir.getAbsolutePath());
@@ -92,50 +87,60 @@ public final class UmaNativeBridge {
     }
 
     public static JSONObject search(JSONObject summary, int umaId, int[] cards, int searchN) {
-        // 云端优先
         if (!cloudUrl.isEmpty()) {
             JSONObject cloudResult = searchCloud(summary, umaId, cards, searchN);
             if (cloudResult != null) return cloudResult;
         }
-        // 本地 JNI 回退
         if (!isAvailable()) return null;
         return searchLocal(summary, umaId, cards, searchN);
     }
 
+    /**
+     * hlpatch acquisition_gauges currently contains structured map entries, while the native
+     * compatibility field was provisionally typed as integers. Its semantics are not verified and
+     * the native search does not need it, so omit it rather than rejecting the entire state JSON.
+     */
+    static JSONObject stateForNative(JSONObject summary) {
+        try {
+            JSONObject state = new JSONObject(summary.toString());
+            JSONObject ramen = state.optJSONObject("ramen");
+            if (ramen != null) ramen.remove("acquisition_gauges");
+            return state;
+        } catch (Exception e) {
+            return summary;
+        }
+    }
+
     private static JSONObject searchLocal(JSONObject summary, int umaId, int[] cards, int searchN) {
         try {
-            JSONObject config = new JSONObject();
-            config.put("uma_id", umaId);
-            JSONArray cardsArr = new JSONArray();
-            for (int c : cards) cardsArr.put(c);
-            config.put("cards", cardsArr);
-            config.put("search_n", searchN);
-            config.put("blue_count", new JSONArray("[15,3,0,0,0]"));
-            config.put("extra_count", new JSONArray("[0,30,0,0,30,30]"));
-            if (optimizedStrategy != null) config.put("strategy", optimizedStrategy);
-
-            String result = nativeSearch(summary.toString(), config.toString());
+            JSONObject config = makeConfig(umaId, cards, searchN, true);
+            String result = nativeSearch(stateForNative(summary).toString(), config.toString());
             return new JSONObject(result);
         } catch (Exception e) {
             return null;
         }
     }
 
-    /** 云端搜索：POST state + config → 返回推荐 */
+    private static JSONObject makeConfig(int umaId, int[] cards, int searchN,
+                                         boolean includeOptimizedStrategy) throws Exception {
+        JSONObject config = new JSONObject();
+        config.put("uma_id", umaId);
+        JSONArray cardsArr = new JSONArray();
+        for (int c : cards) cardsArr.put(c);
+        config.put("cards", cardsArr);
+        config.put("search_n", searchN);
+        config.put("blue_count", new JSONArray("[15,3,0,0,0]"));
+        config.put("extra_count", new JSONArray("[0,30,0,0,30,30]"));
+        if (includeOptimizedStrategy && optimizedStrategy != null)
+            config.put("strategy", optimizedStrategy);
+        return config;
+    }
+
     private static JSONObject searchCloud(JSONObject summary, int umaId, int[] cards, int searchN) {
         try {
             JSONObject payload = new JSONObject();
-            payload.put("state", summary);
-
-            JSONObject config = new JSONObject();
-            config.put("uma_id", umaId);
-            JSONArray cardsArr = new JSONArray();
-            for (int c : cards) cardsArr.put(c);
-            config.put("cards", cardsArr);
-            config.put("search_n", searchN);
-            config.put("blue_count", new JSONArray("[15,3,0,0,0]"));
-            config.put("extra_count", new JSONArray("[0,30,0,0,30,30]"));
-            payload.put("config", config);
+            payload.put("state", stateForNative(summary));
+            payload.put("config", makeConfig(umaId, cards, searchN, false));
 
             URL url = new URL(cloudUrl + "/search");
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
@@ -151,13 +156,12 @@ public final class UmaNativeBridge {
 
             if (conn.getResponseCode() != 200) return null;
             BufferedReader reader = new BufferedReader(
-                new InputStreamReader(conn.getInputStream(), "UTF-8"));
+                    new InputStreamReader(conn.getInputStream(), "UTF-8"));
             StringBuilder sb = new StringBuilder();
             String line;
             while ((line = reader.readLine()) != null) sb.append(line);
             reader.close();
             conn.disconnect();
-
             return new JSONObject(sb.toString());
         } catch (Exception e) {
             return null;
