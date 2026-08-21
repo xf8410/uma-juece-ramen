@@ -1,18 +1,12 @@
 name: Ramen Policy A-B
 
 on:
-  push:
-    branches: ['workbench/power-guts-benchmark']
-    paths:
-      - '.github/workflows/policy-ab.yml'
-      - 'rust/src/policy_ab.rs'
-      - 'rust/Cargo.toml'
   workflow_dispatch:
     inputs:
       runs:
-        description: '每套卡组、每种策略局数'
+        description: '每种卡组构成、每种策略局数'
         required: true
-        default: '100'
+        default: '10000'
         type: string
       seed:
         description: '基础随机种子'
@@ -23,7 +17,7 @@ on:
 jobs:
   compare:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -46,12 +40,10 @@ jobs:
           done
       - name: Build
         run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_policy_ab
-      - name: Run same-seed multi-deck A-B
+      - name: Run same-seed all-composition A-B
         run: |
           set -euo pipefail
-          RUNS='${{ github.event_name == 'push' && '100' || inputs.runs }}'
-          SEED='${{ github.event_name == 'push' && '42' || inputs.seed }}'
-          rust/target/release/ramen_policy_ab "$RUNS" "$SEED" 2>&1 | tee policy_ab.md
+          rust/target/release/ramen_policy_ab '${{ inputs.runs }}' '${{ inputs.seed }}' 2>&1 | tee policy_ab.md
           cat policy_ab.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v6
         with:
