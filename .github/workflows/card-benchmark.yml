@@ -1,0 +1,61 @@
+name: Ramen Card Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      games_per_deck:
+        description: '每套卡组模拟局数'
+        required: true
+        default: '300'
+        type: string
+      use_optimized_strategy:
+        description: '使用当前优化策略'
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: card-benchmark-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
+          restore-keys: card-benchmark-${{ runner.os }}-
+      - name: Download pinned gamedata
+        run: |
+          set -euo pipefail
+          mkdir -p gamedata
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/b53451c09a35c0b59a410f79ae45ce9ccb47cc52/gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+            curl --fail --silent --show-error --location "$BASE/$f" -o "gamedata/$f"
+            test -s "gamedata/$f"
+          done
+      - name: Build benchmark
+        run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_card_benchmark
+      - name: Run card/deck simulations
+        env:
+          USE_OPTIMIZED: ${{ inputs.use_optimized_strategy }}
+        run: |
+          set -euo pipefail
+          if [ "$USE_OPTIMIZED" = "true" ]; then
+            export RAMEN_STRATEGY="$(cat rust/strategy_optimized.json)"
+          fi
+          N='${{ inputs.games_per_deck }}'
+          rust/target/release/ramen_card_benchmark "$N" 2>&1 | tee card_benchmark.md
+          cat card_benchmark.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ramen-card-benchmark-report
+          path: card_benchmark.md
+          if-no-files-found: error
