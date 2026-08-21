@@ -14,6 +14,10 @@ path = "src/batch.rs"
 name = "ramen_optimize"
 path = "src/optimize.rs"
 
+[[bin]]
+name = "ramen_card_benchmark"
+path = "src/card_benchmark.rs"
+
 [dependencies]
 umasim = { git = "https://github.com/xulai1001/umaai-rs", rev = "b53451c09a35c0b59a410f79ae45ce9ccb47cc52", default-features = false, features = ["diag", "no-color"] }
 jni = { version = "0.21", optional = true }
