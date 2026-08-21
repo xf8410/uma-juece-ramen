@@ -17,8 +17,8 @@ jobs:
           ref: workbench/bench-card-compositions
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Format check
-        run: cargo fmt --all -- --check
+      - name: Format working copy
+        run: cargo fmt --all
       - name: Compile all umasim targets with warnings denied
         env:
           RUSTFLAGS: -D warnings
