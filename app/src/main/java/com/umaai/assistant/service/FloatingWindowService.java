@@ -33,6 +33,12 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private static final String CHANNEL = "ramen_overlay";
     private static final int NOTIFICATION_ID = 1401;
     private static final long STALE_MS = 5000;
+
+    // Default search config (from upstream test deck; will be configurable later)
+    private static final int DEFAULT_UMA_ID = 102601;
+    private static final int[] DEFAULT_CARDS = {302424, 302894, 303044, 302924, 303024, 303054};
+    private static final int DEFAULT_SEARCH_N = 32;
+
     private final Handler main = new Handler(Looper.getMainLooper());
     private final TrainingEvaluator evaluator = new TrainingEvaluator();
     private WindowManager windowManager;
@@ -43,6 +49,13 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private volatile boolean polling;
     private volatile long lastDataAt;
 
+    // Native search state
+    private volatile JSONObject lastSearchResult;
+    private volatile int lastSearchedTurn = -1;
+    private volatile boolean searchRunning = false;
+    private volatile JSONObject pendingSummary;
+    private Thread searchThread;
+
     @Override public void onCreate() {
         super.onCreate();
         createNotificationChannel();
@@ -51,6 +64,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         try { server = new HttpDataService(this); server.startServer(); }
         catch (Exception e) { stopSelf(); return; }
         startPolling();
+        initNativeSearch();
     }
 
     @Override public IBinder onBind(Intent intent) { return null; }
@@ -102,11 +116,79 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                 + " 干劲" + stats.optString("motivation", "?"));
         ramenView.setText(RamenDecisionSupport.stateLine(summary));
         trainingsView.setText(renderTrainings(summary.optJSONArray("trainings"))
-                + "\n" + evaluator.recommend(summary));
-        sourceView.setText(source + " · upstream xulai1001/umaai-rs");
+                + "\n" + evaluator.recommend(summary)
+                + formatSearchLine());
+        sourceView.setText(source + " · upstream xulai1001/umaai-rs"
+                + (UmaNativeBridge.isAvailable() ? " · 搜索就绪" : " · 仅兜底评分"));
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (manager != null) manager.notify(NOTIFICATION_ID, notification("拉面杯 第" + turn + "回合"));
+
+        // Trigger native search when turn changes
+        if (turn > 0 && turn != lastSearchedTurn && !searchRunning && UmaNativeBridge.isAvailable()) {
+            triggerSearch(summary, turn);
+        }
     }
+
+    // ── Native search ──────────────────────────────────────────────
+
+    private void initNativeSearch() {
+        new Thread(() -> {
+            boolean ok = UmaNativeBridge.init(this);
+            if (ok) {
+                main.post(() -> {
+                    if (sourceView != null)
+                        sourceView.setText(sourceView.getText() + " · 搜索就绪");
+                });
+            }
+        }, "NativeInit").start();
+    }
+
+    private void triggerSearch(JSONObject summary, int turn) {
+        searchRunning = true;
+        lastSearchedTurn = turn;
+        pendingSummary = summary;
+        if (searchThread != null && searchThread.isAlive()) return;
+        searchThread = new Thread(() -> {
+            JSONObject snap = pendingSummary;
+            if (snap == null) { searchRunning = false; return; }
+            JSONObject result = UmaNativeBridge.search(snap, DEFAULT_UMA_ID, DEFAULT_CARDS, DEFAULT_SEARCH_N);
+            lastSearchResult = result;
+            searchRunning = false;
+            main.post(() -> {
+                if (trainingsView != null)
+                    trainingsView.setText(renderTrainings(snap.optJSONArray("trainings"))
+                            + "\n" + evaluator.recommend(snap)
+                            + formatSearchLine());
+            });
+        }, "NativeSearch");
+        searchThread.setDaemon(true);
+        searchThread.start();
+    }
+
+    private String formatSearchLine() {
+        if (searchRunning) return "\n上游搜索：计算中…";
+        if (lastSearchResult == null) {
+            if (UmaNativeBridge.isAvailable()) return "\n上游搜索：等待回合";
+            if (UmaNativeBridge.isLoaded()) return "\n上游搜索：初始化中";
+            return "";
+        }
+        try {
+            boolean ok = lastSearchResult.optBoolean("ok", false);
+            if (!ok) {
+                String err = lastSearchResult.optString("error", "未知错误");
+                return "\n上游搜索：错误—" + err;
+            }
+            String action = lastSearchResult.optString("action_display", "?");
+            double score = lastSearchResult.optDouble("score_mean", 0);
+            int n = lastSearchResult.optInt("search_n", 0);
+            long ms = lastSearchResult.optLong("elapsed_ms", 0);
+            return "\n上游搜索：" + action + "（均分" + (int)score + " · N=" + n + " · " + ms + "ms）";
+        } catch (Exception e) {
+            return "\n上游搜索：解析失败";
+        }
+    }
+
+    // ── Trainings display ───────────────────────────────────────────
 
     private String renderTrainings(JSONArray trainings) {
         if (trainings == null) return "训练数据：无";
@@ -148,6 +230,8 @@ public final class FloatingWindowService extends Service implements HttpDataServ
             default: return name;
         }
     }
+
+    // ── Panel & polling ─────────────────────────────────────────────
 
     private void createPanel() {
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);

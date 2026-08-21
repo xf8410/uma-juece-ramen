@@ -1,0 +1,34 @@
+[package]
+name = "uma-jni"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "ramen_batch"
+path = "src/batch.rs"
+
+[[bin]]
+name = "ramen_optimize"
+path = "src/optimize.rs"
+
+[dependencies]
+umasim = { git = "https://github.com/xulai1001/umaai-rs", default-features = false, features = ["diag"] }
+jni = { version = "0.21", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.9"
+rayon = "1"
+anyhow = "1"
+log = "0.4"
+
+[features]
+default = ["jni-support"]
+jni-support = ["dep:jni"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

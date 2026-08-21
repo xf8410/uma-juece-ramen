@@ -1,21 +1,9 @@
-# Build secrets
-secrets.properties
-local.properties
-
-# Android/Gradle
-*.apk
-*.aab
-*.ap_
-*.dex
-build/
-.gradle/
-*.iml
-.idea/
-captures/
-.externalNativeBuild/
-.cxx/
-
-# Signing and logs
-*.jks
-*.keystore
-*.log
+/.idea
+/.gradle
+/build
+/app/build
+/captures
+/local.properties
+/app/src/main/jniLibs
+/app/src/main/assets/gamedata
+/rust/target

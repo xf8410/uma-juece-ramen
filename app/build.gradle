@@ -15,15 +15,27 @@ android {
         applicationId "com.umaai.assistant"
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName "0.1.0-ramen"
+        versionCode 3
+        versionName "0.3.0-cloud"
         buildConfigField "String", "SCENARIO_ID", '"Ramen"'
+        buildConfigField "String", "CLOUD_URL", '""'
+
+        ndk {
+            abiFilters 'arm64-v8a', 'x86_64'
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+            assets.srcDirs += ['src/main/assets']
         }
     }
 
