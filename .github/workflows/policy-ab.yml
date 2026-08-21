@@ -14,6 +14,9 @@ on:
         default: '42'
         type: string
 
+permissions:
+  contents: write
+
 jobs:
   compare:
     runs-on: ubuntu-latest
@@ -50,3 +53,20 @@ jobs:
           name: ramen-policy-ab-report
           path: policy_ab.md
           if-no-files-found: error
+      - name: Publish aggregate report to branch
+        env:
+          RUNS: ${{ inputs.runs }}
+          SEED: ${{ inputs.seed }}
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          cp policy_ab.md "reports/policy_ab_${RUNS}_seed_${SEED}.md"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add reports/
+          if git diff --cached --quiet; then
+            echo 'Aggregate report is unchanged.'
+          else
+            git commit -m "results: 保存101构成策略A-B聚合结果 [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
