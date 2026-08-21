@@ -12,7 +12,7 @@ on:
       games_per_deck:
         description: '每套卡组模拟局数'
         required: true
-        default: '300'
+        default: '3000'
         type: string
       use_optimized_strategy:
         description: '使用当前优化策略'
@@ -56,10 +56,10 @@ jobs:
           if [ "$USE_OPTIMIZED" = "true" ]; then
             export RAMEN_STRATEGY="$(cat rust/strategy_optimized.json)"
           fi
-          N='${{ github.event_name == 'push' && '300' || inputs.games_per_deck }}'
+          N='${{ github.event_name == 'push' && '3000' || inputs.games_per_deck }}'
           rust/target/release/ramen_card_benchmark "$N" 2>&1 | tee card_benchmark.md
           cat card_benchmark.md >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload benchmark report
+      - name: Upload aggregate benchmark report
         uses: actions/upload-artifact@v6
         with:
           name: ramen-card-benchmark-report
