@@ -37,7 +37,7 @@ impl Default for RamenStrategy {
         Self {
             head_weight: 15.0,
             shining_weight: 40.0,
-            failure_penalty: 2.0,
+            failure_penalty: 150.0,
             big_fail_penalty: 500.0,
             jiban_value: 12.0,
             status_soft_cap: 40.0,
@@ -294,8 +294,7 @@ impl RamenStrategy {
         let mut score = status_gain
             + value.status_pt[5] as f64
             + heads as f64 * self.head_weight
-            + shining as f64 * self.shining_weight
-            - fail_rate * self.failure_penalty;
+            + shining as f64 * self.shining_weight;
 
         for &index in &person_indices {
             let person = &game.persons()[index];
@@ -335,6 +334,20 @@ impl RamenStrategy {
             if has_friend {
                 score += self.friend_click_bonus;
             }
+        }
+
+        let fail_probability = (fail_rate / 100.0).clamp(0.0, 1.0);
+        if fail_probability > 0.0 {
+            let big_probability = if fail_rate > 20.0 {
+                fail_probability
+            } else {
+                0.0
+            };
+            let failed_score = -(
+                self.failure_penalty * (1.0 - big_probability)
+                    + self.big_fail_penalty * big_probability
+            );
+            score = score * (1.0 - fail_probability) + failed_score * fail_probability;
         }
 
         score
