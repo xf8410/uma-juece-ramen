@@ -1,0 +1,35 @@
+name: Validate upstream composition benchmark
+
+on:
+  push:
+    branches: ['workbench/test-upstream-compositions']
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout contribution branch
+        uses: actions/checkout@v4
+        with:
+          repository: xf8410/umaai-rs
+          ref: workbench/bench-card-compositions
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Compile all umasim targets with warnings denied
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test --release -p umasim --all-targets --no-run
+      - name: Run all umasim tests
+        run: cargo test --release -p umasim --all-targets -- --test-threads=1
+      - name: Smoke test all 101 compositions
+        run: cargo run --release -p umasim --bin bench_compositions -- --runs 1 --trainer handwritten --out /tmp/bench_compositions.csv
+      - name: Verify complete CSV
+        run: |
+          set -euo pipefail
+          test -s /tmp/bench_compositions.csv
+          test "$(wc -l < /tmp/bench_compositions.csv)" -eq 102
+          awk -F, 'NR > 1 && ($3 != 1 || $4 != 0) { exit 1 }' /tmp/bench_compositions.csv
