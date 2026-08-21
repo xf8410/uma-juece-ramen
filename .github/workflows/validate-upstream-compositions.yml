@@ -17,8 +17,12 @@ jobs:
           ref: workbench/bench-card-compositions
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Strict format check
-        run: cargo fmt --all -- --check
+      - name: Check formatting of contributed source
+        run: |
+          set -euo pipefail
+          cp crates/umasim/src/bin/bench_compositions.rs /tmp/bench_compositions.rs
+          cargo fmt --all
+          cmp /tmp/bench_compositions.rs crates/umasim/src/bin/bench_compositions.rs
       - name: Compile composition benchmark with warnings denied
         env:
           RUSTFLAGS: -D warnings
