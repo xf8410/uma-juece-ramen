@@ -1,6 +1,12 @@
 name: Ramen Card Benchmark
 
 on:
+  push:
+    branches: ['workbench/cloud-card-benchmark']
+    paths:
+      - '.github/workflows/card-benchmark.yml'
+      - 'rust/src/card_benchmark.rs'
+      - 'rust/Cargo.toml'
   workflow_dispatch:
     inputs:
       games_per_deck:
@@ -44,13 +50,13 @@ jobs:
         run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_card_benchmark
       - name: Run card/deck simulations
         env:
-          USE_OPTIMIZED: ${{ inputs.use_optimized_strategy }}
+          USE_OPTIMIZED: ${{ github.event_name == 'push' && 'true' || inputs.use_optimized_strategy }}
         run: |
           set -euo pipefail
           if [ "$USE_OPTIMIZED" = "true" ]; then
             export RAMEN_STRATEGY="$(cat rust/strategy_optimized.json)"
           fi
-          N='${{ inputs.games_per_deck }}'
+          N='${{ github.event_name == 'push' && '300' || inputs.games_per_deck }}'
           rust/target/release/ramen_card_benchmark "$N" 2>&1 | tee card_benchmark.md
           cat card_benchmark.md >> "$GITHUB_STEP_SUMMARY"
       - name: Upload benchmark report
