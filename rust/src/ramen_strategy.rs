@@ -192,6 +192,16 @@ impl RamenStrategy {
         }
     }
 
+    fn status_eval(x: f64, reserve: f64) -> f64 {
+        if x >= 0.0 {
+            0.0
+        } else if x > -reserve {
+            -x * x / (2.0 * reserve)
+        } else {
+            x + reserve * 0.5
+        }
+    }
+
     fn score_train(&self, game: &RamenGame, action: &RamenAction) -> f64 {
         let vital = game.uma().vital;
         let max_vital = game.uma().max_vital;
@@ -270,9 +280,19 @@ impl RamenStrategy {
         let buffs = game.calc_training_buff(train).unwrap_or_default();
         let fail_rate = game.calc_training_failure_rate(&buffs, train) as f64;
         let value = game.calc_training_value(&buffs, train).unwrap_or_default();
-        let total_gain: i32 = value.status_pt.iter().sum();
+        let remaining_turns = (78 - game.base.turn).max(0) as f64;
+        let reserve = (self.status_soft_cap * remaining_turns / 78.0).max(1.0);
+        let mut status_gain = 0.0;
 
-        let mut score = total_gain as f64
+        for i in 0..5 {
+            let remaining = (game.uma().five_status_limit[i] - game.uma().five_status[i]) as f64 - 45.0;
+            let before = Self::status_eval(-remaining, reserve);
+            let after = Self::status_eval(value.status_pt[i] as f64 - remaining, reserve);
+            status_gain += after - before;
+        }
+
+        let mut score = status_gain
+            + value.status_pt[5] as f64
             + heads as f64 * self.head_weight
             + shining as f64 * self.shining_weight
             - fail_rate * self.failure_penalty;
