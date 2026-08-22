@@ -1,0 +1,35 @@
+name: Apply Rust lint fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Remove unused imports and commit
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('rust/src/lib.rs')
+          text = path.read_text()
+          replacements = {
+              '    Game, Trainer,\n': '    Game,\n',
+              '    use serde::de::Error;\n': '',
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f'expected exactly one match for {old!r}, got {text.count(old)}')
+              text = text.replace(old, new)
+          path.write_text(text)
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add rust/src/lib.rs
+          git commit -m 'fix: 删除Rust未使用导入'
+          git push origin "HEAD:${GITHUB_REF_NAME}"
