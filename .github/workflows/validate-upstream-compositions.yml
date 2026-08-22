@@ -10,60 +10,134 @@ permissions:
 
 jobs:
   repair-repository-rust:
-    name: Apply known repository Rust lint repair
+    name: Apply repository Rust and card-selection updates
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Remove the two diagnosed unused imports
+      - name: Apply diagnosed lint fixes and upstream weak-card filter
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          path = Path('rust/src/lib.rs')
-          text = path.read_text()
-          replacements = {
-              '    Game, Trainer,\n': '    Game,\n',
-              '    use serde::de::Error;\n': '',
-          }
-          changed = False
-          for old, new in replacements.items():
+          import re
+
+          def replace_once(text, old, new, label):
               count = text.count(old)
-              if count > 1:
-                  raise SystemExit(f'ambiguous match for {old!r}: {count}')
-              if count == 1:
-                  text = text.replace(old, new)
-                  changed = True
-          if changed:
-              path.write_text(text)
+              if count == 0:
+                  return text, False
+              if count != 1:
+                  raise SystemExit(f'{label}: expected at most one match, got {count}')
+              return text.replace(old, new), True
+
+          changed = []
+
+          lib = Path('rust/src/lib.rs')
+          text = lib.read_text()
+          for old, new, label in [
+              ('    Game, Trainer,\n', '    Game,\n', 'unused Trainer import'),
+              ('    use serde::de::Error;\n', '', 'unused serde Error import'),
+          ]:
+              text, did = replace_once(text, old, new, label)
+              changed += [str(lib)] if did else []
+          lib.write_text(text)
+
+          optimize = Path('rust/src/optimize.rs')
+          text = optimize.read_text()
+          text, did = replace_once(
+              text,
+              '    let best_json_pretty = serde_json::to_string_pretty(&best_strategy).unwrap();\n',
+              '',
+              'unused best_json_pretty',
+          )
+          changed += [str(optimize)] if did else []
+          text, did = replace_once(text, 'let mut nvec = if', 'let nvec = if', 'unused mut nvec')
+          changed += [str(optimize)] if did else []
+          new_text = re.sub(r'\bX\b', 'x', text)
+          if new_text != text:
+              changed.append(str(optimize))
+          optimize.write_text(new_text)
+
+          policy = Path('rust/src/policy_ab.rs')
+          text = policy.read_text()
+          text, did = replace_once(
+              text,
+              '    proxy: f64,\n',
+              '    proxy: f64,\n    panel: f64,\n',
+              'Card panel field',
+          )
+          changed += [str(policy)] if did else []
+          old = '        Some(Card { idrank: c.card_id * 10 + 4, name: c.card_name, card_type: c.card_type, proxy })'
+          new = '''        let panel = v.you_qing + v.gan_jing + v.xun_lian;
+          Some(Card { idrank: c.card_id * 10 + 4, name: c.card_name, card_type: c.card_type, proxy, panel })'''
+          text, did = replace_once(text, old, new, 'compute weak-card panel')
+          changed += [str(policy)] if did else []
+          old = '''        let mut pool: Vec<&Card> = cards.iter().filter(|c| c.card_type == t).collect();
+          pool.sort_by(|a, b| b.proxy.total_cmp(&a.proxy));
+          if pool.len() < count { anyhow::bail!("类型 {} 的候选卡不足 {} 张", TYPE_NAMES[t], count); }
+          ids.extend(pool.into_iter().take(count).map(|c| c.idrank));'''
+          new = '''        let mut pool: Vec<&Card> = cards.iter().filter(|c| c.card_type == t).collect();
+          pool.sort_by_key(|card| std::cmp::Reverse(card.idrank));
+          pool.truncate(5);
+          pool.retain(|card| card.panel >= 70.0);
+          if pool.len() < 3 {
+              anyhow::bail!("{}类型最新5张满破SSR中过滤弱卡后只有{}张（需3张）", TYPE_NAMES[t], pool.len());
+          }
+          ids.extend(pool.into_iter().take(count).map(|c| c.idrank));'''
+          text, did = replace_once(text, old, new, 'upstream representative selection')
+          changed += [str(policy)] if did else []
+          text, did = replace_once(text, '            pt10000: self.pt_10000 as f64 * 100.0 / div,\n', '', 'unused pt10000 summary value')
+          changed += [str(policy)] if did else []
+          text, did = replace_once(text, '    pt10000: f64,\n', '', 'unused pt10000 summary field')
+          changed += [str(policy)] if did else []
+          text, did = replace_once(
+              text,
+              '    println!("- 普通卡速/耐/力/根/智各0..3张且合计5张，再加固定友人");',
+              '    println!("- 普通卡速/耐/力/根/智各0..3张且合计5张，再加固定友人");\n    println!("- 代表卡：各类型最新5张满破SSR，排除友情+干劲+训练<70的弱卡，再按card_id倒序取3张");',
+              'report selection rule',
+          )
+          changed += [str(policy)] if did else []
+          text, did = replace_once(
+              text,
+              '> 代表卡按 cardDB 满破面板代理值选取，仅用于为每种卡型构成选卡；最终比较依据是完整育成结果。固有未实现的卡仍需单独审计。',
+              '> 代表卡按上游规则从各类型最新5张满破SSR中过滤友情+干劲+训练<70的弱卡，再取最新3张；仅用于比较卡型构成。固有未实现的卡仍需单独审计。',
+              'report caveat',
+          )
+          changed += [str(policy)] if did else []
+          policy.write_text(text)
+
+          workflow = Path('.github/workflows/policy-ab.yml')
+          text = workflow.read_text()
+          old_sha = '62dacd592eeceb3ee0ce0401f2f28bf484a69fa3/gamedata'
+          new_sha = '379e8c6e6236d7e36a1f08fc8f1b36ea77f4ef6d/gamedata'
+          if old_sha in text:
+              text = text.replace(old_sha, new_sha)
+              changed.append(str(workflow))
+          workflow.write_text(text)
+
+          print('changed:', sorted(set(changed)))
           PY
-          if git diff --quiet -- rust/src/lib.rs; then
-            echo 'Known imports are already fixed.'
+          if git diff --quiet; then
+            echo 'Repository is already updated.'
             exit 0
           fi
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add rust/src/lib.rs
-          git commit -m 'fix: 删除Rust未使用导入 [skip ci]'
+          git add rust/src/lib.rs rust/src/optimize.rs rust/src/policy_ab.rs .github/workflows/policy-ab.yml
+          git commit -m 'fix: 同步上游弱卡过滤并清理严格lint'
           git push origin "HEAD:${GITHUB_REF_NAME}"
 
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Checkout contribution branch
-        uses: actions/checkout@v4
+      - name: Checkout upstream master
+        uses: actions/checkout@v5
         with:
-          repository: xf8410/umaai-rs
-          ref: workbench/bench-card-compositions
+          repository: xulai1001/umaai-rs
+          ref: 379e8c6e6236d7e36a1f08fc8f1b36ea77f4ef6d
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Check formatting of contributed source
-        run: |
-          set -euo pipefail
-          cp crates/umasim/src/bin/bench_compositions.rs /tmp/bench_compositions.rs
-          cargo fmt --all
-          cmp /tmp/bench_compositions.rs crates/umasim/src/bin/bench_compositions.rs
       - name: Compile composition benchmark with warnings denied
         env:
           RUSTFLAGS: -D warnings
@@ -72,7 +146,7 @@ jobs:
         run: cargo test --release -p umasim --bin bench_compositions -- --test-threads=1
       - name: Run all umasim targets
         run: cargo test --release -p umasim --all-targets -- --test-threads=1
-      - name: Smoke test all 101 compositions
+      - name: Smoke test all 101 compositions with upstream weak-card filter
         run: cargo run --release -p umasim --bin bench_compositions -- --runs 1 --trainer handwritten --out /tmp/bench_compositions.csv
       - name: Verify complete CSV
         run: |
