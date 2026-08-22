@@ -12,7 +12,7 @@ path = "src/batch.rs"
 
 [[bin]]
 name = "ramen_optimize"
-path = "src/optimize.rs"
+path = "src/bin/ramen_optimize/main.rs"
 
 [[bin]]
 name = "ramen_card_benchmark"

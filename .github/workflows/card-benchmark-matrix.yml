@@ -1,0 +1,191 @@
+name: Card Benchmark Matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      strict_k:
+        description: '全排列每类入池张数 K'
+        required: true
+        default: '10'
+        type: string
+      strict_games:
+        description: '全排列每种组合局数'
+        required: true
+        default: '300'
+        type: string
+      final_games:
+        description: '终验局数'
+        required: true
+        default: '100000'
+        type: string
+
+jobs:
+  # ── 准备：阶段1-3（粗筛/搜索/全卡筛选），输出每类入池 ──
+  prep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: card-bench-matrix-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
+          restore-keys: card-bench-matrix-${{ runner.os }}-
+      - name: Download pinned gamedata
+        run: |
+          set -euo pipefail
+          mkdir -p gamedata
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/b53451c09a35c0b59a410f79ae45ce9ccb47cc52/gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+            curl --fail --silent --show-error --location "$BASE/$f" -o "gamedata/$f"
+            test -s "gamedata/$f"
+          done
+      - name: Build
+        run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_card_benchmark
+      - name: Run prep (stages 1-3)
+        env:
+          BENCH_MODE: prep
+          BENCH_POOLS_OUT: strict_pools.json
+        run: |
+          set -euo pipefail
+          rust/target/release/ramen_card_benchmark 300 3 150 ${{ inputs.strict_k }} ${{ inputs.strict_games }} ${{ inputs.final_games }} 2>&1 | tee prep_report.md
+          cat prep_report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload pools
+        uses: actions/upload-artifact@v4
+        with:
+          name: prep-pools
+          path: strict_pools.json
+          if-no-files-found: error
+      - name: Upload prep report
+        uses: actions/upload-artifact@v4
+        with:
+          name: prep-report
+          path: prep_report.md
+          if-no-files-found: warn
+
+  # ── 分片：阶段4全排列，10片并行，每片约2.4小时（K=10×300局） ──
+  shard:
+    needs: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: card-bench-matrix-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
+          restore-keys: card-bench-matrix-${{ runner.os }}-
+      - name: Download pinned gamedata
+        run: |
+          set -euo pipefail
+          mkdir -p gamedata
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/b53451c09a35c0b59a410f79ae45ce9ccb47cc52/gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+            curl --fail --silent --show-error --location "$BASE/$f" -o "gamedata/$f"
+            test -s "gamedata/$f"
+          done
+      - name: Download pools
+        uses: actions/download-artifact@v4
+        with:
+          name: prep-pools
+      - name: Build
+        run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_card_benchmark
+      - name: Run shard ${{ matrix.shard }}/10
+        env:
+          BENCH_MODE: shard
+          BENCH_SHARD_INDEX: ${{ matrix.shard }}
+          BENCH_SHARD_COUNT: '10'
+          BENCH_POOLS_IN: strict_pools.json
+          BENCH_TOP_OUT: top_shard.json
+        run: |
+          set -euo pipefail
+          rust/target/release/ramen_card_benchmark 300 3 150 ${{ inputs.strict_k }} ${{ inputs.strict_games }} ${{ inputs.final_games }} 2>&1 | tee shard_report.md
+          cat shard_report.md >> "$GITHUB_STEP_SUM"
+      - name: Upload shard top
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: top_shard.json
+          if-no-files-found: error
+
+  # ── 终验：合并各片头部，前12名各跑十万局 ──
+  final:
+    needs: shard
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: card-bench-matrix-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
+          restore-keys: card-bench-matrix-${{ runner.os }}-
+      - name: Download pinned gamedata
+        run: |
+          set -euo pipefail
+          mkdir -p gamedata
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/b53451c09a35c0b59a410f79ae45ce9ccb47cc52/gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+            curl --fail --silent --show-error --location "$BASE/$f" -o "gamedata/$f"
+            test -s "gamedata/$f"
+          done
+      - name: Download all shard tops
+        uses: actions/download-artifact@v4
+        with:
+          path: shards
+      - name: Merge shard tops
+        run: |
+          python3 - <<'EOF'
+          import json, glob
+          results = []
+          for f in sorted(glob.glob('shards/*/top_shard.json')):
+              results.extend(json.load(open(f))['results'])
+          results.sort(key=lambda r: -r['score'])
+          seen = set()
+          unique = []
+          for r in results:
+              key = tuple(sorted(r['cards'][:5]))
+              if key not in seen:
+                  seen.add(key)
+                  unique.append(r)
+          json.dump(unique[:12], open('final_candidates.json', 'w'), ensure_ascii=False, indent=1)
+          print(f"合并 {len(results)} 条 → 去重 {len(unique)} 条，取前 {min(12, len(unique))} 进终验")
+          EOF
+      - name: Build
+        run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_card_benchmark
+      - name: Run finals
+        env:
+          BENCH_MODE: final
+          BENCH_FINAL_IN: final_candidates.json
+        run: |
+          set -euo pipefail
+          rust/target/release/ramen_card_benchmark 300 3 150 ${{ inputs.strict_k }} ${{ inputs.strict_games }} ${{ inputs.final_games }} 2>&1 | tee benchmark_final.md
+          cat benchmark_final.md >> "$GITHUB_STEP_SUM"
+      - name: Upload final report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ramen-card-benchmark-final-report
+          path: benchmark_final.md
+          if-no-files-found: error

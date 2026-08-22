@@ -2,7 +2,7 @@ name: Ramen Card Benchmark
 
 on:
   push:
-    branches: ['workbench/cloud-card-benchmark', 'workbench/card-filter-from-ai-ru-wang-xi']
+    branches: ['workbench/cloud-card-benchmark', 'workbench/card-filter-from-ai-ru-wang-xi', 'workbench/modularize-rust-core']
     paths:
       - '.github/workflows/card-benchmark.yml'
       - 'rust/src/card_benchmark.rs'
