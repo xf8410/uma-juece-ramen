@@ -16,15 +16,9 @@ use rand::SeedableRng;
 use rayon::prelude::*;
 
 use uma_jni::ramen_strategy::RamenStrategy;
-use umasim::game::{Game, InheritInfo, ramen::RamenGame};
+use uma_jni::testbed::{TEST_DECK, TEST_INHERIT, TEST_UMA};
+use umasim::game::{Game, ramen::RamenGame};
 use umasim::gamedata::init_global;
-
-const TEST_UMA: u32 = 102601;
-const TEST_DECK: [u32; 6] = [302424, 302894, 303044, 302924, 303024, 303054];
-const TEST_INHERIT: InheritInfo = InheritInfo {
-    blue_count: [15, 3, 0, 0, 0],
-    extra_count: [0, 30, 0, 0, 30, 30],
-};
 
 struct SimResult {
     score: i32,
