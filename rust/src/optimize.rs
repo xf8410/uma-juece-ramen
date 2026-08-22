@@ -196,7 +196,6 @@ fn write_best_params(params: &[f64]) {
 fn print_results(baseline: f64, best: f64, best_params: &[f64], elapsed: std::time::Duration, mode: &str, total_games: usize) {
     let best_strategy = vec_to_strategy(best_params);
     let best_json_compact = serde_json::to_string(&best_strategy).unwrap();
-    let best_json_pretty = serde_json::to_string_pretty(&best_strategy).unwrap();
 
     println!();
     println!("════════════════════════════════════════");
@@ -330,13 +329,13 @@ fn solve_linear_system(a: &mut [Vec<f64>], b: &mut [f64]) -> Vec<f64> {
     x
 }
 
-fn fit_linear(X: &[Vec<f64>], y: &[f64]) -> Vec<f64> {
-    let n = X.len();
+fn fit_linear(x: &[Vec<f64>], y: &[f64]) -> Vec<f64> {
+    let n = x.len();
     let m = DIMS + 1;
     let mut a = vec![vec![0.0; m]; m];
     let mut b = vec![0.0; m];
     for i in 0..n {
-        let row: Vec<f64> = std::iter::once(1.0).chain(X[i].iter().copied()).collect();
+        let row: Vec<f64> = std::iter::once(1.0).chain(x[i].iter().copied()).collect();
         for j in 0..m {
             for k in 0..m { a[j][k] += row[j] * row[k]; }
             b[j] += row[j] * y[i];
@@ -398,24 +397,24 @@ fn bayesian_optimize(n_init: usize, n_iter: usize, games_per_eval: usize) {
     let start = Instant::now();
 
     for iter in 0..n_iter {
-        let X: Vec<Vec<f64>> = samples.iter().map(|(v, _)| normalize(v)).collect();
+        let x: Vec<Vec<f64>> = samples.iter().map(|(v, _)| normalize(v)).collect();
         let y: Vec<f64> = samples.iter().map(|(_, s)| *s).collect();
-        let w = fit_linear(&X, &y);
+        let w = fit_linear(&x, &y);
 
-        let residuals: Vec<f64> = X.iter().zip(y.iter())
+        let residuals: Vec<f64> = x.iter().zip(y.iter())
             .map(|(x, &yv)| yv - predict_linear(&w, x))
             .collect();
         let resid_std = (residuals.iter().map(|r| r * r).sum::<f64>() / residuals.len().max(1) as f64).sqrt();
         let kappa = resid_std * 2.0;
 
         let n_candidates = 2000;
-        let train_norm: Vec<Vec<f64>> = X.clone();
+        let train_norm: Vec<Vec<f64>> = x.clone();
 
         let candidates: Vec<(Vec<f64>, f64)> = (0..n_candidates)
             .into_par_iter()
             .map(|_| {
                 let mut rng = StdRng::from_os_rng();
-                let mut nvec = if rng.random::<f64>() < 0.5 {
+                let nvec = if rng.random::<f64>() < 0.5 {
                     (0..DIMS).map(|_| rng.random::<f64>()).collect::<Vec<_>>()
                 } else {
                     let best_norm = normalize(&best_params);

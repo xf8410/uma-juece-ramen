@@ -30,7 +30,6 @@ struct SimResult {
     score: i32,
     pt: i32,
     rmj_success: [bool; 3],
-    final_turn: i32,
 }
 
 fn run_one(strategy: &RamenStrategy) -> Option<SimResult> {
@@ -41,7 +40,6 @@ fn run_one(strategy: &RamenStrategy) -> Option<SimResult> {
     let score = game.uma().calc_score();
     let pt = game.uma().total_pt();
     let rmj = game.ramen.rmj_results.clone();
-    let final_turn = game.turn();
 
     Some(SimResult {
         score,
@@ -51,7 +49,6 @@ fn run_one(strategy: &RamenStrategy) -> Option<SimResult> {
             rmj.get(1).copied().unwrap_or(false),
             rmj.get(2).copied().unwrap_or(false),
         ],
-        final_turn,
     })
 }
 

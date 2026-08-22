@@ -132,7 +132,6 @@ impl Aggregate {
             others: self.target_others as f64 * 100.0 / div,
             all: self.target_all as f64 * 100.0 / div,
             pt8000: self.pt_8000 as f64 * 100.0 / div,
-            pt10000: self.pt_10000 as f64 * 100.0 / div,
         }
     }
 }
@@ -152,7 +151,6 @@ struct Summary {
     others: f64,
     all: f64,
     pt8000: f64,
-    pt10000: f64,
 }
 
 fn sum(v: &[i32]) -> f64 { v.iter().map(|&x| x as f64).sum() }
