@@ -2,7 +2,7 @@ name: Ramen Card Benchmark
 
 on:
   push:
-    branches: ['workbench/cloud-card-benchmark']
+    branches: ['workbench/cloud-card-benchmark', 'workbench/card-filter-from-ai-ru-wang-xi']
     paths:
       - '.github/workflows/card-benchmark.yml'
       - 'rust/src/card_benchmark.rs'
@@ -25,11 +25,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
