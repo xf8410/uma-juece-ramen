@@ -24,10 +24,18 @@
 //!
 //! K 调大覆盖更多组合：K=6 → 62,100 种；K=7 → 144,060 种（CI 约 5 小时）。
 //!
+//! 分片模式（BENCH_MODE，用于 CI 矩阵并行）：
+//!   BENCH_MODE=prep   只跑阶段1-3，把每类入池写进 BENCH_POOLS_OUT（默认 strict_pools.json）
+//!   BENCH_MODE=shard  读 BENCH_POOLS_IN，按 BENCH_SHARD_INDEX/COUNT 分片跑阶段4，
+//!                     前50名写进 BENCH_TOP_OUT（默认 top_shard.json）
+//!   BENCH_MODE=final  读 BENCH_FINAL_IN（合并后的候选数组），跑十万局终验
+//!   缺省=full         串行跑全部五个阶段
+//!
 //! 环境变量：
 //!   MIN_CARD_ID     卡池下界（默认 30215 = 爱如往昔）
 //!   CARD_DB         cardDB.json 路径（默认 gamedata/cardDB.json）
 //!   RAMEN_STRATEGY  策略 JSON（内联字符串，缺省用默认策略）
+//!   BENCH_STRICT_GAMES / BENCH_FINAL_GAMES  shard/final 模式下的局数覆盖
 
 use std::collections::{BTreeMap, HashSet};
 use std::env;
@@ -36,7 +44,7 @@ use std::time::Instant;
 
 use rand::SeedableRng;
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use uma_jni::ramen_strategy::RamenStrategy;
 use uma_jni::testbed::{FRIEND, TEST_UMA};
@@ -531,16 +539,21 @@ fn comp_of_types(types: &[usize; 6]) -> String {
 }
 
 /// 严格构成全排列：常规卡恰好 3 种类型（连友人共 4 种配卡）。
-/// 每类型取 strict_pools[t]，枚举 3-1-1 与 2-2-1 两种分配的全部组合，
-/// 每种组合真实模拟 games 局，返回按分降序的 (卡组, 分) 列表。
+/// 枚举 3-1-1 与 2-2-1 两种分配的全部组合。
+/// 分片：候选按全局生成序号 idx % shard_count == shard_index 归属本片，
+/// 生成顺序确定，同一组合固定落同一片；shard_count=1 即全量串行。
+/// 每种归属组合真实模拟 games 局，返回 (全局候选总数, 本片按分降序结果)。
 fn strict_enumerate(
     strict_pools: &[Vec<u32>; 5],
     strategy: &RamenStrategy,
     games: usize,
-) -> Vec<(Deck, f64)> {
+    shard_index: usize,
+    shard_count: usize,
+) -> (usize, Vec<(Deck, f64)>) {
     let mut seen: HashSet<Vec<u32>> = HashSet::new();
     let mut out: Vec<(Deck, f64)> = vec![];
-    let mut tried = 0usize;
+    let mut tried = 0usize; // 本片已模拟数
+    let mut total = 0usize; // 全局候选总数
 
     // 10 个三元类型组
     let mut sets: Vec<[usize; 3]> = vec![];
@@ -552,6 +565,34 @@ fn strict_enumerate(
         }
     }
 
+    let mut consider = |ids: Vec<u32>, types: [usize; 6]| {
+        total += 1;
+        if total % shard_count != shard_index {
+            return;
+        }
+        let mut key = ids.clone();
+        key.sort();
+        if !seen.insert(key) {
+            return;
+        }
+        let mut ids = ids;
+        ids.push(FRIEND);
+        let cards: [u32; 6] = ids.try_into().unwrap();
+        tried += 1;
+        if tried % 2000 == 0 {
+            eprintln!("  全排列进度（片 {}/{}）：{} 种组合", shard_index, shard_count, tried);
+        }
+        let s = score_of(&cards, strategy, games);
+        out.push((
+            Deck {
+                name: comp_of_types(&types),
+                cards,
+                types,
+            },
+            s,
+        ));
+    };
+
     for set in &sets {
         // 分配一：某类出 3 张（3-1-1）
         for &big in set {
@@ -562,27 +603,7 @@ fn strict_enumerate(
                         let mut ids = triple.clone();
                         ids.push(x);
                         ids.push(y);
-                        let mut key = ids.clone();
-                        key.sort();
-                        if !seen.insert(key) {
-                            continue;
-                        }
-                        let types = [big, big, big, others[0], others[1], 5];
-                        ids.push(FRIEND);
-                        let cards: [u32; 6] = ids.try_into().unwrap();
-                        tried += 1;
-                        if tried % 2000 == 0 {
-                            eprintln!("  全排列进度：{} 种组合", tried);
-                        }
-                        let s = score_of(&cards, strategy, games);
-                        out.push((
-                            Deck {
-                                name: comp_of_types(&types),
-                                cards,
-                                types,
-                            },
-                            s,
-                        ));
+                        consider(ids, [big, big, big, others[0], others[1], 5]);
                     }
                 }
             }
@@ -596,36 +617,46 @@ fn strict_enumerate(
                         let mut ids = pa.clone();
                         ids.extend_from_slice(&pb);
                         ids.push(s0);
-                        let mut key = ids.clone();
-                        key.sort();
-                        if !seen.insert(key) {
-                            continue;
-                        }
-                        let types = [pairs[0], pairs[0], pairs[1], pairs[1], single, 5];
-                        ids.push(FRIEND);
-                        let cards: [u32; 6] = ids.try_into().unwrap();
-                        tried += 1;
-                        if tried % 2000 == 0 {
-                            eprintln!("  全排列进度：{} 种组合", tried);
-                        }
-                        let s = score_of(&cards, strategy, games);
-                        out.push((
-                            Deck {
-                                name: comp_of_types(&types),
-                                cards,
-                                types,
-                            },
-                            s,
-                        ));
+                        consider(ids, [pairs[0], pairs[0], pairs[1], pairs[1], single, 5]);
                     }
                 }
             }
         }
     }
 
-    eprintln!("  全排列完成：共 {} 种组合", tried);
+    eprintln!(
+        "  全排列完成：全局 {} 种候选，本片（{}/{}）模拟 {} 种",
+        total, shard_index, shard_count, tried
+    );
     out.sort_by(|a, b| b.1.total_cmp(&a.1));
-    out
+    (total, out)
+}
+
+// ── 分片文件接口 ────────────────────────────────────────
+
+/// prep 模式输出：每类入池卡 ID（阶段4用）
+#[derive(Serialize, Deserialize)]
+struct PoolsFile {
+    pools: [Vec<u32>; 5],
+}
+
+/// shard 模式输出的头部条目
+#[derive(Serialize, Deserialize)]
+struct TopEntry {
+    name: String,
+    cards: [u32; 6],
+    types: [usize; 6],
+    score: f64,
+}
+
+/// shard 模式输出文件
+#[derive(Serialize, Deserialize)]
+struct ShardTopFile {
+    shard: usize,
+    shard_count: usize,
+    games: usize,
+    total_candidates: usize,
+    results: Vec<TopEntry>,
 }
 
 // ── 入口 ────────────────────────────────────────────────
@@ -665,6 +696,11 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|x| x.parse().ok())
         .unwrap_or(DEFAULT_MIN_CARD_ID);
+    let mode = env::var("BENCH_MODE").unwrap_or_default();
+    let strategy: RamenStrategy = env::var("RAMEN_STRATEGY")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
 
     init_global()?;
     let cards = load_cards(
@@ -672,16 +708,139 @@ fn main() -> anyhow::Result<()> {
         min_id,
     )?;
     let names: BTreeMap<u32, String> = cards.iter().map(|c| (c.id, c.name.clone())).collect();
+
+    match mode.as_str() {
+        // ── shard 模式：读池文件，只跑本片的阶段4 ──
+        "shard" => {
+            let games: usize = env::var("BENCH_STRICT_GAMES")
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(strict_games);
+            let shard_index: usize = env::var("BENCH_SHARD_INDEX")
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .expect("BENCH_SHARD_INDEX 未设置");
+            let shard_count: usize = env::var("BENCH_SHARD_COUNT")
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .filter(|&x| x >= 1)
+                .expect("BENCH_SHARD_COUNT 未设置");
+            let pools_path =
+                env::var("BENCH_POOLS_IN").unwrap_or_else(|_| "strict_pools.json".into());
+            let pools: PoolsFile =
+                serde_json::from_str(&fs::read_to_string(&pools_path)?)?;
+            eprintln!(
+                "[shard {}/{}] 池文件 {}，{} 局/种，入池 {:?}",
+                shard_index,
+                shard_count,
+                pools_path,
+                games,
+                pools.pools.iter().map(|p| p.len()).collect::<Vec<_>>()
+            );
+            let (total, results) =
+                strict_enumerate(&pools.pools, &strategy, games, shard_index, shard_count);
+            let top: Vec<TopEntry> = results
+                .iter()
+                .take(50)
+                .map(|(d, s)| TopEntry {
+                    name: d.name.clone(),
+                    cards: d.cards,
+                    types: d.types,
+                    score: *s,
+                })
+                .collect();
+            let file = ShardTopFile {
+                shard: shard_index,
+                shard_count,
+                games,
+                total_candidates: total,
+                results: top,
+            };
+            let out_path =
+                env::var("BENCH_TOP_OUT").unwrap_or_else(|_| "top_shard.json".into());
+            fs::write(&out_path, serde_json::to_string_pretty(&file)?)?;
+            println!(
+                "# 分片 {}/{} 完成\n\n- 候选总数：{}\n- 本片模拟：{}\n- 每种局数：{}\n- 头部50名已写入 {}\n\n|排名|构成|实测分|\n|---:|---|---:|",
+                shard_index,
+                shard_count,
+                total,
+                results.len(),
+                games,
+                out_path
+            );
+            for (i, (d, s)) in results.iter().take(20).enumerate() {
+                println!("|{}|{}|{:.0}|", i + 1, d.name, s);
+            }
+            return Ok(());
+        }
+        // ── final 模式：读合并候选，跑十万局终验 ──
+        "final" => {
+            let games: usize = env::var("BENCH_FINAL_GAMES")
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(final_games);
+            let path =
+                env::var("BENCH_FINAL_IN").unwrap_or_else(|_| "final_candidates.json".into());
+            let candidates: Vec<TopEntry> =
+                serde_json::from_str(&fs::read_to_string(&path)?)?;
+            let mut seen: HashSet<Vec<u32>> = HashSet::new();
+            let mut decks: Vec<Deck> = vec![];
+            for (i, c) in candidates.iter().enumerate() {
+                let mut key = c.cards[..5].to_vec();
+                key.sort();
+                if seen.insert(key) {
+                    decks.push(Deck {
+                        name: format!("全排列#{} {}", i + 1, c.name),
+                        cards: c.cards,
+                        types: c.types,
+                    });
+                }
+                if decks.len() >= STRICT_FINALISTS {
+                    break;
+                }
+            }
+            decks.push(Deck {
+                name: "上游推荐基准：3速1耐1智+1友".into(),
+                cards: BASELINE,
+                types: BASELINE_TYPES,
+            });
+            let start = Instant::now();
+            println!("# 终验（{}局/种，{}个卡组）\n", games, decks.len());
+            let mut final_rows: Vec<ResultRow> = decks
+                .iter()
+                .map(|d| {
+                    eprintln!("[终验] {} {:?}", d.name, d.cards);
+                    simulate(d, games, &strategy)
+                })
+                .collect();
+            final_rows.sort_by(|a, b| b.mean.total_cmp(&a.mean));
+            let refs: Vec<&ResultRow> = final_rows.iter().collect();
+            print_row_table(&refs);
+            println!(
+                "\n总耗时：{:.1}秒\n\n## 终验卡组明细\n",
+                start.elapsed().as_secs_f64()
+            );
+            for (i, r) in final_rows.iter().enumerate() {
+                let d = r
+                    .cards
+                    .iter()
+                    .map(|id| card_label(*id, &names))
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+                println!("{}. **{}**：{}", i + 1, r.name, d);
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // ── prep / full：阶段1-3 + 入池构造 ──
     let pools = build_pools(&cards);
     let all = all_by_type(&cards);
     let decks = build_decks(&pools, &all);
-    let strategy: RamenStrategy = env::var("RAMEN_STRATEGY")
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
 
     println!(
-        "# 拉面杯卡组基准：全排列版\n\n\
+        "# 拉面杯卡组基准：全排列版{}\n\n\
          - 每套严格6张：5张普通卡 + 固定友人 {}\n\
          - 卡池：爱如往昔后满破SSR共{}张（友人/团队不进池），每类 {:?}\n\
          - 阶段1：构成粗筛+力/根逐测，{} 局/套，共{}套\n\
@@ -690,6 +849,7 @@ fn main() -> anyhow::Result<()> {
          - 阶段4：严格构成全排列（恰好3种常规类型+友人=4种配卡），\n\
          \x20\x20\x20\x20\x20\x20\x20\x20每类实测前{}张（含赢家保送），每种 {} 局\n\
          - 阶段5：终验 {} 局/种（全排列前{} + 搜索赢家 + 构成冠军 + 上游基准）\n",
+        if mode == "prep" { "（prep：只跑阶段1-3，输出入池）" } else { "" },
         FRIEND,
         cards.len(),
         all.iter().map(|v| v.len()).collect::<Vec<_>>(),
@@ -773,7 +933,7 @@ fn main() -> anyhow::Result<()> {
         println!();
     }
 
-    // ── 阶段4：严格构成全排列 ──
+    // ── 阶段4入池构造 ──
     // 每类入池 = 搜索赢家/头部卡组保送（至多2张） + 实测排名补足到 K
     let mut strict_pools: [Vec<u32>; 5] = std::array::from_fn(|_| vec![]);
     for t in 0..5 {
@@ -824,7 +984,26 @@ fn main() -> anyhow::Result<()> {
     }
     println!();
 
-    let strict_results = strict_enumerate(&strict_pools, &strategy, strict_games);
+    // ── prep 模式：写池文件后退出 ──
+    if mode == "prep" {
+        let out_path =
+            env::var("BENCH_POOLS_OUT").unwrap_or_else(|_| "strict_pools.json".into());
+        fs::write(
+            &out_path,
+            serde_json::to_string_pretty(&PoolsFile {
+                pools: strict_pools,
+            })?,
+        )?;
+        println!(
+            "\n[prep] 入池已写入 {}（耗时 {:.1}秒），阶段4-5由分片作业执行",
+            out_path,
+            start.elapsed().as_secs_f64()
+        );
+        return Ok(());
+    }
+
+    let strict_results = strict_enumerate(&strict_pools, &strategy, strict_games, 0, 1);
+    let (total, strict_results) = strict_results;
     println!(
         "\n### 全排列结果（{}局/种，共{}种，头部20）\n",
         strict_games,
@@ -904,6 +1083,7 @@ fn main() -> anyhow::Result<()> {
             .join(" / ");
         println!("{}. **{}**：{}", i + 1, r.name, d);
     }
+    let _ = total;
 
     Ok(())
 }
