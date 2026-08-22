@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use umasim::game::{
-    Game, Trainer,
+    Game,
     ramen::{RamenGame, RamenStage},
     InheritInfo, PersonType,
 };
@@ -98,7 +98,6 @@ pub struct ActionScore {
 
 /// 接受整数或字符串，映射为上游约定：1=绝不调 ~ 5=绝好调（越大越好）
 fn deserialize_motivation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
-    use serde::de::Error;
     let v: serde_json::Value = Deserialize::deserialize(d)?;
     match v {
         serde_json::Value::Number(n) => Ok(n.as_i64().unwrap_or(3) as i32),
