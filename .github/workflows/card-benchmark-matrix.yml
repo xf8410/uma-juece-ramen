@@ -41,7 +41,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p gamedata
-          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/b53451c09a35c0b59a410f79ae45ce9ccb47cc52/gamedata
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/3f37cc7daab2f22fb58cc2c524941a18b6f911d9/gamedata
           for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
             curl --fail --silent --show-error --location "$BASE/$f" -o "gamedata/$f"
             test -s "gamedata/$f"
@@ -95,7 +95,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p gamedata
-          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/b53451c09a35c0b59a410f79ae45ce9ccb47cc52/gamedata
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/3f37cc7daab2f22fb58cc2c524941a18b6f911d9/gamedata
           for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
             curl --fail --silent --show-error --location "$BASE/$f" -o "gamedata/$f"
             test -s "gamedata/$f"
@@ -146,7 +146,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p gamedata
-          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/b53451c09a35c0b59a410f79ae45ce9ccb47cc52/gamedata
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/3f37cc7daab2f22fb58cc2c524941a18b6f911d9/gamedata
           for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
             curl --fail --silent --show-error --location "$BASE/$f" -o "gamedata/$f"
             test -s "gamedata/$f"
