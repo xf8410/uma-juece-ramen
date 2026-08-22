@@ -1,0 +1,93 @@
+name: Root-card four-type A-B 100k
+
+on:
+  push:
+    branches: ['workbench/test-upstream-compositions']
+    paths: ['.github/workflows/root-card-ab-100k.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: root-card-ab-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
+          restore-keys: root-card-ab-${{ runner.os }}-
+
+      - name: Download pinned gamedata
+        run: |
+          set -euo pipefail
+          mkdir -p gamedata
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/62dacd592eeceb3ee0ce0401f2f28bf484a69fa3/gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+            curl --fail --silent --show-error --location "$BASE/$f" -o "gamedata/$f"
+            test -s "gamedata/$f"
+          done
+
+      - name: Restrict benchmark to six root-card four-type compositions
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('rust/src/policy_ab.rs')
+          text = path.read_text()
+          start = text.index('fn all_composition_decks(')
+          end = text.index('\nfn deck_detail(', start)
+          replacement = '''fn all_composition_decks(cards: &[Card]) -> anyhow::Result<Vec<Deck>> {
+              // 固定友人算一种类型；其余5张恰好包含根性及另外两种普通类型。
+              // “主根”按根性严格最多解释，因此为3根+1副类型A+1副类型B+1友。
+              let counts = [
+                  [1, 1, 0, 3, 0], // 3根1速1耐+1友
+                  [1, 0, 1, 3, 0], // 3根1速1力+1友
+                  [1, 0, 0, 3, 1], // 3根1速1智+1友
+                  [0, 1, 1, 3, 0], // 3根1耐1力+1友
+                  [0, 1, 0, 3, 1], // 3根1耐1智+1友
+                  [0, 0, 1, 3, 1], // 3根1力1智+1友
+              ];
+              counts.into_iter().map(|c| build_deck(cards, c)).collect()
+          }
+          '''
+          text = text[:start] + replacement + text[end:]
+
+          old = 'let old = RamenStrategy::default();'
+          new = '''let old: RamenStrategy = serde_json::from_str(
+                  &fs::read_to_string("rust/strategy_optimized.json")?
+              )?;'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one A strategy constructor, found {text.count(old)}')
+          text = text.replace(old, new)
+          text = text.replace('全101种卡型构成', '主根且含友人的六种四类型构成')
+          text = text.replace('全构成数量', '六构成数量')
+          text = text.replace('A：本仓库原手写策略', 'A：Android APK 当前打包优化策略')
+          text = text.replace('A 原策略', 'A APK优化策略')
+          path.write_text(text)
+          PY
+
+      - name: Build benchmark
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_policy_ab
+
+      - name: Run A and B with 100000 same-seed games per composition
+        run: |
+          set -euo pipefail
+          echo '# 运行口径：6种构成 × 2种逻辑 × 每项100000局 = 1200000局' | tee root_card_ab_100k.md
+          rust/target/release/ramen_policy_ab 100000 42 2>&1 | tee -a root_card_ab_100k.md
+          cat root_card_ab_100k.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: root-card-four-type-ab-100k
+          path: root_card_ab_100k.md
+          if-no-files-found: error
