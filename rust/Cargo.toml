@@ -36,6 +36,9 @@ log = "0.4"
 default = ["jni-support"]
 jni-support = ["dep:jni"]
 
+[lints.rust]
+unused_imports = "deny"
+
 [profile.release]
 opt-level = 3
 lto = true
