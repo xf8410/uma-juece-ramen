@@ -1,6 +1,12 @@
 name: Card Benchmark Matrix
 
 on:
+  push:
+    branches: ['workbench/rerun-upstream-3f37']
+    paths:
+      - '.github/workflows/card-benchmark-matrix.yml'
+      - 'rust/Cargo.toml'
+      - 'rust/src/card_benchmark.rs'
   workflow_dispatch:
     inputs:
       strict_k:
@@ -20,7 +26,6 @@ on:
         type: string
 
 jobs:
-  # ── 准备：阶段1-3（粗筛/搜索/全卡筛选），输出每类入池 ──
   prep:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -54,7 +59,7 @@ jobs:
           BENCH_POOLS_OUT: strict_pools.json
         run: |
           set -euo pipefail
-          rust/target/release/ramen_card_benchmark 300 3 150 ${{ inputs.strict_k }} ${{ inputs.strict_games }} ${{ inputs.final_games }} 2>&1 | tee prep_report.md
+          rust/target/release/ramen_card_benchmark 300 3 150 ${{ github.event_name == 'push' && '10' || inputs.strict_k }} ${{ github.event_name == 'push' && '300' || inputs.strict_games }} ${{ github.event_name == 'push' && '100000' || inputs.final_games }} 2>&1 | tee prep_report.md
           cat prep_report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Upload pools
         uses: actions/upload-artifact@v4
@@ -69,7 +74,6 @@ jobs:
           path: prep_report.md
           if-no-files-found: warn
 
-  # ── 分片：阶段4全排列，10片并行，每片约2.4小时（K=10×300局） ──
   shard:
     needs: prep
     runs-on: ubuntu-latest
@@ -115,8 +119,8 @@ jobs:
           BENCH_TOP_OUT: top_shard.json
         run: |
           set -euo pipefail
-          rust/target/release/ramen_card_benchmark 300 3 150 ${{ inputs.strict_k }} ${{ inputs.strict_games }} ${{ inputs.final_games }} 2>&1 | tee shard_report.md
-          cat shard_report.md >> "$GITHUB_STEP_SUM"
+          rust/target/release/ramen_card_benchmark 300 3 150 ${{ github.event_name == 'push' && '10' || inputs.strict_k }} ${{ github.event_name == 'push' && '300' || inputs.strict_games }} ${{ github.event_name == 'push' && '100000' || inputs.final_games }} 2>&1 | tee shard_report.md
+          cat shard_report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Upload shard top
         uses: actions/upload-artifact@v4
         with:
@@ -124,7 +128,6 @@ jobs:
           path: top_shard.json
           if-no-files-found: error
 
-  # ── 终验：合并各片头部，前12名各跑十万局 ──
   final:
     needs: shard
     runs-on: ubuntu-latest
@@ -181,8 +184,8 @@ jobs:
           BENCH_FINAL_IN: final_candidates.json
         run: |
           set -euo pipefail
-          rust/target/release/ramen_card_benchmark 300 3 150 ${{ inputs.strict_k }} ${{ inputs.strict_games }} ${{ inputs.final_games }} 2>&1 | tee benchmark_final.md
-          cat benchmark_final.md >> "$GITHUB_STEP_SUM"
+          rust/target/release/ramen_card_benchmark 300 3 150 ${{ github.event_name == 'push' && '10' || inputs.strict_k }} ${{ github.event_name == 'push' && '300' || inputs.strict_games }} ${{ github.event_name == 'push' && '100000' || inputs.final_games }} 2>&1 | tee benchmark_final.md
+          cat benchmark_final.md >> "$GITHUB_STEP_SUMMARY"
       - name: Upload final report
         uses: actions/upload-artifact@v4
         with:
