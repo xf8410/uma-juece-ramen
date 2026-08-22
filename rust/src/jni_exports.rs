@@ -11,7 +11,7 @@ use jni::sys::jstring;
 use jni::JNIEnv;
 use rand::{SeedableRng, rngs::StdRng};
 
-use umasim::game::{InheritInfo, ramen::RamenGame};
+use umasim::game::{Game, InheritInfo, ramen::RamenGame};
 use umasim::gamedata::init_global;
 
 use crate::inject::inject_state;

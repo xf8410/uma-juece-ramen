@@ -7,7 +7,7 @@ use rand::{SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use umasim::game::ramen::{RamenGame, RamenStage};
+use umasim::game::{Game, ramen::{RamenGame, RamenStage}};
 
 use crate::ramen_strategy;
 
