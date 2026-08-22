@@ -568,8 +568,8 @@ fn strict_enumerate(
                             continue;
                         }
                         let types = [big, big, big, others[0], others[1], 5];
-                        let mut cards = ids;
-                        cards.push(FRIEND);
+                        ids.push(FRIEND);
+                        let cards: [u32; 6] = ids.try_into().unwrap();
                         tried += 1;
                         if tried % 2000 == 0 {
                             eprintln!("  全排列进度：{} 种组合", tried);
@@ -602,8 +602,8 @@ fn strict_enumerate(
                             continue;
                         }
                         let types = [pairs[0], pairs[0], pairs[1], pairs[1], single, 5];
-                        let mut cards = ids;
-                        cards.push(FRIEND);
+                        ids.push(FRIEND);
+                        let cards: [u32; 6] = ids.try_into().unwrap();
                         tried += 1;
                         if tried % 2000 == 0 {
                             eprintln!("  全排列进度：{} 种组合", tried);
@@ -846,7 +846,7 @@ fn main() -> anyhow::Result<()> {
     println!("\n## 阶段5：终验（{}局/种）\n", final_games);
     let mut finalists: Vec<Deck> = vec![];
     let mut seen_final: HashSet<Vec<u32>> = HashSet::new();
-    let mut push_final = |d: Deck, seen: &mut HashSet<Vec<u32>>, out: &mut Vec<Deck>| {
+    let push_final = |d: Deck, seen: &mut HashSet<Vec<u32>>, out: &mut Vec<Deck>| {
         let mut key = d.cards[..5].to_vec();
         key.sort();
         if seen.insert(key) {
