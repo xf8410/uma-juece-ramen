@@ -9,7 +9,7 @@ use rayon::prelude::*;
 
 use uma_jni::ramen_strategy::RamenStrategy;
 use uma_jni::testbed::{TEST_DECK, TEST_INHERIT, TEST_UMA};
-use umasim::game::ramen::RamenGame;
+use umasim::game::{Game, ramen::RamenGame};
 
 use crate::params::{PARAMS, clamp_vec, strategy_to_vec, vec_to_strategy};
 
