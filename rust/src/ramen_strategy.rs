@@ -254,6 +254,7 @@ impl RamenStrategy {
             }
             Operation::RegionSelect(_) => 50.0,
             Operation::StageOnly => 0.0,
+            Operation::SuperRamenSelect(_) => 50.0,
         }
     }
 
