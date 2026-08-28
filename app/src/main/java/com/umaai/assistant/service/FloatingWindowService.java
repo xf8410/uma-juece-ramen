@@ -26,17 +26,26 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 
 /**
- * 拉面杯浮窗服务（v0.3.0+）。
+ * 拉面杯浮窗服务（v0.3.1+）。
  *
  * 通信架构：
  * - hlpatch so 推送 JSON → HttpDataService(:18766) 或轮询(:18765/summary)
- * - JSON 透传给 UmaNativeBridge.search() → Rust reconcile + MCTS 搜索
- * - 返回结构化 JSON（view + decision + reconcile）→ 渲染浮窗
+ * - JSON 透传给 UmaNativeBridge.search() → Rust reconcile + 重放重建 + MCTS 搜索
+ * - 返回结构化 JSON（view + decision + training_decision + reconcile）→ 渲染浮窗
  *
  * 显示内容（对齐 PC 黑板，EtherealAO 版）：
  * - 主建议 + 搜索规模（建议：吃面/函馆-耐（mean 66972 · 4096次/12.7s））
  * - 候选差值（决策理由：#0 不吃面 -999 ｜ #2 吃面/东京-智 -731）
- * - 训练兜底建议 + 训练明细行（速: 速46 力14 27pt 体力-25 失败10% 头3光2）
+ * - 训练建议（训练建议：速度训练（mean X · 64次/…ms），来自 Rust Train 阶段补搜）
+ * - 训练明细行（速: 速46 力14 27pt 体力-25 失败10% 头3光2）
+ *
+ * v0.3.1 变更：
+ * - 删除 Java 端「训练兜底」（TrainingEvaluator）：小黑板已有 hlpatch 真实训练
+ *   明细，Java 端再算一遍纯属浪费算力，且质量远低于模拟器搜索
+ * - hlpatch 没发 trainings（非行动画面）时，Rust 在 Train 阶段补搜并返回
+ *   training_decision，浮窗显示「训练建议：…」；trainings 非空时不显示该行
+ * - Rust 侧 v0.3.1 起先重放重建（断线重连）再搜索，非行动画面也能给出
+ *   有依据的吃面/训练建议
  *
  * 回合口径：
  * - hlpatch 的 turn 与游戏 UI「第N回合」一致（1-based），直读时标注「直读」
@@ -47,7 +56,7 @@ import java.net.URL;
  * - chara 对象（speed/stamina/power/guts/wiz/vital/max_vital/motivation/skill_point/scenario_id）
  * - month(1-12) + half(1-2)，v3.27.17+ 补发 turn
  * - 可选 ramen 对象（sozai/feeling/acquisition_gauges/checkpoint_pt）
- * - 顶层 trainings（五项训练收益/失败率/人头/发光）
+ * - 顶层 trainings（五项训练收益/失败率/人头/发光，仅行动画面非空）
  */
 public final class FloatingWindowService extends Service implements HttpDataService.OnDataListener {
     private static final String TAG = "RamenFloat";
@@ -58,7 +67,6 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private static final int[] DEFAULT_CARDS = {302424, 302894, 303044, 302924, 303024, 303054};
 
     private final Handler main = new Handler(Looper.getMainLooper());
-    private final TrainingEvaluator evaluator = new TrainingEvaluator();
     private WindowManager windowManager;
     private View panel;
     private TextView turnView, recommendView, statusView, ramenView, trainingsView, sourceView;
@@ -213,7 +221,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
             " 干劲" + mot
         );
 
-        // 训练数据（hlpatch /summary 顶层 trainings）
+        // 训练数据（hlpatch /summary 顶层 trainings，仅行动画面非空）
         JSONArray trainings = s.optJSONArray("trainings");
         String detail = RamenBoardText.trainingLines(trainings);
         trainingsView.setText(detail.isEmpty() ? "训练数据：无" : detail);
@@ -228,11 +236,8 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     }
 
     private void renderSearchResult(JSONObject s) {
-        // 训练兜底（运行时收益评分，读 chara/stats + 顶层 trainings）
-        String training = evaluator.recommend(s);
-
         if (searchRunning) {
-            recommendView.setText("模拟搜索中…\n训练兜底：" + training);
+            recommendView.setText("模拟搜索中…");
             return;
         }
 
@@ -246,8 +251,13 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                 String deltas = RamenBoardText.candidateDeltas(decision, 3);
                 if (!deltas.isEmpty()) b.append('\n').append(deltas);
 
-                // 训练建议与拉面建议并列显示（不再被搜索结果覆盖）
-                b.append("\n训练兜底：").append(training);
+                // 训练建议：hlpatch 没发 trainings（非行动画面）时由 Rust 在
+                // Train 阶段补搜返回；trainings 非空时不显示（黑板已有真实明细）
+                JSONObject td = result.optJSONObject("training_decision");
+                if (td != null) {
+                    // decisionLine 输出「建议：X（…）」，前拼「训练」→「训练建议：X（…）」
+                    b.append("\n训练").append(RamenBoardText.decisionLine(td));
+                }
 
                 // 校正警告数量
                 JSONObject reconcile = result.optJSONObject("reconcile");
@@ -264,13 +274,13 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         if (result != null && !result.optBoolean("ok", false)) {
             String error = result.optString("error", "");
             if (!error.isEmpty()) {
-                recommendView.setText("搜索失败：" + error + "\n兜底：" + training);
+                recommendView.setText("搜索失败：" + error);
                 return;
             }
         }
 
-        // 无搜索结果，用兜底
-        recommendView.setText(training);
+        // 无搜索结果
+        recommendView.setText("等待搜索…");
     }
 
     // ── 搜索触发 ──────────────────────────────────────────────────────
@@ -307,7 +317,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         searchRunning = true;
         lastSearchKey = key;
         pendingSummary = s;
-        recommendView.setText(evaluator.recommend(s) + " · 模拟搜索中...");
+        recommendView.setText("模拟搜索中...");
 
         if (searchThread != null && searchThread.isAlive()) return;
 
