@@ -29,4 +29,10 @@ public class ActionRecommendationTest {
         JSONObject b=new JSONObject("{\"turn\":6,\"stats\":{\"vital\":84,\"motivation\":\"Best\"},\"ramen\":{\"checkpoint_pt\":630,\"sozai\":[1,2,5]}}");
         assertTrue(!FloatingWindowService.searchKey(a).equals(FloatingWindowService.searchKey(b)));
     }
+    @Test public void searchKeyChangesWhenDirectTurnAdvances() throws Exception {
+        // hlpatch 直读 turn：同一 month/half 内推进回合必须重新搜索
+        JSONObject a=new JSONObject("{\"turn\":31,\"month\":4,\"half\":1,\"chara\":{\"vital\":60,\"motivation\":\"Best\"}}");
+        JSONObject b=new JSONObject("{\"turn\":32,\"month\":4,\"half\":1,\"chara\":{\"vital\":60,\"motivation\":\"Best\"}}");
+        assertTrue(!FloatingWindowService.searchKey(a).equals(FloatingWindowService.searchKey(b)));
+    }
 }

@@ -3,10 +3,8 @@ package com.umaai.assistant.service;
 import android.content.Context;
 import android.content.res.AssetManager;
 import android.util.Log;
-
 import org.json.JSONArray;
 import org.json.JSONObject;
-
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -19,11 +17,11 @@ import java.net.URL;
 /**
  * JNI 桥接层：手机版与上游 umaai-rs 模拟器的通信入口。
  *
- * 架构（v0.2.0+）：
- * - hlpatch 推送 JSON（chara + month/half）→ 透传给 nativeSearch
- * - Rust 侧 reconcile 校正 → inject_state → RamenMctsTrainer 搜索
- * - 返回标准结构化 JSON（view + decision + reconcile + warnings）
- * - Java 侧直接渲染，不再自己拼文案或算评分
+ * 架构（v0.3.0+）：
+ * - hlpatch 推送 JSON（chara + month/half/turn）→ 透传给 nativeSearch
+ * - Rust 侧 reconcile 校正（turn: UI 1-based → AI 内部 0-based）→ inject_state
+ * - RamenMctsTrainer 搜索 → 结构化 JSON（view + decision + reconcile + warnings）
+ * - Java 侧由 RamenBoardText 组装显示，本层不再改写 action_display
  *
  * 通信方式：
  * - 本地 JNI（默认）：libuma.so 在手机端跑搜索
@@ -74,7 +72,6 @@ public final class UmaNativeBridge {
         File gamedataDir = new File(dataDir, "gamedata");
         gamedataDir.mkdirs();
 
-        // 从 assets 复制 gamedata 文件到内部存储
         String[] files = {
             "constants.json", "cardDB.json", "umaDB.json",
             "text_data_dict.json", "events.json", "scenario_ramen.json",
@@ -95,10 +92,8 @@ public final class UmaNativeBridge {
             }
         }
 
-        // 调用 native init（传 dataDir，Rust 侧 set_current_dir 后用相对路径加载）
         try {
-            String result = nativeInit(dataDir.getAbsolutePath());
-            JSONObject json = new JSONObject(result);
+            JSONObject json = new JSONObject(nativeInit(dataDir.getAbsolutePath()));
             initialized = json.optBoolean("ok", false);
             if (initialized) {
                 Log.i(TAG, "Native init OK");
@@ -116,7 +111,7 @@ public final class UmaNativeBridge {
     /**
      * 搜索入口：把 hlpatch JSON 透传给 Rust，返回结构化结果。
      *
-     * @param summary hlpatch 推送的完整 JSON（chara + month/half + 可选 ramen）
+     * @param summary hlpatch 推送的完整 JSON（chara + month/half/turn + 可选 ramen）
      * @param umaId   马娘 ID
      * @param cards   6 张支援卡 ID
      * @param searchN 搜索次数（0 表示用默认值 4096）
@@ -165,35 +160,37 @@ public final class UmaNativeBridge {
     }
 
     private static JSONObject searchCloud(JSONObject summary, int umaId, int[] cards, int searchN) {
+        HttpURLConnection conn = null;
         try {
             JSONObject payload = new JSONObject();
             payload.put("state", summary);
             payload.put("config", makeConfig(umaId, cards, searchN));
 
             URL url = new URL(cloudUrl + "/search");
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json");
             conn.setDoOutput(true);
             conn.setConnectTimeout(5000);
             conn.setReadTimeout(60000); // 4096 次搜索可能较慢
 
-            OutputStream os = conn.getOutputStream();
-            os.write(payload.toString().getBytes("UTF-8"));
-            os.close();
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(payload.toString().getBytes("UTF-8"));
+            }
 
             if (conn.getResponseCode() != 200) return null;
-            BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(conn.getInputStream(), "UTF-8"));
             StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) sb.append(line);
-            reader.close();
-            conn.disconnect();
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(conn.getInputStream(), "UTF-8"))) {
+                String line;
+                while ((line = reader.readLine()) != null) sb.append(line);
+            }
             return new JSONObject(sb.toString());
         } catch (Exception e) {
             Log.w(TAG, "Cloud search failed, falling back to local", e);
             return null;
+        } finally {
+            if (conn != null) conn.disconnect();
         }
     }
 }
