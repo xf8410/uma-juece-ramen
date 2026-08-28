@@ -2,7 +2,8 @@
 //!
 //! 架构：
 //! - `reconcile`: 状态校正层，把 hlpatch 脏数据清洗为模拟器可用状态
-//! - `inject_state`: 把校正后的状态注入 RamenGame
+//! - `fast_forward`: 断线重连——从第 0 回合重放重建训练分布/羁绊/训练等级（v0.3.1）
+//! - `inject_state`: 把校正后的状态注入 RamenGame（覆盖观测字段）
 //! - `run_search`: 用上游 `RamenMctsTrainer` 搜索，输出 `DecisionInfo` + `GameView`
 //! - JNI exports: `nativeInit` / `nativeSearch` / `nativeVersion`
 //!
@@ -15,6 +16,14 @@
 //!   不再二次搜索（旧行为把 4096 次模拟翻倍，且两次随机数不同、
 //!   展示的 mean 与实际选中动作不一致）
 //! - 返回结构化 JSON（view + decision + warnings + confidence）
+//!
+//! v0.3.1（断线重连）：
+//! - `run_search` 在 newgame 后先 `fast_forward` 从第 0 回合重放到目标回合，
+//!   重建 distribution / friendship / train_level_count，再由 inject_state
+//!   覆盖观测值。修复"跳回合注入导致训练分布停留在 newgame 初始值"的问题。
+//! - hlpatch 没发 `trainings`（非行动画面）时，额外在 Train 阶段搜一次，
+//!   输出 `training_decision`，小黑板没有逐回合训练数据也能给训练建议；
+//!   trainings 非空时跳过这次补搜，不白耗算力。
 
 pub mod ramen_strategy;
 pub mod reconcile;
@@ -70,6 +79,10 @@ pub struct SearchResponse {
     pub view: Option<GameView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<DecisionOutput>,
+    /// 训练阶段建议：hlpatch 没发 trainings 时在 Train 阶段补搜的结果。
+    /// trainings 非空（行动画面）时为 None，小黑板直接显示真实训练明细。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub training_decision: Option<DecisionOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reconcile: Option<ReconciledState>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,6 +109,43 @@ pub struct DecisionOutput {
     pub source: String,
 }
 
+// ── 断线重连（v0.3.1）───────────────────────────────────────────────
+
+/// 从第 0 回合重放模拟到目标回合（内部 0-based 回合数）。
+///
+/// `inject_state` 只覆盖观测字段（五维/体力/拉面/回合），但训练分布、
+/// 羁绊、训练等级无法从 hlpatch 数据恢复——旧版直接跳回合，导致这些
+/// 字段停留在 newgame 初始值，搜索没有依据。这里用手写策略从第 0 回合
+/// 快速重放（不做 MCTS，毫秒级），把 distribution / friendship /
+/// train_level_count 重建到接近真实 run 的状态。
+///
+/// 这是 PC 黑板「全程模拟」在手机上的等价物：hlpatch 不发 trainings
+/// （非行动画面）也能给出有依据的训练建议。
+///
+/// 使用固定种子的 StdRng：同一快照多次重放结果一致（可复现、可对比）。
+/// 单个阶段失败不阻断重放（继续推进，尽力走到目标回合）。
+///
+/// 返回实际执行的阶段数（诊断用）。
+fn fast_forward(game: &mut RamenGame, target_internal_turn: i32) -> usize {
+    if target_internal_turn <= 0 {
+        return 0;
+    }
+    let trainer = RamenHandwrittenTrainer::new();
+    let mut rng = StdRng::seed_from_u64(0x5EED_2026);
+    let mut steps = 0usize;
+    // 防御上限：每回合最多 8 个阶段再留余量，避免异常状态死循环
+    let guard_max = (target_internal_turn as usize + 2) * 8 + 64;
+    // 与上游 run_full_game 相同的推进语义：先执行当前阶段，再推进
+    while game.turn() < target_internal_turn && steps < guard_max {
+        let _ = game.run_stage(&trainer, &mut rng);
+        steps += 1;
+        if !game.next() {
+            break; // 游戏结束
+        }
+    }
+    steps
+}
+
 // ── 状态注入 ────────────────────────────────────────────────────────
 
 /// 把校正后的状态注入 RamenGame。
@@ -103,9 +153,10 @@ pub struct DecisionOutput {
 /// 回合转换：`state.turn` 是 hlpatch 直读的游戏 UI 回合（1-based），
 /// 上游模拟器内部回合从 0 开始，这里做 `-1`。
 ///
-/// 注意：这是"部分重建"，不是完美快照。以下字段无法从 hlpatch 数据恢复：
-/// - friendship（友情等级）：估算为 80（接近满级）
-/// - train_level_count（训练等级）：估算为 0
+/// 注意：这是"部分重建"，不是完美快照。训练分布 / 羁绊 / 训练等级由
+/// `fast_forward` 重放重建（v0.3.1），本函数只覆盖可直接观测的字段：
+/// - friendship：重放近似值（不再固定估算 80）
+/// - train_level_count：重放近似值（不再固定为 0）
 /// - feeling_queue（诀窍获得顺序队列）：置空
 /// - yearly_* 观测字段：置默认值
 pub fn inject_state(game: &mut RamenGame, state: &ReconciledState) -> Result<()> {
@@ -134,6 +185,8 @@ pub fn inject_state(game: &mut RamenGame, state: &ReconciledState) -> Result<()>
     }
 
     // 人头注入：根据回合添加友人/NPC/记者
+    // （fast_forward 重放过程中已按回合推进添加；这里兜底补齐，
+    //   保证 target=0 或重放中断时人头仍然完整）
     if internal_turn >= 2 {
         let has_scenario = game
             .persons
@@ -175,9 +228,10 @@ pub fn inject_state(game: &mut RamenGame, state: &ReconciledState) -> Result<()>
 /// 流程：
 /// 1. reconcile hlpatch JSON → ReconciledState
 /// 2. 如果 confidence = Reject，返回错误
-/// 3. newgame + inject_state
+/// 3. newgame → fast_forward（重放重建）→ inject_state（覆盖观测值）
 /// 4. 用 RamenMctsTrainer 搜索（Train + RamenSelect 阶段）
-/// 5. 输出 GameView + DecisionOutput
+/// 5. hlpatch 无 trainings 时补一次 Train 阶段搜索 → training_decision
+/// 6. 输出 GameView + DecisionOutput(+ training_decision)
 pub fn run_search(
     summary_json: &str,
     config: &SearchConfigInput,
@@ -193,11 +247,16 @@ pub fn run_search(
                 ok: false,
                 view: None,
                 decision: None,
+                training_decision: None,
                 reconcile: None,
                 error: Some(format!("JSON 解析失败: {e}")),
             }
         }
     };
+
+    // hlpatch 的 trainings 只在回合行动画面非空。
+    // 空时需要 Rust 在 Train 阶段补搜训练建议；非空时跳过，不白耗算力。
+    let need_training_search = raw.trainings.is_empty();
 
     let reconciled = match reconcile(&raw) {
         Ok(s) => s,
@@ -207,6 +266,7 @@ pub fn run_search(
                 ok: false,
                 view: None,
                 decision: None,
+                training_decision: None,
                 reconcile: None,
                 error: Some(format!("状态校正失败: {e}")),
             }
@@ -230,6 +290,7 @@ pub fn run_search(
             ok: false,
             view: None,
             decision: None,
+            training_decision: None,
             reconcile: Some(reconciled),
             error: Some(format!(
                 "置信度过低({confidence:?})，跳过搜索"
@@ -237,7 +298,7 @@ pub fn run_search(
         };
     }
 
-    // ② 初始化游戏 + 注入状态
+    // ② 初始化游戏 + 重放重建 + 注入状态
     let inherit = InheritInfo {
         blue_count: config.blue_count,
         extra_count: config.extra_count,
@@ -251,17 +312,29 @@ pub fn run_search(
                 ok: false,
                 view: None,
                 decision: None,
+                training_decision: None,
                 reconcile: Some(reconciled),
                 error: Some(format!("newgame 失败: {e}")),
             }
         }
     };
 
+    // ★ v0.3.1 断线重连：先重放到目标回合（重建分布/羁绊/训练等级），
+    //   再用观测值覆盖。跳回合注入的时代，这些字段全是 newgame 初始值。
+    let target_internal = (reconciled.turn - 1).max(0);
+    let replay_steps = fast_forward(&mut game, target_internal);
+    log::info!(
+        "fast_forward: target_turn={} replayed_stages={} (断线重连重建)",
+        target_internal,
+        replay_steps
+    );
+
     if let Err(e) = inject_state(&mut game, &reconciled) {
         return SearchResponse {
             ok: false,
             view: None,
             decision: None,
+            training_decision: None,
             reconcile: Some(reconciled),
             error: Some(format!("inject_state 失败: {e}")),
         };
@@ -285,6 +358,7 @@ pub fn run_search(
                         ok: false,
                         view: Some(view),
                         decision: None,
+                        training_decision: None,
                         reconcile: Some(reconciled),
                         error: Some(format!(
                             "搜索失败: {e}；手写兜底也失败: {e2}"
@@ -295,15 +369,39 @@ pub fn run_search(
         }
     };
 
+    // ⑤ 训练阶段建议（hlpatch 无 trainings 时才补搜，省算力）
+    let training_decision = if need_training_search && game.stage != RamenStage::Train {
+        let t0 = Instant::now();
+        let saved_stage = game.stage;
+        game.stage = RamenStage::Train;
+        let mut td = run_mcts_search(&mut game, config.search_n)
+            .or_else(|e| {
+                log::warn!("训练阶段 MCTS 失败，用手写策略: {e}");
+                run_handwritten_fallback(&mut game)
+            })
+            .ok();
+        game.stage = saved_stage;
+        if let Some(d) = td.as_mut() {
+            d.elapsed_ms = t0.elapsed().as_millis() as u64;
+        }
+        td
+    } else {
+        None
+    };
+
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     log::info!(
-        "搜索完成: action={}, score={:.0}, n={}, elapsed={}ms, source={}",
+        "搜索完成: action={}, score={:.0}, n={}, elapsed={}ms, source={}, training_advice={}",
         decision.action_display,
         decision.score,
         config.search_n,
         elapsed_ms,
-        decision.source
+        decision.source,
+        training_decision
+            .as_ref()
+            .map(|d| d.action_display.clone())
+            .unwrap_or_else(|| "skip(trainings_present)".into())
     );
 
     SearchResponse {
@@ -319,6 +417,7 @@ pub fn run_search(
             elapsed_ms,
             source: decision.source,
         }),
+        training_decision,
         reconcile: Some(reconciled),
         error: None,
     }
@@ -497,7 +596,7 @@ mod jni_exports {
         log::info!("nativeInit: data_dir={dir}");
 
         let result = if INITIALIZED.get().is_some() {
-            r#""{"ok":true,"already_initialized":true}"#.to_string()
+            r#"{"ok":true,"already_initialized":true}"#.to_string()
         } else {
             // 上游 init_global() 通过相对路径 "gamedata/xxx.json" 加载数据，
             // 需要先 set_current_dir 到 data_dir（Java 侧已把 assets 复制到这里）
@@ -540,6 +639,7 @@ mod jni_exports {
                     ok: false,
                     view: None,
                     decision: None,
+                    training_decision: None,
                     reconcile: None,
                     error: Some(format!("config 解析失败: {e}")),
                 };
@@ -555,6 +655,7 @@ mod jni_exports {
             ok: false,
             view: None,
             decision: None,
+            training_decision: None,
             reconcile: None,
             error: Some("panic during search".into()),
         })
@@ -571,12 +672,14 @@ mod jni_exports {
         _class: JClass,
     ) -> jstring {
         let v = serde_json::json!({
-            "version": "0.3.0",
+            "version": "0.3.1",
             "upstream": "xulai1001/umaai-rs",
             "upstream_commit": "7cef1fa",
             "search": "ramen_mcts_trainer",
             "stages": ["train", "ramen_select"],
             "reconcile": true,
+            "replay_reconnect": true,
+            "training_decision": "computed_only_when_hlpatch_trainings_empty",
             "turn_convention": "hlpatch UI 1-based -> AI internal 0-based (turn-1)",
             "candidate_scores": "last_breakdown_reuse"
         })
@@ -610,9 +713,8 @@ mod tests {
         assert_eq!(parse_breakdown_means(None, 3), vec![0.0, 0.0, 0.0]);
     }
 
-    #[test]
-    fn test_run_search_with_real_sample() {
-        // 初始化 gamedata（需要 gamedata/ 目录在工作目录下）
+    /// gamedata 工作目录初始化（测试公共前置）
+    fn setup_gamedata() -> bool {
         let workspace_root = std::env::current_dir()
             .ok()
             .and_then(|d| d.parent().map(|p| p.to_path_buf()))
@@ -621,15 +723,84 @@ mod tests {
         let gamedata_dir = workspace_root.join("gamedata");
         if !gamedata_dir.exists() {
             eprintln!("跳过测试：gamedata 目录不存在");
-            return;
+            return false;
         }
 
         // 上游 init_global() 用相对路径 "gamedata/xxx.json" 加载，
         // 需要先 set_current_dir 到 workspace_root
         let _ = std::env::set_current_dir(&workspace_root);
         let _ = init_global();
+        true
+    }
+
+    fn test_config(search_n: usize) -> SearchConfigInput {
+        SearchConfigInput {
+            uma_id: 102601,
+            cards: [302424, 302894, 303044, 302924, 303024, 303054],
+            blue_count: [15, 3, 0, 0, 0],
+            extra_count: [0, 30, 0, 0, 30, 30],
+            search_n,
+        }
+    }
+
+    /// ★ v0.3.1 断线重连核心：重放后回合到位、训练分布已重建。
+    /// 旧版跳回合注入时 distribution 停留在 newgame 初始值（空），
+    /// 这正是"没有训练数据就算不了"的根因。
+    #[test]
+    fn test_fast_forward_rebuilds_distribution() {
+        if !setup_gamedata() {
+            return;
+        }
+
+        let inherit = InheritInfo {
+            blue_count: [15, 3, 0, 0, 0],
+            extra_count: [0, 30, 0, 0, 30, 30],
+            ..Default::default()
+        };
+        let mut game =
+            RamenGame::newgame(102601, &[302424, 302894, 303044, 302924, 303024, 303054], inherit)
+                .expect("newgame 失败");
+
+        // 重放前：分布为空
+        let heads_before: usize = game
+            .distribution()
+            .iter()
+            .map(|d| d.iter().filter(|&&p| p >= 0).count())
+            .sum();
+
+        let steps = fast_forward(&mut game, 31);
+
+        assert!(steps > 0, "应至少重放一个阶段");
+        assert_eq!(game.turn(), 31, "重放后应到达目标回合");
+
+        let heads_after: usize = game
+            .distribution()
+            .iter()
+            .map(|d| d.iter().filter(|&&p| p >= 0).count())
+            .sum();
+        assert!(heads_after > 0, "重放后训练分布应已重建（重放前={heads_before}）");
+
+        // 固定种子：重放可复现
+        let mut game2 =
+            RamenGame::newgame(102601, &[302424, 302894, 303044, 302924, 303024, 303054], inherit)
+                .expect("newgame 失败");
+        let steps2 = fast_forward(&mut game2, 31);
+        assert_eq!(steps, steps2, "固定种子下重放阶段数应一致");
+        assert_eq!(
+            game.uma().five_status, game2.uma().five_status,
+            "固定种子下重放结果应一致"
+        );
+    }
+
+    #[test]
+    fn test_run_search_with_real_sample() {
+        if !setup_gamedata() {
+            return;
+        }
 
         // hlpatch 直读回合样本：turn=31（UI 第31回合）→ AI 内部 30
+        // 注意：没有 trainings / ramen —— 正是"非行动画面"的真实形态，
+        // v0.3.1 起这种输入也应给出完整决策 + 训练建议
         let json = r#"{
             "chara": {
                 "speed": 1200, "stamina": 301, "power": 437, "guts": 362, "wiz": 280,
@@ -639,15 +810,7 @@ mod tests {
             "turn": 31
         }"#;
 
-        let config = SearchConfigInput {
-            uma_id: 102601,
-            cards: [302424, 302894, 303044, 302924, 303024, 303054],
-            blue_count: [15, 3, 0, 0, 0],
-            extra_count: [0, 30, 0, 0, 30, 30],
-            search_n: 8, // 测试用小搜索次数
-        };
-
-        let response = run_search(json, &config);
+        let response = run_search(json, &test_config(8));
 
         // 直读回合无估算 warning
         let reconciled = response.reconcile.as_ref().unwrap();
@@ -661,8 +824,46 @@ mod tests {
             let decision = response.decision.as_ref().unwrap();
             assert!(!decision.candidate_displays.is_empty());
             eprintln!("搜索成功: {}", decision.action_display);
+
+            // ★ v0.3.1: hlpatch 没发 trainings → 必须给出训练阶段建议
+            let td = response.training_decision.as_ref().expect("无 trainings 时应有训练阶段建议");
+            assert!(!td.action_display.is_empty());
+            eprintln!(
+                "训练建议: {} (n={} elapsed={}ms source={})",
+                td.action_display, td.search_n, td.elapsed_ms, td.source
+            );
         } else {
             eprintln!("搜索失败（预期，gamedata 可能不完整）: {:?}", response.error);
+        }
+    }
+
+    /// trainings 非空（行动画面）时跳过训练补搜，省算力
+    #[test]
+    fn test_training_search_skipped_when_trainings_present() {
+        if !setup_gamedata() {
+            return;
+        }
+
+        let json = r#"{
+            "chara": {
+                "speed": 1200, "stamina": 301, "power": 437, "guts": 362, "wiz": 280,
+                "vital": 60, "max_vital": 108, "motivation": 5,
+                "skill_point": 1492, "scenario_id": 14
+            },
+            "turn": 31,
+            "trainings": [
+                {"name": "Speed", "command_id": 101, "is_enable": 1, "failure_rate": 0,
+                 "heads": 3, "shining": 2, "partner_ids": [1, 2, 3], "partners": [],
+                 "gains": {"Speed": 46, "Power": 14, "SkillPt": 27, "HP": -25}}
+            ]
+        }"#;
+
+        let response = run_search(json, &test_config(8));
+        if response.ok {
+            assert!(
+                response.training_decision.is_none(),
+                "trainings 非空时不应补搜训练建议（省算力）"
+            );
         }
     }
 }
