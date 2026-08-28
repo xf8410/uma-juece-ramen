@@ -26,17 +26,28 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 
 /**
- * 拉面杯浮窗服务（v0.2.0+）。
+ * 拉面杯浮窗服务（v0.3.0+）。
  *
  * 通信架构：
  * - hlpatch so 推送 JSON → HttpDataService(:18766) 或轮询(:18765/summary)
  * - JSON 透传给 UmaNativeBridge.search() → Rust reconcile + MCTS 搜索
  * - 返回结构化 JSON（view + decision + reconcile）→ 渲染浮窗
  *
+ * 显示内容（对齐 PC 黑板，EtherealAO 版）：
+ * - 主建议 + 搜索规模（建议：吃面/函馆-耐（mean 66972 · 4096次/12.7s））
+ * - 候选差值（决策理由：#0 不吃面 -999 ｜ #2 吃面/东京-智 -731）
+ * - 训练兜底建议 + 训练明细行（速: 速46 力14 27pt 体力-25 失败10% 头3光2）
+ *
+ * 回合口径：
+ * - hlpatch 的 turn 与游戏 UI「第N回合」一致（1-based），直读时标注「直读」
+ * - AI（umaai-rs）内部回合从 0 开始，浮窗同时显示 AI 内部值便于核对
+ * - 旧版 hlpatch 无 turn 字段时回退 month/half 显示，Rust 侧再推导
+ *
  * hlpatch v3.27.22 JSON 格式：
  * - chara 对象（speed/stamina/power/guts/wiz/vital/max_vital/motivation/skill_point/scenario_id）
- * - month(1-12) + half(1-2)，无 turn 字段（Rust 侧 reconcile 推导）
+ * - month(1-12) + half(1-2)，v3.27.17+ 补发 turn
  * - 可选 ramen 对象（sozai/feeling/acquisition_gauges/checkpoint_pt）
+ * - 顶层 trainings（五项训练收益/失败率/人头/发光）
  */
 public final class FloatingWindowService extends Service implements HttpDataService.OnDataListener {
     private static final String TAG = "RamenFloat";
@@ -144,14 +155,18 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     }
 
     private void renderBasicState(JSONObject s, JSONObject chara, String source) {
-        // 回合显示：优先用 Rust 返回的 view.turn，否则从 month/half 显示
-        int turn = s.optInt("turn", -1);
+        // 回合显示：
+        // - hlpatch 直读 turn（游戏 UI 第N回合，1-based）→ 标「直读」并附 AI 内部值（0-based）
+        // - 旧版 hlpatch 无 turn → 显示 month/half，Rust 侧推导
+        int turn = s.has("turn") ? s.optInt("turn", -1) : -1;
         int month = s.optInt("month", -1);
         int half = s.optInt("half", -1);
 
         String turnText;
         if (turn > 0) {
-            turnText = "第" + turn + "回合";
+            turnText = "第" + turn + "回合 直读(AI:" + (turn - 1) + ")";
+        } else if (turn == 0) {
+            turnText = "第1回合 直读(AI:0)";
         } else if (month > 0 && half > 0) {
             turnText = month + "月" + (half == 1 ? "前" : "后");
         } else {
@@ -198,8 +213,10 @@ public final class FloatingWindowService extends Service implements HttpDataServ
             " 干劲" + mot
         );
 
-        // 训练数据（如果有）
-        trainingsView.setText(renderTrainings(s.optJSONArray("trainings")));
+        // 训练数据（hlpatch /summary 顶层 trainings）
+        JSONArray trainings = s.optJSONArray("trainings");
+        String detail = RamenBoardText.trainingLines(trainings);
+        trainingsView.setText(detail.isEmpty() ? "训练数据：无" : detail);
 
         // 来源 + AI 状态
         String aiStatus = UmaNativeBridge.isAvailable() ? "AI就绪" : "安全兜底";
@@ -211,60 +228,56 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     }
 
     private void renderSearchResult(JSONObject s) {
-        // 安全兜底
-        String fallback = evaluator.recommend(s);
+        // 训练兜底（运行时收益评分，读 chara/stats + 顶层 trainings）
+        String training = evaluator.recommend(s);
 
         if (searchRunning) {
-            recommendView.setText(fallback + " · 模拟搜索中...");
+            recommendView.setText("模拟搜索中…\n训练兜底：" + training);
             return;
         }
 
-        if (lastSearchResult != null) {
-            // Rust 返回的结构化 JSON
-            boolean ok = lastSearchResult.optBoolean("ok", false);
-            if (ok) {
-                JSONObject decision = lastSearchResult.optJSONObject("decision");
-                if (decision != null) {
-                    String action = decision.optString("action_display", "?");
-                    int searchN = decision.optInt("search_n", 0);
-                    long elapsed = decision.optLong("elapsed_ms", 0);
-                    String source = decision.optString("source", "mcts");
+        JSONObject result = lastSearchResult;
+        if (result != null && result.optBoolean("ok", false)) {
+            JSONObject decision = result.optJSONObject("decision");
+            if (decision != null) {
+                StringBuilder b = new StringBuilder(RamenBoardText.decisionLine(decision));
 
-                    // 显示校正警告（如果有）
-                    JSONObject reconcile = lastSearchResult.optJSONObject("reconcile");
-                    String warningText = "";
-                    if (reconcile != null) {
-                        JSONArray warnings = reconcile.optJSONArray("warnings");
-                        if (warnings != null && warnings.length() > 0) {
-                            warningText = " ⚠" + warnings.length() + "警告";
-                        }
-                    }
+                // 候选差值（PC 黑板「决策理由」：其余候选相对选中的 mean 差）
+                String deltas = RamenBoardText.candidateDeltas(decision, 3);
+                if (!deltas.isEmpty()) b.append('\n').append(deltas);
 
-                    recommendView.setText(
-                        "模拟建议：" + action +
-                        (searchN > 0 ? "（" + searchN + "次/" + elapsed + "ms）" : "") +
-                        warningText
-                    );
-                    return;
+                // 训练建议与拉面建议并列显示（不再被搜索结果覆盖）
+                b.append("\n训练兜底：").append(training);
+
+                // 校正警告数量
+                JSONObject reconcile = result.optJSONObject("reconcile");
+                JSONArray warnings = reconcile == null ? null : reconcile.optJSONArray("warnings");
+                if (warnings != null && warnings.length() > 0) {
+                    b.append(" ⚠").append(warnings.length());
                 }
-            } else {
-                String error = lastSearchResult.optString("error", "");
-                if (!error.isEmpty()) {
-                    recommendView.setText("搜索失败：" + error + "\n兜底：" + fallback);
-                    return;
-                }
+
+                recommendView.setText(b.toString());
+                return;
+            }
+        }
+
+        if (result != null && !result.optBoolean("ok", false)) {
+            String error = result.optString("error", "");
+            if (!error.isEmpty()) {
+                recommendView.setText("搜索失败：" + error + "\n兜底：" + training);
+                return;
             }
         }
 
         // 无搜索结果，用兜底
-        recommendView.setText(fallback);
+        recommendView.setText(training);
     }
 
     // ── 搜索触发 ──────────────────────────────────────────────────────
 
     /**
-     * 搜索去重键：用 month+half+vital+motivation+sozai 组合。
-     * 不再用 turn（hlpatch 不发）和 sozai 字符串（格式不稳定）。
+     * 搜索去重键：直读 turn（若有）+ month/half + vital + motivation + sozai。
+     * 不再依赖 sozai 字符串（格式不稳定）以外的推断值。
      */
     static String searchKey(JSONObject s) {
         JSONObject chara = s.optJSONObject("chara");
@@ -272,7 +285,8 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         JSONObject c = chara != null ? chara : stats;
         JSONObject r = s.optJSONObject("ramen");
 
-        return s.optInt("month") + ":" + s.optInt("half") + ":" +
+        int turn = s.has("turn") ? s.optInt("turn", -1) : -1;
+        return turn + ":" + s.optInt("month") + ":" + s.optInt("half") + ":" +
                (c == null ? "" : c.optInt("vital") + ":" + c.optString("motivation")) + ":" +
                (r == null ? "" : r.optInt("checkpoint_pt") + ":" + r.optString("sozai"));
     }
@@ -309,54 +323,6 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         }, "NativeSearch");
         searchThread.setDaemon(true);
         searchThread.start();
-    }
-
-    // ── 训练数据渲染 ──────────────────────────────────────────────────
-
-    private String renderTrainings(JSONArray a) {
-        if (a == null) return "训练数据：无";
-        StringBuilder o = new StringBuilder();
-        for (int i = 0; i < a.length(); i++) {
-            JSONObject t = a.optJSONObject(i);
-            if (t == null) continue;
-            JSONObject g = t.optJSONObject("gains");
-            if (o.length() > 0) o.append("  |  ");
-            o.append(translate(t.optString("name", "?"))).append(':');
-            if (g != null) {
-                gain(o, "速", g.optInt("Speed"));
-                gain(o, "耐", g.optInt("Stamina"));
-                gain(o, "力", g.optInt("Power"));
-                gain(o, "根", g.optInt("Guts"));
-                gain(o, "智", g.optInt("Wiz"));
-                gain(o, "Pt", g.optInt("SkillPt"));
-                int hp = g.optInt("HP");
-                if (hp != 0) o.append(" HP").append(hp > 0 ? "+" : "").append(hp);
-            }
-            int f = t.optInt("failure_rate");
-            if (f > 0) o.append(" 失败").append(f).append('%');
-            int h = t.optInt("heads");
-            if (h > 0) o.append(" 头").append(h);
-        }
-        return o.toString();
-    }
-
-    private static void gain(StringBuilder o, String n, int v) {
-        if (v != 0) o.append(' ').append(n).append(v > 0 ? "+" : "").append(v);
-    }
-
-    private static String translate(String n) {
-        switch (n.toLowerCase()) {
-            case "speed": return "速";
-            case "stamina": return "耐";
-            case "power": return "力";
-            case "guts": return "根";
-            case "wisdom":
-            case "wiz": return "智";
-            case "rest": return "休息";
-            case "outgoing":
-            case "outing": return "外出";
-            default: return n;
-        }
     }
 
     // ── 浮窗 + 通信 ───────────────────────────────────────────────────
