@@ -6,10 +6,14 @@
 //! - `run_search`: 用上游 `RamenMctsTrainer` 搜索，输出 `DecisionInfo` + `GameView`
 //! - JNI exports: `nativeInit` / `nativeSearch` / `nativeVersion`
 //!
+//! 回合口径：
+//! - hlpatch `turn` = 游戏 UI「第N回合」（1-based）
+//! - umaai-rs 内部回合从 0 开始，`inject_state()` 做 `turn - 1` 转换
+//!
 //! 与旧版的区别：
-//! - 不再自研 `run_flat_search`，改用上游 `FlatSearch::<RamenGame>`
-//! - 不再自研 `SearchResult`，改用上游 `DecisionInfo` 标准格式
-//! - 新增 `reconcile_state` 校正层，处理 hlpatch 数据质量问题
+//! - 候选评分直接复用 `select_action` 内部那次搜索的 `last_breakdown()`，
+//!   不再二次搜索（旧行为把 4096 次模拟翻倍，且两次随机数不同、
+//!   展示的 mean 与实际选中动作不一致）
 //! - 返回结构化 JSON（view + decision + warnings + confidence）
 
 pub mod ramen_strategy;
@@ -95,6 +99,9 @@ pub struct DecisionOutput {
 // ── 状态注入 ────────────────────────────────────────────────────────
 
 /// 把校正后的状态注入 RamenGame。
+///
+/// 回合转换：`state.turn` 是 hlpatch 直读的游戏 UI 回合（1-based），
+/// 上游模拟器内部回合从 0 开始，这里做 `-1`。
 ///
 /// 注意：这是"部分重建"，不是完美快照。以下字段无法从 hlpatch 数据恢复：
 /// - friendship（友情等级）：估算为 80（接近满级）
@@ -320,6 +327,11 @@ pub fn run_search(
 /// 用上游 RamenMctsTrainer 搜索。
 ///
 /// 阶段门控：只搜 Train + RamenSelect（手机性能有限，省略 SpecialSelect 等）。
+///
+/// 候选评分来自 `trainer.last_breakdown()`——那是 `select_action` 内部
+/// 那次搜索缓存的统计（`#i 动作 n=N mean=M sd=S pt=P | ...`）。
+/// 旧版在这里又跑了一遍 `trainer.search.search()`：4096 次模拟直接翻倍，
+/// 且两次随机流不同，展示的 mean 和实际选中动作对不上。
 fn run_mcts_search(game: &mut RamenGame, search_n: usize) -> Result<DecisionOutput> {
     let config = SearchConfig::default().with_search_n(search_n);
     let trainer = RamenMctsTrainer::new(config).with_stages(RamenSearchStages {
@@ -332,7 +344,7 @@ fn run_mcts_search(game: &mut RamenGame, search_n: usize) -> Result<DecisionOutp
 
     let mut rng = StdRng::from_os_rng();
 
-    // 获取候选动作列表
+    // 获取候选动作列表（RamenSelect 用合并候选：吃面×targets + 不吃面）
     let actions: Vec<_> = if game.stage == RamenStage::RamenSelect {
         game.list_combined_ramen_select_actions()
     } else {
@@ -346,23 +358,15 @@ fn run_mcts_search(game: &mut RamenGame, search_n: usize) -> Result<DecisionOutp
     // 执行搜索
     let action_index = trainer.select_action(game, &actions, &mut rng)?;
 
-    // 收集所有候选的评分（从 trainer 的 last_breakdown 获取）
+    // 收集所有候选的展示文本
     let candidate_displays: Vec<String> = actions
         .iter()
         .map(|a| format!("{a}"))
         .collect();
 
-    // 评分信息从搜索输出获取
-    let search_output = trainer.search.search(game, &actions, &mut rng).ok();
-    let candidate_scores: Vec<f64> = if let Some(ref output) = search_output {
-        output
-            .action_results
-            .iter()
-            .map(|(r, _)| r.mean())
-            .collect()
-    } else {
-        vec![0.0; actions.len()]
-    };
+    // 候选评分：复用 select_action 内部搜索的 breakdown，不再二次搜索
+    let candidate_scores =
+        parse_breakdown_means(trainer.last_breakdown().as_deref(), actions.len());
 
     let score = candidate_scores.get(action_index).copied().unwrap_or(0.0);
     let action_display = candidate_displays
@@ -380,6 +384,40 @@ fn run_mcts_search(game: &mut RamenGame, search_n: usize) -> Result<DecisionOutp
         elapsed_ms: 0, // 由上层填充
         source: "mcts".into(),
     })
+}
+
+/// 从 `RamenMctsTrainer::last_breakdown()` 文本解析每个候选的 mean 分。
+///
+/// 行格式（" | " 分隔）：`#0 不吃面 n=4096 mean=65973 sd=1234 pt=5678`
+/// 解析失败的候选保持 0.0（上层展示时按"无评分"处理）。
+fn parse_breakdown_means(breakdown: Option<&str>, expected_len: usize) -> Vec<f64> {
+    let mut scores = vec![0.0; expected_len];
+    let Some(text) = breakdown else {
+        return scores;
+    };
+    for part in text.split(" | ") {
+        let part = part.trim();
+        let Some(rest) = part.strip_prefix('#') else {
+            continue;
+        };
+        let Some((idx_str, tail)) = rest.split_once(' ') else {
+            continue;
+        };
+        let Ok(idx) = idx_str.trim().parse::<usize>() else {
+            continue;
+        };
+        if idx >= expected_len {
+            continue;
+        }
+        for seg in tail.split_whitespace() {
+            if let Some(v) = seg.strip_prefix("mean=") {
+                if let Ok(m) = v.parse::<f64>() {
+                    scores[idx] = m;
+                }
+            }
+        }
+    }
+    scores
 }
 
 /// 手写策略兜底（搜索失败时使用）。
@@ -403,7 +441,7 @@ fn run_handwritten_fallback(game: &mut RamenGame) -> Result<DecisionOutput> {
         .iter()
         .map(|a| format!("{a}"))
         .collect();
-    let candidate_scores = vec![0.0; actions.len()];
+    let candidate_scores = parse_breakdown_means(trainer.last_breakdown().as_deref(), actions.len());
 
     Ok(DecisionOutput {
         action_index,
@@ -411,7 +449,7 @@ fn run_handwritten_fallback(game: &mut RamenGame) -> Result<DecisionOutput> {
             .get(action_index)
             .cloned()
             .unwrap_or_default(),
-        score: 0.0,
+        score: candidate_scores.get(action_index).copied().unwrap_or(0.0),
         candidate_displays,
         candidate_scores,
         search_n: 0,
@@ -451,7 +489,6 @@ mod jni_exports {
         let dir = string_from_jstring(&mut env, data_dir);
 
         // 初始化 Android logger，把上游 log::info!/warn!/error! 转发到 Logcat
-        // android_logger 0.14: 用 with_tag + with_max_level，模块过滤靠 log level
         android_logger::init_once(
             android_logger::Config::default()
                 .with_tag("uma_jni")
@@ -460,7 +497,7 @@ mod jni_exports {
         log::info!("nativeInit: data_dir={dir}");
 
         let result = if INITIALIZED.get().is_some() {
-            r#"{"ok":true,"already_initialized":true}"#.to_string()
+            r#""{"ok":true,"already_initialized":true}"#.to_string()
         } else {
             // 上游 init_global() 通过相对路径 "gamedata/xxx.json" 加载数据，
             // 需要先 set_current_dir 到 data_dir（Java 侧已把 assets 复制到这里）
@@ -534,12 +571,14 @@ mod jni_exports {
         _class: JClass,
     ) -> jstring {
         let v = serde_json::json!({
-            "version": "0.2.0",
+            "version": "0.3.0",
             "upstream": "xulai1001/umaai-rs",
             "upstream_commit": "7cef1fa",
             "search": "ramen_mcts_trainer",
             "stages": ["train", "ramen_select"],
-            "reconcile": true
+            "reconcile": true,
+            "turn_convention": "hlpatch UI 1-based -> AI internal 0-based (turn-1)",
+            "candidate_scores": "last_breakdown_reuse"
         })
         .to_string();
         jstring_from_str(&mut env, &v)
@@ -551,6 +590,25 @@ mod jni_exports {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// last_breakdown 文本 → 候选 mean 数组（PC 黑板「决策理由」数据源）
+    #[test]
+    fn test_parse_breakdown_means() {
+        let text = "#0 不吃面 n=4096 mean=65973 sd=3210 pt=5646 | #1 吃面/函馆-耐 n=4096 mean=66972 sd=2980 pt=6750 | #2 吃面/东京-智 n=4096 mean=66241 sd=3055 pt=6668";
+        let scores = parse_breakdown_means(Some(text), 4);
+        assert_eq!(scores.len(), 4);
+        assert!((scores[0] - 65973.0).abs() < 0.5, "scores[0]={}", scores[0]);
+        assert!((scores[1] - 66972.0).abs() < 0.5);
+        assert!((scores[2] - 66241.0).abs() < 0.5);
+        assert_eq!(scores[3], 0.0, "缺失候选保持 0.0");
+
+        // 候选数超出的行被忽略、非 # 开头的段被跳过
+        let messy = "garbage | #7 越界 mean=1.0";
+        let scores2 = parse_breakdown_means(Some(messy), 2);
+        assert_eq!(scores2, vec![0.0, 0.0]);
+
+        assert_eq!(parse_breakdown_means(None, 3), vec![0.0, 0.0, 0.0]);
+    }
 
     #[test]
     fn test_run_search_with_real_sample() {
@@ -571,13 +629,14 @@ mod tests {
         let _ = std::env::set_current_dir(&workspace_root);
         let _ = init_global();
 
+        // hlpatch 直读回合样本：turn=31（UI 第31回合）→ AI 内部 30
         let json = r#"{
             "chara": {
                 "speed": 1200, "stamina": 301, "power": 437, "guts": 362, "wiz": 280,
                 "vital": 60, "max_vital": 108, "motivation": 5,
                 "skill_point": 1492, "scenario_id": 14
             },
-            "month": 4, "half": 1
+            "turn": 31
         }"#;
 
         let config = SearchConfigInput {
@@ -590,10 +649,10 @@ mod tests {
 
         let response = run_search(json, &config);
 
-        // 即使没有 ramen 数据，也应该能校正出回合
-        assert!(response.reconcile.is_some());
+        // 直读回合无估算 warning
         let reconciled = response.reconcile.as_ref().unwrap();
         assert_eq!(reconciled.turn, 31);
+        assert_eq!(reconciled.turn_source, "direct");
 
         // 搜索可能成功也可能失败（取决于 gamedata 是否完整）
         if response.ok {
