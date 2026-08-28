@@ -6,14 +6,6 @@ import org.json.JSONObject;
 /**
  * PC 黑板风格的文本组装（对齐 EtherealAO 版决策理由/训练明细的可读格式）。
  *
- * 目标显示效果（拉面杯第69回合示例）：
- * <pre>
- * 建议：吃面/函馆-耐（mean 66972 · 4096次/12.7s）
- * #0 不吃面 -999 ｜ #2 吃面/东京-智 -731 ｜ #3 吃面/中山-速力智 -42
- * 速 速46 力14 27pt 体力-25 失败10% 头3光2
- * 耐 耐36 根12 19pt 体力-26 失败10% 头5
- * </pre>
- *
  * 数据来源：
  * - 决策/候选：Rust DecisionOutput（action_display + candidate_displays/candidate_scores）
  * - 训练明细：hlpatch /summary 顶层 trainings（name/gains/failure_rate/heads/shining）
@@ -93,7 +85,7 @@ public final class RamenBoardText {
     /**
      * SO 建议行（来自 hlpatch /summary 顶层 ai）。
      * 当 trainings 为空（v3.27.20+、或当前不在训练选择画面）时，SO 仍会算一个动作建议。
-     * 例：`SO建议：外出(488) ｜ 休息188 外出488`；in-turn 时 ai.train 有每项训练值则换行列出。
+     * 例：`SO建议：外出(487) ｜ 休息187`；in-turn 时 ai.train 有每项训练值则换行列出。
      */
     public static String soRecommendation(JSONObject summary) {
         JSONObject ai = summary == null ? null : summary.optJSONObject("ai");
@@ -101,14 +93,21 @@ public final class RamenBoardText {
         String best = ai.optString("best", "");
         if (best.isEmpty()) return "";
         double bestV = ai.optDouble("best_v", 0);
-        StringBuilder b = new StringBuilder("SO建议：").append(actionName(best));
+        String bestName = actionName(best);
+
+        StringBuilder b = new StringBuilder("SO建议：").append(bestName);
         if (bestV != 0) b.append('(').append((long) bestV).append(')');
 
+        // 对比项：只列出与 best 不同的（避免"外出(487) ｜ 外出487"重复）
         double rest = ai.optDouble("rest", 0);
         double outing = ai.optDouble("outgoing", 0);
-        if (rest != 0 || outing != 0) {
-            b.append(" ｜ 休息").append((long) rest).append(" 外出").append((long) outing);
-        }
+        StringBuilder compare = new StringBuilder();
+        boolean isRest = "休息".equals(bestName);
+        boolean isOuting = "外出".equals(bestName);
+        if (!isRest && rest != 0) compare.append(" 休息").append((long) rest);
+        if (!isOuting && outing != 0) compare.append(" 外出").append((long) outing);
+        if (compare.length() > 0) b.append(" ｜").append(compare);
+
         String trainLines = aiTrainLines(ai.optJSONObject("train"));
         if (!trainLines.isEmpty()) b.append('\n').append(trainLines);
         return b.toString();
