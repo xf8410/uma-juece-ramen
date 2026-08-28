@@ -17,6 +17,8 @@ import org.json.JSONObject;
  * 数据来源：
  * - 决策/候选：Rust DecisionOutput（action_display + candidate_displays/candidate_scores）
  * - 训练明细：hlpatch /summary 顶层 trainings（name/gains/failure_rate/heads/shining）
+ * - SO 建议：hlpatch /summary 顶层 ai（best/best_v/rest/outgoing/train）—— 当 trainings
+ *   为空（hlpatch v3.27.20+ / 非训练选择画面）时，用 SO 自己算出的建议兜底
  */
 public final class RamenBoardText {
     private RamenBoardText() {}
@@ -89,6 +91,49 @@ public final class RamenBoardText {
     }
 
     /**
+     * SO 建议行（来自 hlpatch /summary 顶层 ai）。
+     * 当 trainings 为空（v3.27.20+、或当前不在训练选择画面）时，SO 仍会算一个动作建议。
+     * 例：`SO建议：外出(488) ｜ 休息188 外出488`；in-turn 时 ai.train 有每项训练值则换行列出。
+     */
+    public static String soRecommendation(JSONObject summary) {
+        JSONObject ai = summary == null ? null : summary.optJSONObject("ai");
+        if (ai == null) return "";
+        String best = ai.optString("best", "");
+        if (best.isEmpty()) return "";
+        double bestV = ai.optDouble("best_v", 0);
+        StringBuilder b = new StringBuilder("SO建议：").append(actionName(best));
+        if (bestV != 0) b.append('(').append((long) bestV).append(')');
+
+        double rest = ai.optDouble("rest", 0);
+        double outing = ai.optDouble("outgoing", 0);
+        if (rest != 0 || outing != 0) {
+            b.append(" ｜ 休息").append((long) rest).append(" 外出").append((long) outing);
+        }
+        String trainLines = aiTrainLines(ai.optJSONObject("train"));
+        if (!trainLines.isEmpty()) b.append('\n').append(trainLines);
+        return b.toString();
+    }
+
+    /**
+     * ai.train 对象 → 每项训练值行。
+     * 返回 `训练：速300 耐200 力180 根120 智260`；为空返回空串。
+     */
+    public static String aiTrainLines(JSONObject train) {
+        if (train == null || train.length() == 0) return "";
+        StringBuilder b = new StringBuilder("训练：");
+        java.util.Iterator<String> keys = train.keys();
+        boolean first = true;
+        while (keys.hasNext()) {
+            String k = keys.next();
+            long v = (long) train.optDouble(k, 0);
+            if (!first) b.append(' ');
+            b.append(actionName(k)).append(v);
+            first = false;
+        }
+        return b.toString();
+    }
+
+    /**
      * 训练明细行（PC 黑板「训练:」节）：每个可用训练一行。
      * `速 速46 力14 27pt 体力-25 失败10% 头3光2`
      */
@@ -141,6 +186,26 @@ public final class RamenBoardText {
             case "wiz":
             case "wisdom": return "智";
             default: return "";
+        }
+    }
+
+    /** 动作名（SO/Rust）→ 中文；未知原样返回 */
+    static String actionName(String name) {
+        if (name == null) return "?";
+        switch (name.toLowerCase()) {
+            case "speed": case "速度": return "速";
+            case "stamina": case "耐力": return "耐";
+            case "power": case "力量": return "力";
+            case "guts": case "根性": return "根";
+            case "wisdom":
+            case "wiz":
+            case "智力": return "智";
+            case "rest": case "休息": return "休息";
+            case "outgoing":
+            case "普通出行":
+            case "外出": return "外出";
+            case "race": case "比赛": return "比赛";
+            default: return translate(name);
         }
     }
 
