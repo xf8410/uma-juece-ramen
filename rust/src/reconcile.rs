@@ -1,7 +1,7 @@
 //! 状态校正层（reconcile_state）
 //!
 //! hlpatch 推送的 /summary JSON 可能存在以下问题：
-//! - 缺少 turn 字段（只有 month + half），需要推导
+//! - 缺少 turn 字段（旧版 hlpatch 只有 month + half），需要推导
 //! - acquisition_gauges 是对象数组 [{feeling_id, remaining}]，不是整数数组
 //! - sozai 总和可能超过 FEELING_LIMIT(10)
 //! - 五维值可能超过剧本上限
@@ -9,6 +9,15 @@
 //!
 //! 本模块负责把"脏数据"清洗为模拟器可接受的状态，并记录所有校正动作。
 //! 核心原则：以游戏规则为准，数据脏了按规则钳制，而不是按数据走。
+//!
+//! # 回合口径（重要）
+//!
+//! - hlpatch 的 `turn` 与游戏 UI「第N回合」一致（1-based，第1回合=1）。
+//!   hlpatch v3.27.17+ 对拉面杯直接发 turn（raw_total_turn_num 校正），
+//!   本层直读，置信度 High，不再做年份估算。
+//! - 上游模拟器 umaai-rs 的内部回合从 0 开始（0..=77），
+//!   `inject_state()` 负责 `turn - 1` 转换，本层保持 1-based 口径。
+//! - hlpatch 若发 `turn: 0`，按「第1回合」处理（内部回合 0，两种口径一致）。
 
 use serde::{Deserialize, Serialize};
 
@@ -23,9 +32,10 @@ use umasim::game::ramen::rules::{FEELING_LIMIT, GAUGE_LIMIT};
 pub struct HlpatchSummary {
     #[serde(default)]
     pub version: String,
-    /// hlpatch v3.27.22 不发 turn 字段（Ramen 场景被隔离）
+    /// hlpatch 直读回合（1-based，与游戏 UI「第N回合」一致）。
+    /// Option 用于区分「字段缺失」和「字段=0」：缺失才走 month/half 推导。
     #[serde(default)]
-    pub turn: i32,
+    pub turn: Option<i32>,
     #[serde(default)]
     pub year: i32,
     #[serde(default)]
@@ -183,7 +193,7 @@ impl ReconciledState {
 /// # 校正步骤
 ///
 /// 1. 场景校验：必须是 Ramen
-/// 2. 回合推导：优先用 turn 字段，否则从 month+half+stats 推导
+/// 2. 回合推导：优先用 turn 字段（1-based 直读），否则从 month+half+stats 推导
 /// 3. 五维校验：clamp 到 [0, 剧本上限]
 /// 4. 体力校验：clamp 到 [0, max_vital]
 /// 5. sozai 校验：每项 [0, FEELING_LIMIT]，总和 ≤ FEELING_LIMIT
@@ -289,9 +299,15 @@ fn derive_turn(
     stats: &HlpatchStats,
     warnings: &mut Vec<String>,
 ) -> Result<(i32, String, TurnConfidence), String> {
-    // 优先用 turn 字段
-    if raw.turn > 0 && raw.turn <= 78 {
-        return Ok((raw.turn, "direct".into(), TurnConfidence::Direct));
+    // 优先用 turn 字段（hlpatch 直读，1-based，与游戏 UI「第N回合」一致）。
+    // AI（umaai-rs）内部回合从 0 开始，inject_state() 做 -1 转换。
+    if let Some(t) = raw.turn {
+        if (0..=78).contains(&t) {
+            // turn=0 视为第1回合（内部回合 0，两种口径一致）
+            let turn = if t == 0 { 1 } else { t };
+            return Ok((turn, "direct".into(), TurnConfidence::Direct));
+        }
+        warnings.push(format!("turn={t} 越界(0-78)，回退 month/half 推导"));
     }
 
     // 从 year + month + half 推导
@@ -321,7 +337,8 @@ fn derive_turn(
     // 完全无法确定
     Err(format!(
         "无法确定回合：turn={}, year={}, month={}, half={}",
-        raw.turn, raw.year, raw.month, raw.half
+        raw.turn.map(|t| t.to_string()).unwrap_or_else(|| "缺失".into()),
+        raw.year, raw.month, raw.half
     ))
 }
 
@@ -672,6 +689,54 @@ mod tests {
         assert_eq!(state.stats.speed, 1200);
         assert_eq!(state.stats.motivation, 5);
         assert!(!state.ramen.has_region_data);
+    }
+
+    /// hlpatch 直读 turn：1-based（与游戏 UI「第N回合」一致），无 warning、High 置信。
+    /// AI 内部回合由 inject_state 做 -1 转换（31 → 0-based 30）。
+    #[test]
+    fn test_direct_turn_from_hlpatch_is_ui_one_based() {
+        let json = r#"{
+            "scenario": "Ramen",
+            "turn": 31,
+            "chara": {
+                "speed": 1200, "stamina": 301, "power": 437, "guts": 362, "wiz": 280,
+                "vital": 60, "max_vital": 108, "motivation": 5,
+                "skill_point": 1492, "scenario_id": 14
+            },
+            "ramen": {
+                "checkpoint_pt": 450,
+                "special_feeling_num": 2,
+                "sozai": [3, 2, 1],
+                "acquisition_gauges": [3, 5, 1]
+            }
+        }"#;
+
+        let raw: HlpatchSummary = serde_json::from_str(json).unwrap();
+        let state = reconcile(&raw).unwrap();
+
+        assert_eq!(state.turn, 31, "直读第31回合（与游戏 UI 一致）");
+        assert_eq!(state.turn_source, "direct");
+        assert_eq!(state.confidence, Confidence::High, "直读且无校正 → High");
+        assert!(state.warnings.is_empty(), "直读回合不应产生估算 warning");
+    }
+
+    /// turn=0 按第1回合处理（内部回合 0，两种口径一致）；
+    /// turn 缺失时才走 month/half 推导。
+    #[test]
+    fn test_turn_zero_is_first_turn_and_missing_turn_falls_back() {
+        let zero: HlpatchSummary =
+            serde_json::from_str(r#"{"scenario":"Ramen","turn":0,"chara":{"scenario_id":14,"speed":100}}"#)
+                .unwrap();
+        let s0 = reconcile(&zero).unwrap();
+        assert_eq!(s0.turn, 1, "turn=0 → 第1回合");
+        assert_eq!(s0.turn_source, "direct");
+
+        let missing: HlpatchSummary =
+            serde_json::from_str(r#"{"scenario":"Ramen","chara":{"scenario_id":14,"speed":100}}"#)
+                .unwrap();
+        assert_eq!(missing.turn, None);
+        // 无 turn 且无 month/half → 无法确定
+        assert!(reconcile(&missing).is_err());
     }
 
     #[test]
