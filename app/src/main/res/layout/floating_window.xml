@@ -16,6 +16,14 @@
         android:textSize="10sp"
         android:textStyle="bold" />
 
+    <!-- 候选条形图（v0.3.2）：tv_turn 下方，Rust decision 喂图，
+         无候选/评分全 0 时 GONE 不占空间 -->
+    <com.umaai.assistant.service.BoardChartsView
+        android:id="@+id/chart_candidates"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:visibility="gone" />
+
     <TextView
         android:id="@+id/tv_recommend"
         android:layout_width="match_parent"
