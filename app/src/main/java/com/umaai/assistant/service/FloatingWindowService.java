@@ -26,7 +26,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 
 /**
- * 拉面杯浮窗服务（v0.3.1+）。
+ * 拉面杯浮窗服务（v0.3.2+）。
  *
  * 通信架构：
  * - hlpatch so 推送 JSON → HttpDataService(:18766) 或轮询(:18765/summary)
@@ -35,9 +35,14 @@ import java.net.URL;
  *
  * 显示内容（对齐 PC 黑板，EtherealAO 版）：
  * - 主建议 + 搜索规模（建议：吃面/函馆-耐（mean 66972 · 4096次/12.7s））
- * - 候选差值（决策理由：#0 不吃面 -999 ｜ #2 吃面/东京-智 -731）
+ * - 候选条形图（BoardChartsView：每候选一行 标签+比例条+相对差值，选中项绿色，
+ *   喂 decision 的 candidate_displays/candidate_scores/action_index）
  * - 训练建议（训练建议：速度训练（mean X · 64次/…ms），来自 Rust Train 阶段补搜）
  * - 训练明细行（速: 速46 力14 27pt 体力-25 失败10% 头3光2）
+ *
+ * v0.3.2 变更：
+ * - 候选差值从文字行（「#2 吃面/东京-智 -731」）改为 tv_turn 下方的候选条形图
+ *   （BoardChartsView，Canvas 绘制，无候选/评分全 0 时自动隐藏不占空间）
  *
  * v0.3.1 变更：
  * - 删除 Java 端「训练兜底」（TrainingEvaluator）：小黑板已有 hlpatch 真实训练
@@ -70,6 +75,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private WindowManager windowManager;
     private View panel;
     private TextView turnView, recommendView, statusView, ramenView, trainingsView, sourceView;
+    private BoardChartsView chartsView;
     private HttpDataService server;
     private volatile boolean polling, searchRunning;
     private volatile long lastDataAt;
@@ -146,6 +152,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
             statusView.setText("");
             ramenView.setText("");
             trainingsView.setText("");
+            chartsView.clear();
             return;
         }
 
@@ -238,6 +245,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private void renderSearchResult(JSONObject s) {
         if (searchRunning) {
             recommendView.setText("模拟搜索中…");
+            chartsView.clear();
             return;
         }
 
@@ -247,9 +255,13 @@ public final class FloatingWindowService extends Service implements HttpDataServ
             if (decision != null) {
                 StringBuilder b = new StringBuilder(RamenBoardText.decisionLine(decision));
 
-                // 候选差值（PC 黑板「决策理由」：其余候选相对选中的 mean 差）
-                String deltas = RamenBoardText.candidateDeltas(decision, 3);
-                if (!deltas.isEmpty()) b.append('\n').append(deltas);
+                // 候选差值（PC 黑板「决策理由」图形版）：喂 BoardChartsView 画横条，
+                // 标签走 RamenBoardText.translate 中文化，选中项绿色；
+                // v0.3.2 起不再输出文字版差值行（「#2 吃面/东京-智 -731」）
+                chartsView.setCandidates(
+                        decision.optJSONArray("candidate_displays"),
+                        decision.optJSONArray("candidate_scores"),
+                        decision.optInt("action_index", 0));
 
                 // 训练建议：hlpatch 没发 trainings（非行动画面）时由 Rust 在
                 // Train 阶段补搜返回；trainings 非空时不显示（黑板已有真实明细）
@@ -270,6 +282,8 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                 return;
             }
         }
+
+        chartsView.clear();
 
         if (result != null && !result.optBoolean("ok", false)) {
             String error = result.optString("error", "");
@@ -354,6 +368,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         p.x = 0;
         p.y = 120;
         turnView = panel.findViewById(R.id.tv_turn);
+        chartsView = panel.findViewById(R.id.chart_candidates);
         recommendView = panel.findViewById(R.id.tv_recommend);
         statusView = panel.findViewById(R.id.tv_status);
         ramenView = panel.findViewById(R.id.tv_ramen);
