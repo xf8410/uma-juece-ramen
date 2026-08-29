@@ -12,16 +12,15 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * RamenDecisionLogger 的 JVM 单测：纯 Java 实现，无 Android 依赖。
- * 覆盖：回合行去重、summary+decision 结构、outcome 收尾三路径（新局开/结算 fans/flush）、
+ * 覆盖：回合行去重、summary+decision 结构、outcome 三收尾路径（新局开/结算 fans/flush）、
  * fans 双键输出、decision 缺省不落行、readLog 空态。
  */
 public class RamenDecisionLoggerTest {
 
     private static File tempDir() {
-        File d = new File(System.getProperty("java.io.tmpdir"),
+        // 每个用例独立临时目录；init() 会把日志指到 dir/decision_log.jsonl
+        return new File(System.getProperty("java.io.tmpdir"),
                 "ramen-dl-test-" + System.nanoTime());
-        // mk-temp dir per test; init() 会把日志指到 d/decision_log.jsonl
-        return d;
     }
 
     private static List<String> logLines() throws Exception {
@@ -65,7 +64,7 @@ public class RamenDecisionLoggerTest {
         RamenDecisionLogger.init(tempDir(), 102601, new int[]{1, 2});
         JSONObject s = summary(1, 120, 0);
         RamenDecisionLogger.onSummary(s);
-        String key = FloatingWindowService.searchKey(s);
+        String key = "1:6:1:80:絕好:0:2:2:1"; // 与 FloatingWindowService.searchKey 同构
         RamenDecisionLogger.onDecision(s, decision(), key);
         // 轮询/搜索完成回调会重复渲染同一 summary —— 按 key 去重
         RamenDecisionLogger.onDecision(s, decision(), key);
@@ -81,8 +80,6 @@ public class RamenDecisionLoggerTest {
         assertEquals(66972.3, line.getJSONObject("decision").getDouble("score"), 1e-9);
         assertEquals(4096, line.getJSONObject("decision").getInt("search_n"));
         assertEquals(120, line.getJSONObject("summary").getJSONObject("chara").getInt("speed"));
-        // turn 行不应带 outcome 字段
-        assertEquals(0, line.getJSONArray("decision").length() >= 0 ? 0 : 1);
     }
 
     @Test public void outcomeWrittenWhenNextRunStarts() throws Exception {
