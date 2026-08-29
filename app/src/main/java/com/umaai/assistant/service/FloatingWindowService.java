@@ -26,12 +26,15 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 
 /**
- * 拉面杯浮窗服务（v0.3.2+）。
+ * 拉面杯浮窗服务（v0.3.3+）。
  *
  * 通信架构：
  * - hlpatch so 推送 JSON → HttpDataService(:18766) 或轮询(:18765/summary)
  * - JSON 透传给 UmaNativeBridge.search() → Rust reconcile + 重放重建 + MCTS 搜索
  * - 返回结构化 JSON（view + decision + training_decision + reconcile）→ 渲染浮窗
+ * - 决策日志：每回合 summary+decision 一行、局末 outcome 一行追加到
+ *   decision_log.jsonl（RamenDecisionLogger，GET /decision_log 可拉取），
+ *   目标是喂 rust/src/optimize.rs 用真实对局校准 strategy_optimized.json
  *
  * 显示内容（对齐 PC 黑板，EtherealAO 版）：
  * - 主建议 + 搜索规模（建议：吃面/函馆-耐（mean 66972 · 4096次/12.7s））
@@ -39,6 +42,9 @@ import java.net.URL;
  *   喂 decision 的 candidate_displays/candidate_scores/action_index）
  * - 训练建议（训练建议：速度训练（mean X · 64次/…ms），来自 Rust Train 阶段补搜）
  * - 训练明细行（速: 速46 力14 27pt 体力-25 失败10% 头3光2）
+ *
+ * v0.3.3 变更：
+ * - 接入 RamenDecisionLogger（数据收集）：日志写盘在后台单线程，不影响渲染
  *
  * v0.3.2 变更：
  * - 候选差值从文字行（「#2 吃面/东京-智 -731」）改为 tv_turn 下方的候选条形图
@@ -89,6 +95,8 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         createNotificationChannel();
         startForeground(NOTIFICATION_ID, notification("等待拉面杯数据"));
         createPanel();
+        // 决策日志：真实对局数据收集（outcome 的 config 回显本服务固定搜索配置）
+        RamenDecisionLogger.init(getFilesDir(), DEFAULT_UMA_ID, DEFAULT_CARDS);
         try {
             server = new HttpDataService(this);
             server.startServer();
@@ -112,6 +120,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         polling = false;
         if (server != null) server.stopServer();
         if (panel != null && windowManager != null) windowManager.removeView(panel);
+        RamenDecisionLogger.flush(); // 收尾当前 run（幂等）
         super.onDestroy();
     }
 
@@ -158,6 +167,9 @@ public final class FloatingWindowService extends Service implements HttpDataServ
 
         // 渲染基础状态
         renderBasicState(s, charaOrStats, source);
+
+        // 决策日志 run 生命周期（开局/中途入局/终盘收尾），先于搜索结果处理
+        RamenDecisionLogger.onSummary(s);
 
         // 渲染搜索结果（如果有）
         renderSearchResult(s);
@@ -262,6 +274,9 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                         decision.optJSONArray("candidate_displays"),
                         decision.optJSONArray("candidate_scores"),
                         decision.optInt("action_index", 0));
+
+                // 决策日志：本回合 summary+decision 一行（按 searchKey 去重，一回合一行）
+                RamenDecisionLogger.onDecision(s, decision, searchKey(s));
 
                 // 训练建议：hlpatch 没发 trainings（非行动画面）时由 Rust 在
                 // Train 阶段补搜返回；trainings 非空时不显示（黑板已有真实明细）

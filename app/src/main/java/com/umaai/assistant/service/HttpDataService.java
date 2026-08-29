@@ -38,7 +38,13 @@ public final class HttpDataService extends NanoHTTPD {
                 if (body != null && listener != null) listener.onDataReceived(body);
                 return json("{\"ok\":true}");
             }
-            return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Use POST /data or GET /status");
+            // 决策日志拉取：adb forward tcp:18766 tcp:18766 && curl http://127.0.0.1:18766/decision_log
+            if ("/decision_log".equals(session.getUri()) && session.getMethod() == Method.GET) {
+                String body = RamenDecisionLogger.readLog();
+                return newFixedLengthResponse(Response.Status.OK, "text/plain; charset=utf-8", body);
+            }
+            return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain",
+                    "Use POST /data, GET /status or GET /decision_log");
         } catch (Exception e) {
             return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", e.getMessage());
         }
