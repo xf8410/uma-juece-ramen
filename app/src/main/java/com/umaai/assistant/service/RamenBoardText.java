@@ -6,10 +6,12 @@ import org.json.JSONObject;
 /**
  * PC 黑板风格的文本组装（对齐 EtherealAO 版决策理由/训练明细的可读格式）。
  *
- * 目标显示效果（拉面杯第69回合示例）：
+ * 目标显示效果（竖排平铺，每个候选一行）：
  * <pre>
  * 建议：吃面/函馆-耐（mean 66972 · 4096次/12.7s）
- * #0 不吃面 -999 ｜ #2 吃面/东京-智 -731 ｜ #3 吃面/中山-速力智 -42
+ * #0 不吃面 -999
+ * #2 吃面/东京-智 -731
+ * #3 吃面/中山-速力智 -42
  * 速 速46 力14 27pt 体力-25 失败10% 头3光2
  * 耐 耐36 根12 19pt 体力-26 失败10% 头5
  * </pre>
@@ -52,8 +54,13 @@ public final class RamenBoardText {
     }
 
     /**
-     * 候选差值行（PC 黑板「决策理由」）：其余候选相对选中动作的 mean 差值。
-     * `#0 不吃面 -999 ｜ #2 吃面/东京-智 -731`；无有效评分（全 0）时返回空串。
+     * 候选差值（PC 黑板「决策理由」）：其余候选相对选中动作的 mean 差值。
+     * 每个候选独占一行（竖排平铺）：
+     * <pre>
+     * #0 不吃面 -999
+     * #2 吃面/东京-智 -731
+     * </pre>
+     * 无有效评分（全 0）时返回空串。
      */
     public static String candidateDeltas(JSONObject decision, int maxOthers) {
         if (decision == null || maxOthers <= 0) return "";
@@ -79,7 +86,7 @@ public final class RamenBoardText {
         for (int i = 0; i < len && shown < maxOthers; i++) {
             if (i == best) continue;
             double delta = scores.optDouble(i, 0.0) - bestScore;
-            if (b.length() > 0) b.append(" ｜ ");
+            if (b.length() > 0) b.append('\n');
             b.append('#').append(i).append(' ')
              .append(translate(names.optString(i, "?")))
              .append(' ').append(String.format("%+.0f", delta));
@@ -149,6 +156,11 @@ public final class RamenBoardText {
         if (action == null) return "?";
         return action.replace("普通出行", "外出")
                 .replace("友人出行", "友人外出")
+                // 隐藏风味替换代码：A=面 B=汤 C=料（hlpatch sozai 顺序：麺/スープ/トッピング）
+                // "(替换Bx1+Cx1)" → "(替换汤1+料1)"
+                .replace("Ax", "面")
+                .replace("Bx", "汤")
+                .replace("Cx", "料")
                 .replace("Speed训练", "速度训练")
                 .replace("Stamina训练", "耐力训练")
                 .replace("Power训练", "力量训练")
