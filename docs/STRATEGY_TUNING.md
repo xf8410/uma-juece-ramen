@@ -72,4 +72,48 @@ grep "均分" run-a.txt run-b.txt
 | `eat_ramen_base_score` | 50.0 | 吃面基础分 |
 | `friend_click_bonus` | 25.0 | 友人未点击时有友人的训练加分 |
 
-## 剩下的你自己想办法
+## 真实对局数据收集（decision_log.jsonl，v0.3.3+）
+
+APK 在手机上自动记录真实对局：**每回合一行 turn（hlpatch summary 原样 + Rust decision），
+局末一行 outcome（最终五维 + fans/fan_count + RMJ Pt + 回合）**，追加写
+`getFilesDir()/decision_log.jsonl`（超 4MB 轮转 `.1`，只留一代）。
+
+### 行格式
+
+```jsonc
+// turn 行（每回合最多一条，按 searchKey 去重）
+{"type":"turn","run":"r20260829_012233","ts":…,"turn":12,"key":"12:…",
+ "summary":{…hlpatch 推送 JSON 原样，含 chara/ramen/trainings…},
+ "decision":{…Rust DecisionOutput：action_index/action_display/score/
+             search_n/elapsed_ms/candidate_displays/candidate_scores…}}
+
+// outcome 行（每局恰好一条：下一局 turn<=1 出现 / 终盘 fans 签名 / 服务退出，先到先写）
+{"type":"outcome","run":"r…","ts":…,
+ "final":{"turn":77,"speed":…,"stamina":…,"power":…,"guts":…,"wiz":…,
+          "vital":…,"skill_point":…,"fans":…,"fan_count":…,"checkpoint_pt":…},
+ "config":{"uma_id":102601,"cards":[302424,302894,303044,302924,303024,303054]}}
+```
+
+### 从手机拉日志
+
+```bash
+adb forward tcp:18766 tcp:18766
+curl http://127.0.0.1:18766/decision_log > decision_log.jsonl
+```
+
+### 喂 optimize.rs 的路线（设计目标）
+
+- **回放校准**：turn 行的 `summary` 可原样喂 Rust reconcile 重放重建，
+  对照 `decision` 复现真实决策链 → 找出模拟器与真实局分歧的回合类型。
+- **真实结果回归**：outcome 行的最终五维/粉丝是 `calc_score()` 之外的
+  真实回归目标（真实局 objective），用于校验/修正 `rust/strategy_optimized.json`
+  的模拟分与真实分差距（bias 校正），而不是直接替换 CMA-ES 目标。
+- **后续步骤**：攒够 10+ 局后，在 rust 侧加 `ramen_calibrate` 二进制读
+  decision_log.jsonl，输出「模拟 vs 真实」逐回合偏差报告；偏差稳定后
+  再考虑把真实 outcome 作为 optimize.rs 的先验/验证集。
+
+### 注意
+
+- 日志只在本机（app 私有目录），不上传任何服务器；写盘失败静默。
+- 手写兜底/解析失败（评分全 0）的回合不产 turn 行。
+- 中途安装/启动时从当前回合起记录，outcome 的 `final.turn` < 77 表示该局未跑完。
