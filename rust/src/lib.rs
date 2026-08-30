@@ -1032,7 +1032,7 @@ mod tests {
             ..Default::default()
         };
         let mut game =
-            RamenGame::newgame(102601, &[302424, 302894, 303044, 302924, 303024, 303054], inherit)
+            RamenGame::newgame(102601, &[302424, 302894, 303044, 302924, 303024, 303054], inherit.clone())
                 .expect("newgame 失败");
 
         // 重放前：分布为空
