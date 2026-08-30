@@ -10,7 +10,13 @@
 //!
 //! 回合口径：
 //! - hlpatch `turn` = 游戏 UI「第N回合」（1-based）
-//! - umaai-rs 内部回合从 0 开始，`inject_state()` 做 `turn - 1` 转换
+//! - umaai-rs 内部回合从 0 开始（上游输出统一 `turn()+1`，见 turn_flow.rs），
+//!   `inject_state()` 做 `turn - 1` 转换
+//!
+//! 回合内阶段顺序（上游 turn_flow.rs 实锤）：
+//!   Begin → Distribute(人头) → RamenSelect(选面) → SpecialSelect → Train(面效果已落地) → NextTurn
+//! 因此 hlpatch 发来 trainings（行动画面）时，本回合的面已选完，当前决策点
+//! 是训练而非吃面——v0.4.0 起主决策据此切换（见 run_search 阶段判定）。
 //!
 //! 与旧版的区别：
 //! - 候选评分直接复用 `select_action` 内部那次搜索的 `last_breakdown()`，
@@ -36,6 +42,13 @@
 //!   假盘面评估。现在 `apply_observed_distribution` 按观测人头把可动人员
 //!   （卡/友人/NPC）在训练之间搬移，使模拟分布与实况一致
 //! - 友人加入门槛从内部回合 2 降到 1（实况确认：游戏 UI 第2回合友人已在场）
+//!
+//! v0.4.0（阶段判定修正）：
+//! - ★ 修复「行动画面时主决策还在推荐吃面」：上游回合内顺序是
+//!   Distribute → RamenSelect(选面) → Train(面效果落地)。hlpatch trainings
+//!   在场 = 行动画面 = 面已选完，主决策应为训练建议；旧版按回合区间
+//!   强设 RamenSelect，主决策错误地推荐吃面
+//! - trainings 空（选面画面/非行动画面）→ 主决策 = 吃面建议（按回合区间）
 
 pub mod ramen_strategy;
 pub mod reconcile;
@@ -92,7 +105,7 @@ pub struct SearchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<DecisionOutput>,
     /// 训练阶段建议：hlpatch 没发 trainings 时在 Train 阶段补搜的结果。
-    /// trainings 非空（行动画面）时为 None，小黑板直接显示真实训练明细。
+    /// trainings 非空（行动画面）时为 None，主决策即训练建议。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub training_decision: Option<DecisionOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,7 +120,7 @@ pub struct DecisionOutput {
     pub action_index: usize,
     /// 选中的动作展示文本
     pub action_display: String,
-    /// 选中动作的评分
+    /// 选中的动作评分
     pub score: f64,
     /// 所有候选动作的展示文本
     pub candidate_displays: Vec<String>,
@@ -166,7 +179,7 @@ fn fast_forward(game: &mut RamenGame, target_internal_turn: i32) -> usize {
 /// 把校正后的状态注入 RamenGame。
 ///
 /// 回合转换：`state.turn` 是 hlpatch 直读的游戏 UI 回合（1-based），
-/// 上游模拟器内部回合从 0 开始，这里做 `-1`。
+/// 上游模拟器内部回合从 0 开始（上游显示统一 `turn()+1`），这里做 `-1`。
 ///
 /// 注意：这是"部分重建"，不是完美快照。训练分布 / 羁绊 / 训练等级由
 /// `fast_forward` 重放重建（v0.3.1）+ `apply_observed_distribution`
@@ -224,7 +237,7 @@ pub fn inject_state(game: &mut RamenGame, state: &ReconciledState) -> Result<()>
         }
     }
 
-    // 阶段判定
+    // 阶段判定（v0.4.0 起由 run_search 按观测数据覆盖，这里保留兜底）
     // turn 2-71: RamenSelect 阶段（吃面决策）
     // turn 72-77: SuperRamenSelect 阶段（超级拉面）
     // 其他: Train 阶段
@@ -460,9 +473,11 @@ fn apply_observed_distribution(
 /// 2. 如果 confidence = Reject，返回错误
 /// 3. newgame → fast_forward（重放重建）→ inject_state（覆盖观测值）
 ///    → apply_observed_distribution（直读人头注入，v0.3.2）
-/// 4. 用 RamenMctsTrainer 搜索（Train + RamenSelect 阶段）
-/// 5. hlpatch 无 trainings 时补一次 Train 阶段搜索 → training_decision
-/// 6. 输出 GameView + DecisionOutput(+ training_decision)
+/// 4. 阶段判定（v0.4.0）：trainings 在场 = 行动画面 = 面已选完 → Train，
+///    主决策即训练建议；trainings 空 → 按回合区间（RamenSelect 等）
+/// 5. 用上游 `RamenMctsTrainer` 搜索当前决策点
+/// 6. hlpatch 无 trainings 时补一次 Train 阶段搜索 → training_decision
+/// 7. 输出 GameView + DecisionOutput(+ training_decision)
 pub fn run_search(
     summary_json: &str,
     config: &SearchConfigInput,
@@ -583,6 +598,22 @@ pub fn run_search(
         log::info!("observed distribution injected");
     }
 
+    // ★ v0.4.0 阶段判定修正：上游回合内顺序 Distribute → RamenSelect(选面)
+    //   → SpecialSelect → Train(面效果已落地)（turn_flow.rs）。hlpatch 发来
+    //   trainings = 行动画面 = 面已选完，当前决策点是训练而非吃面——
+    //   旧版此时仍按回合区间强设 RamenSelect，主决策错误地推荐吃面。
+    //   trainings 空 = 选面画面或非行动画面 → 按回合区间推定。
+    let have_trainings = !reconciled.observed_trainings.is_empty();
+    game.stage = if have_trainings {
+        RamenStage::Train
+    } else if (2..=71).contains(&target_internal) {
+        RamenStage::RamenSelect
+    } else if (72..=77).contains(&target_internal) {
+        RamenStage::SuperRamenSelect
+    } else {
+        RamenStage::Train
+    };
+
     // ③ 获取 GameView
     let view = game.view();
 
@@ -613,6 +644,7 @@ pub fn run_search(
     };
 
     // ⑤ 训练阶段建议（hlpatch 无 trainings 时才补搜，省算力）
+    // trainings 在场时主决策已是训练建议，此处自然跳过
     let training_decision = if need_training_search && game.stage != RamenStage::Train {
         let t0 = Instant::now();
         let saved_stage = game.stage;
@@ -635,7 +667,8 @@ pub fn run_search(
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     log::info!(
-        "搜索完成: action={}, score={:.0}, n={}, elapsed={}ms, source={}, training_advice={}",
+        "搜索完成: stage={:?}, action={}, score={:.0}, n={}, elapsed={}ms, source={}, training_advice={}",
+        game.stage,
         decision.action_display,
         decision.score,
         config.search_n,
@@ -934,7 +967,7 @@ mod jni_exports {
         _class: JClass,
     ) -> jstring {
         let v = serde_json::json!({
-            "version": "0.3.2",
+            "version": "0.4.0",
             "upstream": "xulai1001/umaai-rs",
             "upstream_commit": "eeae510b57ee9d29a475645a05c191e6ef5a6e72",
             "search": "ramen_mcts_trainer",
@@ -944,8 +977,9 @@ mod jni_exports {
             "replay_reconnect": true,
             "replay_trainer": "recommended_for_rollout",
             "observed_heads_injection": true,
+            "stage_detection": "trainings_present_means_train_phase(action_screen)",
             "training_decision": "computed_only_when_hlpatch_trainings_empty",
-            "turn_convention": "hlpatch UI 1-based -> AI internal 0-based (turn-1)",
+            "turn_convention": "hlpatch UI 1-based -> AI internal 0-based (turn-1); upstream displays turn()+1",
             "candidate_scores": "last_breakdown_reuse"
         })
         .to_string();
