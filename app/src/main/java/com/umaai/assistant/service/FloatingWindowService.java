@@ -26,7 +26,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 
 /**
- * 拉面杯浮窗服务（v0.3.3+）。
+ * 拉面杯浮窗服务（v0.3.4+）。
  *
  * 通信架构：
  * - hlpatch so 推送 JSON → HttpDataService(:18766) 或轮询(:18765/summary)
@@ -42,6 +42,16 @@ import java.net.URL;
  *   喂 decision 的 candidate_displays/candidate_scores/action_index）
  * - 训练建议（训练建议：速度训练（mean X · 64次/…ms），来自 Rust Train 阶段补搜）
  * - 训练明细行（速: 速46 力14 27pt 体力-25 失败10% 头3光2）
+ * - 运气行（v0.3.4：运:总±X 回±Y，见下）
+ *
+ * v0.3.4 变更：
+ * - ⚠ 校正警告显示原文（最多2条/每条40字），不再是干巴巴的条数——
+ *   用户反馈看不懂 ⚠1 是什么；同时 Rust v0.3.2 的「人头注入」摘要
+ *   也会出现在警告里，可直接核对注入是否生效
+ * - 运气追踪：mean 是「模拟到育成结束的期望总分」——第一回合的 mean
+ *   记为本局基准；运气:总 = 当前 mean − 基准（整局相对开局的漂移）；
+ *   运气:回 = 当前 mean − 上一回合 mean（本回合的增益/波动）。
+ *   中途接入（错过第1回合）时以最早观测为近似基准
  *
  * v0.3.3 变更：
  * - 接入 RamenDecisionLogger（数据收集）：日志写盘在后台单线程，不影响渲染
@@ -88,6 +98,15 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private volatile String lastSearchKey = "";
     private volatile JSONObject lastSearchResult, pendingSummary;
     private Thread searchThread;
+
+    // 运气追踪（v0.3.4）：
+    // - firstMean：第一回合（或新一局最早观测）的 mean，= 总运气基准
+    // - prevMean / prevLuckTurn：上一条新决策的 mean 与回合，= 当回合运气基准
+    // - lastLuckKey：去重（同回合重复渲染不重复计算）
+    private volatile double firstMean = Double.NaN;
+    private volatile double prevMean = Double.NaN;
+    private volatile int prevLuckTurn = -1;
+    private volatile String lastLuckKey = "";
 
     @Override
     public void onCreate() {
@@ -267,6 +286,34 @@ public final class FloatingWindowService extends Service implements HttpDataServ
             if (decision != null) {
                 StringBuilder b = new StringBuilder(RamenBoardText.decisionLine(decision));
 
+                // 运气追踪（v0.3.4）：
+                // - mean（decision.score）= 模拟到育成结束的期望总分
+                // - 总运气 = 当前 mean − 第一回合 mean（整局相对开局的漂移）
+                // - 当回合运气 = 当前 mean − 上一回合 mean（本回合的增益/波动）
+                // 新一局判定：回合回退（turn 变小）；第1回合强制重设基准；
+                // 中途接入（错过第1回合）以最早观测为近似基准
+                double mean = decision.optDouble("score", 0.0);
+                int turnNow = s.has("turn") ? s.optInt("turn", -1) : -1;
+                String key = searchKey(s);
+                if (mean > 0 && turnNow > 0 && !key.equals(lastLuckKey)) {
+                    lastLuckKey = key;
+                    if (turnNow == 1 || prevLuckTurn < 0 || turnNow < prevLuckTurn) {
+                        firstMean = mean;
+                    }
+                    StringBuilder luck = new StringBuilder();
+                    if (!Double.isNaN(firstMean)) {
+                        luck.append(" 总").append(String.format("%+.0f", mean - firstMean));
+                    }
+                    if (!Double.isNaN(prevMean) && turnNow == prevLuckTurn + 1) {
+                        luck.append(" 回").append(String.format("%+.0f", mean - prevMean));
+                    }
+                    if (luck.length() > 0) {
+                        b.append("\n运气").append(luck);
+                    }
+                    prevMean = mean;
+                    prevLuckTurn = turnNow;
+                }
+
                 // 候选差值（PC 黑板「决策理由」图形版）：喂 BoardChartsView 画横条，
                 // 标签走 RamenBoardText.translate 中文化，选中项绿色；
                 // v0.3.2 起不再输出文字版差值行（「#2 吃面/东京-智 -731」）
@@ -286,11 +333,25 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                     b.append("\n训练").append(RamenBoardText.decisionLine(td));
                 }
 
-                // 校正警告数量
+                // 校正警告（v0.3.4）：显示原文而不是干巴巴的条数——用户反馈
+                // 看不懂 ⚠1 是什么。常见为良性近似（feeling_slot 从 remaining
+                // 近似转换）；Rust v0.3.2 的「人头注入」摘要也在这里，可直接
+                // 核对注入是否生效。
                 JSONObject reconcile = result.optJSONObject("reconcile");
                 JSONArray warnings = reconcile == null ? null : reconcile.optJSONArray("warnings");
                 if (warnings != null && warnings.length() > 0) {
-                    b.append(" ⚠").append(warnings.length());
+                    StringBuilder wb = new StringBuilder("\n⚠");
+                    int show = Math.min(warnings.length(), 2);
+                    for (int i = 0; i < show; i++) {
+                        if (i > 0) wb.append("；");
+                        String w = warnings.optString(i);
+                        if (w.length() > 40) w = w.substring(0, 40) + "…";
+                        wb.append(w);
+                    }
+                    if (warnings.length() > 2) {
+                        wb.append(" 等").append(warnings.length()).append("条");
+                    }
+                    b.append(wb);
                 }
 
                 recommendView.setText(b.toString());
