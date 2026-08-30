@@ -18,6 +18,15 @@
 //! - 上游模拟器 umaai-rs 的内部回合从 0 开始（0..=77），
 //!   `inject_state()` 负责 `turn - 1` 转换，本层保持 1-based 口径。
 //! - hlpatch 若发 `turn: 0`，按「第1回合」处理（内部回合 0，两种口径一致）。
+//!
+//! # 直读训练观测（v0.3.2）
+//!
+//! 行动画面的 `trainings` 数组携带每训练的真实人头/彩圈（此前只用于
+//! 「是否补搜训练建议」的判空）。重放分布是固定种子近似，早回合几乎必然
+//! 与真实人头对不上——MCTS 对着假盘面评估，会推荐人头明显更少的训练、
+//! 选风味错位的面。本层把 trainings 解析为 [`ObservedTraining`]，
+//! 由 `inject_state` 之后的人头注入（lib.rs `apply_observed_distribution`）
+//! 搬移可动人员，使模拟分布与实况一致。
 
 use serde::{Deserialize, Serialize};
 
@@ -139,6 +148,19 @@ pub struct ReconciledState {
     pub warnings: Vec<String>,
     /// 整体置信度
     pub confidence: Confidence,
+    /// 直读训练观测（v0.3.2 人头注入用；非行动画面为空）
+    pub observed_trainings: Vec<ObservedTraining>,
+}
+
+/// hlpatch 行动画面 `trainings[]` 的观测条目（v0.3.2 人头注入用）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ObservedTraining {
+    /// 训练下标 0..5（速/耐/力/根/智）
+    pub train_index: usize,
+    /// 该训练人头数（hlpatch `heads`，按训练界面人头数口径）
+    pub heads: i32,
+    /// 彩圈数（仅供参考；注入不使用——彩圈由卡的落位与效果推导）
+    pub shining: i32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -199,7 +221,8 @@ impl ReconciledState {
 /// 5. sozai 校验：每项 [0, FEELING_LIMIT]，总和 ≤ FEELING_LIMIT
 /// 6. acquisition_gauges 解析：对象数组 → [i32; 3]
 /// 7. 地区 ID 校验：1-based → 0-based
-/// 8. 置信度评估
+/// 8. 直读训练观测解析（v0.3.2）
+/// 9. 置信度评估
 pub fn reconcile(raw: &HlpatchSummary) -> Result<ReconciledState, String> {
     let mut warnings = Vec::new();
 
@@ -258,6 +281,10 @@ pub fn reconcile(raw: &HlpatchSummary) -> Result<ReconciledState, String> {
         }
     };
 
+    // ⑤b 直读训练观测（v0.3.2）：解析失败静默跳过（人头注入不生效而已，
+    //     不值得为它压低置信度/刷警告）
+    let observed_trainings = parse_observed_trainings(&raw.trainings);
+
     // ⑥ 置信度评估
     let warning_count = warnings.len();
     let confidence = if turn_confidence == TurnConfidence::Reject {
@@ -277,7 +304,46 @@ pub fn reconcile(raw: &HlpatchSummary) -> Result<ReconciledState, String> {
         ramen,
         warnings,
         confidence,
+        observed_trainings,
     })
+}
+
+// ── 直读训练观测解析 ────────────────────────────────────────────────
+
+/// 从 hlpatch `trainings[]` 原始 JSON 提取观测人头。
+///
+/// 训练下标优先用 `command_id`（101..=105 → 0..4），否则按 `name` 匹配
+/// （Speed/Stamina/Power/Guts/Wiz，兼容中文单字）。无法定位训练的条目跳过。
+fn parse_observed_trainings(raw: &[serde_json::Value]) -> Vec<ObservedTraining> {
+    let mut out = Vec::new();
+    for item in raw {
+        let train_index = item
+            .get("command_id")
+            .and_then(|v| v.as_i64())
+            .filter(|id| (101..=105).contains(id))
+            .map(|id| (id - 101) as usize)
+            .or_else(|| {
+                item.get("name")
+                    .and_then(|v| v.as_str())
+                    .and_then(|name| match name.trim() {
+                        "Speed" | "速" => Some(0),
+                        "Stamina" | "耐" => Some(1),
+                        "Power" | "力" => Some(2),
+                        "Guts" | "根" => Some(3),
+                        "Wiz" | "Wisdom" | "智" => Some(4),
+                        _ => None,
+                    })
+            });
+        let Some(train_index) = train_index else { continue };
+        let heads = item.get("heads").and_then(|v| v.as_i64()).unwrap_or(0);
+        let shining = item.get("shining").and_then(|v| v.as_i64()).unwrap_or(0);
+        out.push(ObservedTraining {
+            train_index,
+            heads: heads.clamp(0, 12) as i32,
+            shining: shining.clamp(0, 12) as i32,
+        });
+    }
+    out
 }
 
 // ── 回合推导 ────────────────────────────────────────────────────────
@@ -689,6 +755,7 @@ mod tests {
         assert_eq!(state.stats.speed, 1200);
         assert_eq!(state.stats.motivation, 5);
         assert!(!state.ramen.has_region_data);
+        assert!(state.observed_trainings.is_empty(), "无 trainings → 观测为空");
     }
 
     /// hlpatch 直读 turn：1-based（与游戏 UI「第N回合」一致），无 warning、High 置信。
@@ -718,6 +785,28 @@ mod tests {
         assert_eq!(state.turn_source, "direct");
         assert_eq!(state.confidence, Confidence::High, "直读且无校正 → High");
         assert!(state.warnings.is_empty(), "直读回合不应产生估算 warning");
+    }
+
+    /// v0.3.2：trainings 解析为观测人头（command_id 与 name 两条路径）
+    #[test]
+    fn test_observed_trainings_parsed() {
+        let json = r#"{
+            "scenario": "Ramen",
+            "turn": 10,
+            "chara": {"scenario_id": 14, "speed": 100, "vital": 50, "max_vital": 100},
+            "trainings": [
+                {"name": "Speed", "command_id": 101, "heads": 2, "shining": 1},
+                {"name": "Power", "command_id": 103, "heads": 3, "shining": 0},
+                {"name": "Wiz", "command_id": 105, "heads": 1, "shining": 2}
+            ]
+        }"#;
+        let raw: HlpatchSummary = serde_json::from_str(json).unwrap();
+        let state = reconcile(&raw).unwrap();
+        assert_eq!(state.observed_trainings.len(), 3, "三条观测全部解析");
+        assert_eq!(state.observed_trainings[0].train_index, 0);
+        assert_eq!(state.observed_trainings[0].heads, 2);
+        assert_eq!(state.observed_trainings[2].train_index, 4);
+        assert_eq!(state.observed_trainings[2].shining, 2);
     }
 
     /// turn=0 按第1回合处理（内部回合 0，两种口径一致）；
