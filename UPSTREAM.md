@@ -4,11 +4,30 @@
 
 - Repository: https://github.com/xulai1001/umaai-rs
 - Branch observed: `master`
-- Commit: `ead54762fedc25cafdf2759846d4396a6333aa40`
+- Commit: `eeae510b57ee9d29a475645a05c191e6ef5a6e72`（2026-08-28）
 - Scenario data blob: `gamedata/scenario_ramen.json@cbd96ce172fa7c9578cb6f79859aab907a51c7c9`
 - State model blob: `crates/umasim/src/game/ramen/state.rs@f64a2187209b011d8addc0ed314ba6dcaba52057`
 
 All Android constants in `RamenUpstreamData` must cite this revision. Updating this file and the constants/tests belongs in one PR.
+
+## 2026-08-29 sync notes（7cef1fa → eeae510b）
+
+- `RamenMctsTrainer` 的 rollout 与未搜阶段 fallback 已切换为
+  `RecommendedRamenTrainer`（正式推荐策略）——「手写策略 + 蒙特卡洛」由
+  上游结构保证：门控全关时与纯推荐策略逐位一致（上游守门测试钉死）。
+- rollout 提速约 -29% CPU（diag 输出改运行时门控）。
+- 五维上限剧本化（[3100,2400,2200,2200,2400]）上游已生效；
+  下方 newgame 2800 clamp 的旧记录按当时 rev 保留备查。
+- 险胜决策理由输出（output/reason）默认 NoopSink，安卓侧未接。
+
+## 直读人头注入口径（本仓库约定）
+
+- hlpatch `trainings[].heads` 按「该训练界面人头数」理解（含卡/友人/NPC，
+  不含理事长/记者——两者位置注入时保持不动）。
+- 注入方式：按观测 heads 在训练之间**搬移可动人员**（多退少补），
+  不重建行结构；总人数与观测不一致时按比例缩放并出 warning。
+- `partner_ids` 语义未定，不使用（UPSTREAM 规则：未知映射保持未知）。
+- 彩圈（shining）由卡的落位与效果推导，无法直接注入，保持重放近似。
 
 ## Confirmed model details
 
