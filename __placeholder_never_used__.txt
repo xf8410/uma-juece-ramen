@@ -1,12 +1,1 @@
-/// 重放分布的一个成员快照。
-#[derive(Clone)]
-struct DistMember {
-    /// 分布行内的槽位下标
-    slot: usize,
-    /// person 下标
-    person: i32,
-    /// 理事长/记者：位置保持不动
-    fixed: bool,
-    /// 是否仍在训练里（false = 已被搬出）
-    present: bool,
-}
+// placeholder cleanup
