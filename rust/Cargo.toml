@@ -19,7 +19,14 @@ name = "ramen_card_benchmark"
 path = "src/card_benchmark.rs"
 
 [dependencies]
-umasim = { git = "https://github.com/xulai1001/umaai-rs", rev = "7cef1fabfc6083529e3f645d589cf59a74723ef7", default-features = false, features = ["diag", "no-color"] }
+# 2026-08-29: 7cef1fa → eeae510b
+# 上游关键变更（8-27/28）：
+# - RamenMctsTrainer 的 rollout 与未搜阶段 fallback 切换为 RecommendedRamenTrainer
+#   （正式推荐策略）——「手写策略 + 蒙特卡洛」严格叠加，门控全关与纯推荐逐位一致
+# - rollout 提速约 -29% CPU（diag 运行时门控）
+# - 五维上限剧本化（[3100,2400,2200,2200,2400]）
+# - 险胜决策理由输出（output/reason）
+umasim = { git = "https://github.com/xulai1001/umaai-rs", rev = "eeae510b57ee9d29a475645a05c191e6ef5a6e72", default-features = false, features = ["diag", "no-color"] }
 jni = { version = "0.21", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

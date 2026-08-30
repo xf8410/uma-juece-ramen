@@ -4,6 +4,7 @@
 //! - `reconcile`: 状态校正层，把 hlpatch 脏数据清洗为模拟器可用状态
 //! - `fast_forward`: 断线重连——从第 0 回合重放重建训练分布/羁绊/训练等级（v0.3.1）
 //! - `inject_state`: 把校正后的状态注入 RamenGame（覆盖观测字段）
+//! - `apply_observed_distribution`: 直读人头注入（v0.3.2）
 //! - `run_search`: 用上游 `RamenMctsTrainer` 搜索，输出 `DecisionInfo` + `GameView`
 //! - JNI exports: `nativeInit` / `nativeSearch` / `nativeVersion`
 //!
@@ -24,6 +25,17 @@
 //! - hlpatch 没发 `trainings`（非行动画面）时，额外在 Train 阶段搜一次，
 //!   输出 `training_decision`，小黑板没有逐回合训练数据也能给训练建议；
 //!   trainings 非空时跳过这次补搜，不白耗算力。
+//!
+//! v0.3.2（直读人头注入 + 上游同步）：
+//! - 上游 pin 7cef1fa → eeae510b：MCTS 的 rollout 与未搜阶段 fallback 切换为
+//!   `RecommendedRamenTrainer`（正式推荐策略）——「手写策略 + 蒙特卡洛」严格叠加
+//! - 重放/兜底策略同步切换为推荐策略（旧 RamenHandwrittenTrainer 缺平衡/联动机制）
+//! - ★ 修复「推荐 0 人头训练 / 风味错位的面」的根因：hlpatch 行动画面的
+//!   trainings（每训练真实人头）此前只用于判空，从不注入模拟状态——
+//!   重放分布是固定种子猜的，早回合与真实对局几乎必然对不上，MCTS 对着
+//!   假盘面评估。现在 `apply_observed_distribution` 按观测人头把可动人员
+//!   （卡/友人/NPC）在训练之间搬移，使模拟分布与实况一致
+//! - 友人加入门槛从内部回合 2 降到 1（实况确认：游戏 UI 第2回合友人已在场）
 
 pub mod ramen_strategy;
 pub mod reconcile;
@@ -43,9 +55,9 @@ use umasim::game::{
 use umasim::gamedata::init_global;
 use umasim::output::GameView;
 use umasim::search::SearchConfig;
-use umasim::trainer::{RamenHandwrittenTrainer, RamenMctsTrainer, RamenSearchStages};
+use umasim::trainer::{RamenMctsTrainer, RamenSearchStages, RecommendedRamenTrainer};
 
-use reconcile::{HlpatchSummary, ReconciledState, reconcile};
+use reconcile::{HlpatchSummary, ObservedTraining, ReconciledState, reconcile};
 
 static INITIALIZED: OnceLock<()> = OnceLock::new();
 
@@ -115,7 +127,7 @@ pub struct DecisionOutput {
 ///
 /// `inject_state` 只覆盖观测字段（五维/体力/拉面/回合），但训练分布、
 /// 羁绊、训练等级无法从 hlpatch 数据恢复——旧版直接跳回合，导致这些
-/// 字段停留在 newgame 初始值，搜索没有依据。这里用手写策略从第 0 回合
+/// 字段停留在 newgame 初始值，搜索没有依据。这里用策略从第 0 回合
 /// 快速重放（不做 MCTS，毫秒级），把 distribution / friendship /
 /// train_level_count 重建到接近真实 run 的状态。
 ///
@@ -130,7 +142,10 @@ fn fast_forward(game: &mut RamenGame, target_internal_turn: i32) -> usize {
     if target_internal_turn <= 0 {
         return 0;
     }
-    let trainer = RamenHandwrittenTrainer::new();
+    // v0.3.2: 重放策略从旧 RamenHandwrittenTrainer 换成正式推荐策略——
+    // 旧手写缺平衡/联动机制，重放出的羁绊/心情偏差更大。for_rollout()
+    // 关闭分解采集（重放路径无消费者），决策与 new() 逐位一致（上游守门）。
+    let trainer = RecommendedRamenTrainer::for_rollout();
     let mut rng = StdRng::seed_from_u64(0x5EED_2026);
     let mut steps = 0usize;
     // 防御上限：每回合最多 8 个阶段再留余量，避免异常状态死循环
@@ -154,7 +169,8 @@ fn fast_forward(game: &mut RamenGame, target_internal_turn: i32) -> usize {
 /// 上游模拟器内部回合从 0 开始，这里做 `-1`。
 ///
 /// 注意：这是"部分重建"，不是完美快照。训练分布 / 羁绊 / 训练等级由
-/// `fast_forward` 重放重建（v0.3.1），本函数只覆盖可直接观测的字段：
+/// `fast_forward` 重放重建（v0.3.1）+ `apply_observed_distribution`
+/// 人头注入（v0.3.2），本函数只覆盖可直接观测的字段：
 /// - friendship：重放近似值（不再固定估算 80）
 /// - train_level_count：重放近似值（不再固定为 0）
 /// - feeling_queue（诀窍获得顺序队列）：置空
@@ -187,7 +203,9 @@ pub fn inject_state(game: &mut RamenGame, state: &ReconciledState) -> Result<()>
     // 人头注入：根据回合添加友人/NPC/记者
     // （fast_forward 重放过程中已按回合推进添加；这里兜底补齐，
     //   保证 target=0 或重放中断时人头仍然完整）
-    if internal_turn >= 2 {
+    // v0.3.2: 友人在游戏 UI 第2回合（内部 1）已可见（实况确认），
+    //   门槛从 >=2 降到 >=1，避免第2回合的模拟里缺友人。
+    if internal_turn >= 1 {
         let has_scenario = game
             .persons
             .iter()
@@ -221,6 +239,214 @@ pub fn inject_state(game: &mut RamenGame, state: &ReconciledState) -> Result<()>
     Ok(())
 }
 
+// ── 直读人头注入（v0.3.2）───────────────────────────────────────────
+
+/// 重放分布的一个成员快照。
+#[derive(Clone)]
+struct DistMember {
+    /// 分布行内的槽位下标
+    slot: usize,
+    /// person 下标
+    person: i32,
+    /// 理事长/记者：位置保持不动
+    fixed: bool,
+    /// 是否仍在训练里（false = 已被搬出）
+    present: bool,
+}
+
+/// 把 hlpatch 观测的训练人头重排到模拟分布上。
+///
+/// 背景：`fast_forward` 用固定种子重放，训练分布是模拟器自己随机出来的——
+/// 与真实对局（哪个训练有几张卡）几乎必然对不上。MCTS 因此对着「假盘面」
+/// 评估，会推荐人头明显更少的训练、选风味错位的面（实测：第2回合真实
+/// 力训练 3 头含友人，AI 却推荐 0 头的耐训练）。
+///
+/// 做法：按观测 heads 在训练之间**搬移可动人员**（卡/友人/NPC），
+/// 理事长/记者位置保持不动；搬出时优先让 person 下标大者（NPC 在
+/// persons 数组尾部）移动，尽量保留卡的身份（羁绊/Hint 与卡绑定）。
+/// 观测总人数与场上可动总人数不一致时按比例缩放并出 warning。
+///
+/// 彩圈（shining）由卡的落位与效果推导，无法直接注入，保持重放近似；
+/// `partner_ids` 语义未定（UPSTREAM.md 规则），不使用。
+fn apply_observed_distribution(
+    game: &mut RamenGame,
+    observed: &[ObservedTraining],
+    warnings: &mut Vec<String>,
+) {
+    if observed.is_empty() {
+        return;
+    }
+
+    // 观测目标人数（按训练下标累加）
+    let mut target = [0i64; 5];
+    let mut sum_target = 0i64;
+    for o in observed {
+        if o.train_index < 5 {
+            target[o.train_index] += o.heads.max(0) as i64;
+            sum_target += o.heads.max(0) as i64;
+        }
+    }
+    if sum_target <= 0 {
+        return;
+    }
+
+    // Phase 1: 读取当前成员（训练 → 成员列表）
+    let mut members: Vec<Vec<DistMember>> = vec![Vec::new(); 5];
+    {
+        let dist = game.distribution();
+        for (t, row) in dist.iter().enumerate().take(5) {
+            for (slot, v) in row.iter().enumerate() {
+                if *v >= 0 {
+                    let fixed = matches!(
+                        game.persons().get(*v as usize).map(|p| p.person_type),
+                        Some(PersonType::Yayoi) | Some(PersonType::Reporter)
+                    );
+                    members[t].push(DistMember {
+                        slot,
+                        person: *v,
+                        fixed,
+                        present: true,
+                    });
+                }
+            }
+        }
+    }
+
+    let fixed_count: [i64; 5] =
+        std::array::from_fn(|t| members[t].iter().filter(|m| m.fixed).count() as i64);
+    let movable_total: i64 = members
+        .iter()
+        .map(|m| m.iter().filter(|x| !x.fixed).count() as i64)
+        .sum();
+    if movable_total <= 0 {
+        return;
+    }
+
+    // 目标可动人数 = 观测人头 - 该训练固定人员；总数与场上不一致时按比例缩放
+    let mut desired = [0i64; 5];
+    let mut sum_desired = 0i64;
+    for t in 0..5 {
+        desired[t] = (target[t] - fixed_count[t]).max(0);
+        sum_desired += desired[t];
+    }
+    if sum_desired <= 0 {
+        return;
+    }
+    if sum_desired != movable_total {
+        for t in 0..5 {
+            desired[t] = desired[t] * movable_total / sum_desired;
+        }
+        // 修正舍入误差
+        let mut scaled: i64 = desired.iter().sum();
+        let mut t = 0usize;
+        while scaled != movable_total && t < 5 {
+            if scaled < movable_total {
+                desired[t] += 1;
+                scaled += 1;
+            } else if desired[t] > 0 {
+                desired[t] -= 1;
+                scaled -= 1;
+            }
+            t += 1;
+        }
+        warnings.push(format!(
+            "人头口径: 观测总人数 {sum_target} 与场上可动人数 {movable_total} 不一致，已按比例重排"
+        ));
+    }
+
+    // Phase 2a: 盈余训练搬出（优先 person 下标大者 = NPC，保留卡的身份）
+    let mut surplus: Vec<i32> = Vec::new();
+    for t in 0..5 {
+        let present_movable: Vec<usize> = members[t]
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.fixed && m.present)
+            .map(|(i, _)| i)
+            .collect();
+        let excess = present_movable.len() as i64 - desired[t];
+        if excess > 0 {
+            let mut idxs = present_movable;
+            idxs.sort_by_key(|&i| std::cmp::Reverse(members[t][i].person));
+            for &i in idxs.iter().take(excess as usize) {
+                members[t][i].present = false;
+                surplus.push(members[t][i].person);
+            }
+        }
+    }
+
+    // Phase 2b: 缺口训练补入（优先复用本训练腾出的空槽）
+    for t in 0..5 {
+        let present_n = members[t].iter().filter(|m| m.present).count() as i64;
+        let mut need = (desired[t] - present_n).max(0);
+        while need > 0 {
+            let Some(person) = surplus.pop() else { break };
+            let reuse = members[t]
+                .iter_mut()
+                .find(|m| !m.fixed && !m.present);
+            match reuse {
+                Some(m) => {
+                    m.person = person;
+                    m.present = true;
+                }
+                None => members[t].push(DistMember {
+                    slot: usize::MAX, // 行尾追加（Phase 3 处理）
+                    person,
+                    fixed: false,
+                    present: true,
+                }),
+            }
+            need -= 1;
+        }
+    }
+
+    // Phase 3: 写回分布行（先清空非固定成员原槽，再按新位置落位）
+    let mut new_rows: Vec<Vec<i32>> = game.distribution().clone();
+    let n_trains = new_rows.len().min(5);
+    for t in 0..n_trains {
+        for m in &members[t] {
+            if !m.fixed && m.slot < new_rows[t].len() {
+                new_rows[t][m.slot] = -1;
+            }
+        }
+    }
+    for t in 0..n_trains {
+        for m in &members[t] {
+            if m.present {
+                if m.slot == usize::MAX {
+                    new_rows[t].push(m.person);
+                } else {
+                    if m.slot >= new_rows[t].len() {
+                        new_rows[t].resize(m.slot + 1, -1);
+                    }
+                    new_rows[t][m.slot] = m.person;
+                }
+            }
+        }
+    }
+    {
+        let dist = game.distribution_mut();
+        for (t, row) in new_rows.into_iter().enumerate().take(5) {
+            dist[t] = row;
+        }
+    }
+
+    // 结果摘要（透出到小黑板 ⚠ 区）
+    let counts: Vec<i64> = (0..5)
+        .map(|t| {
+            members[t]
+                .iter()
+                .filter(|m| m.present && !m.fixed)
+                .count() as i64
+                + fixed_count[t]
+        })
+        .collect();
+    warnings.push(format!(
+        "人头注入: 速{} 耐{} 力{} 根{} 智{} (观测 速{} 耐{} 力{} 根{} 智{})",
+        counts[0], counts[1], counts[2], counts[3], counts[4],
+        target[0], target[1], target[2], target[3], target[4]
+    ));
+}
+
 // ── 搜索核心 ────────────────────────────────────────────────────────
 
 /// 执行搜索，返回标准结构化结果。
@@ -229,6 +455,7 @@ pub fn inject_state(game: &mut RamenGame, state: &ReconciledState) -> Result<()>
 /// 1. reconcile hlpatch JSON → ReconciledState
 /// 2. 如果 confidence = Reject，返回错误
 /// 3. newgame → fast_forward（重放重建）→ inject_state（覆盖观测值）
+///    → apply_observed_distribution（直读人头注入，v0.3.2）
 /// 4. 用 RamenMctsTrainer 搜索（Train + RamenSelect 阶段）
 /// 5. hlpatch 无 trainings 时补一次 Train 阶段搜索 → training_decision
 /// 6. 输出 GameView + DecisionOutput(+ training_decision)
@@ -258,7 +485,7 @@ pub fn run_search(
     // 空时需要 Rust 在 Train 阶段补搜训练建议；非空时跳过，不白耗算力。
     let need_training_search = raw.trainings.is_empty();
 
-    let reconciled = match reconcile(&raw) {
+    let mut reconciled = match reconcile(&raw) {
         Ok(s) => s,
         Err(e) => {
             log::warn!("状态校正失败: {e}");
@@ -274,10 +501,11 @@ pub fn run_search(
     };
 
     log::info!(
-        "reconcile: turn={}, confidence={:?}, warnings={}",
+        "reconcile: turn={}, confidence={:?}, warnings={}, observed_trainings={}",
         reconciled.turn,
         reconciled.confidence,
-        reconciled.warnings.len()
+        reconciled.warnings.len(),
+        reconciled.observed_trainings.len()
     );
     for w in &reconciled.warnings {
         log::info!("  warning: {w}");
@@ -338,6 +566,17 @@ pub fn run_search(
             reconcile: Some(reconciled),
             error: Some(format!("inject_state 失败: {e}")),
         };
+    }
+
+    // ★ v0.3.2 直读人头注入：重放分布是固定种子近似，观测人头（行动画面
+    //   trainings）在场时把可动人员搬到与实况一致——MCTS 从此对真实盘面评估。
+    if !reconciled.observed_trainings.is_empty() {
+        apply_observed_distribution(
+            &mut game,
+            &reconciled.observed_trainings,
+            &mut reconciled.warnings,
+        );
+        log::info!("observed distribution injected");
     }
 
     // ③ 获取 GameView
@@ -426,6 +665,8 @@ pub fn run_search(
 /// 用上游 RamenMctsTrainer 搜索。
 ///
 /// 阶段门控：只搜 Train + RamenSelect（手机性能有限，省略 SpecialSelect 等）。
+/// v0.3.2: 上游 eeae510b 起 MCTS 的 rollout 与未搜阶段 fallback 均为
+/// `RecommendedRamenTrainer`（正式推荐策略）——「手写 + 蒙特卡洛」严格叠加。
 ///
 /// 候选评分来自 `trainer.last_breakdown()`——那是 `select_action` 内部
 /// 那次搜索缓存的统计（`#i 动作 n=N mean=M sd=S pt=P | ...`）。
@@ -487,7 +728,12 @@ fn run_mcts_search(game: &mut RamenGame, search_n: usize) -> Result<DecisionOutp
 
 /// 从 `RamenMctsTrainer::last_breakdown()` 文本解析每个候选的 mean 分。
 ///
-/// 行格式（" | " 分隔）：`#0 不吃面 n=4096 mean=65973 sd=1234 pt=5678`
+/// 搜索决策行格式（" | " 分隔）：
+/// `#0 不吃面 n=4096 mean=65973 sd=1234 pt=5678`
+///
+/// 转发（手写策略）决策行格式（v0.3.2 兜底路径）：
+/// `#2 8125[速训练 理由...]`
+///
 /// 解析失败的候选保持 0.0（上层展示时按"无评分"处理）。
 fn parse_breakdown_means(breakdown: Option<&str>, expected_len: usize) -> Vec<f64> {
     let mut scores = vec![0.0; expected_len];
@@ -515,13 +761,25 @@ fn parse_breakdown_means(breakdown: Option<&str>, expected_len: usize) -> Vec<f6
                 }
             }
         }
+        // 兼容推荐策略分解格式 `#2 8125[理由…]`（无 mean= 键时取首个数字）
+        if scores[idx] == 0.0 {
+            if let Some(first) = tail.split_whitespace().next() {
+                let num = first.split('[').next().unwrap_or("");
+                if let Ok(m) = num.parse::<f64>() {
+                    scores[idx] = m;
+                }
+            }
+        }
     }
     scores
 }
 
 /// 手写策略兜底（搜索失败时使用）。
+///
+/// v0.3.2: 与上游同步切换为 `RecommendedRamenTrainer`（正式推荐策略）——
+/// 旧 `RamenHandwrittenTrainer` 缺平衡/联动机制，已非上游生产路径。
 fn run_handwritten_fallback(game: &mut RamenGame) -> Result<DecisionOutput> {
-    let trainer = RamenHandwrittenTrainer::new();
+    let trainer = RecommendedRamenTrainer::new();
     let mut rng = StdRng::from_os_rng();
 
     let actions: Vec<_> = if game.stage == RamenStage::RamenSelect {
@@ -672,13 +930,16 @@ mod jni_exports {
         _class: JClass,
     ) -> jstring {
         let v = serde_json::json!({
-            "version": "0.3.1",
+            "version": "0.3.2",
             "upstream": "xulai1001/umaai-rs",
-            "upstream_commit": "7cef1fa",
+            "upstream_commit": "eeae510b57ee9d29a475645a05c191e6ef5a6e72",
             "search": "ramen_mcts_trainer",
+            "rollout": "recommended_ramen_trainer",
             "stages": ["train", "ramen_select"],
             "reconcile": true,
             "replay_reconnect": true,
+            "replay_trainer": "recommended_for_rollout",
+            "observed_heads_injection": true,
             "training_decision": "computed_only_when_hlpatch_trainings_empty",
             "turn_convention": "hlpatch UI 1-based -> AI internal 0-based (turn-1)",
             "candidate_scores": "last_breakdown_reuse"
@@ -711,6 +972,15 @@ mod tests {
         assert_eq!(scores2, vec![0.0, 0.0]);
 
         assert_eq!(parse_breakdown_means(None, 3), vec![0.0, 0.0, 0.0]);
+    }
+
+    /// v0.3.2: 推荐策略分解格式 `#2 8125[理由…]`（兜底路径，无 mean= 键）
+    #[test]
+    fn test_parse_breakdown_means_policy_format() {
+        let text = "#0 8125[速训练 基础] | #1 6500[休息]";
+        let scores = parse_breakdown_means(Some(text), 2);
+        assert!((scores[0] - 8125.0).abs() < 0.5, "scores[0]={}", scores[0]);
+        assert!((scores[1] - 6500.0).abs() < 0.5, "scores[1]={}", scores[1]);
     }
 
     /// gamedata 工作目录初始化（测试公共前置）
@@ -863,6 +1133,17 @@ mod tests {
             assert!(
                 response.training_decision.is_none(),
                 "trainings 非空时不应补搜训练建议（省算力）"
+            );
+            // ★ v0.3.2: 观测人头应被解析并注入（warning 里有摘要）
+            let reconciled = response.reconcile.as_ref().unwrap();
+            assert!(
+                !reconciled.observed_trainings.is_empty(),
+                "trainings 应解析为观测人头"
+            );
+            assert!(
+                reconciled.warnings.iter().any(|w| w.contains("人头注入")),
+                "人头注入应留摘要 warning: {:?}",
+                reconciled.warnings
             );
         }
     }
