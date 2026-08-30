@@ -242,6 +242,7 @@ pub fn inject_state(game: &mut RamenGame, state: &ReconciledState) -> Result<()>
 // ── 直读人头注入（v0.3.2）───────────────────────────────────────────
 
 /// 重放分布的一个成员快照。
+#[derive(Clone)]
 struct DistMember {
     /// 分布行内的槽位下标
     slot: usize,
