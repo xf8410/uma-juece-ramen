@@ -53,6 +53,10 @@ jobs:
         run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_optimize
       - name: Build JNI lib
         run: cargo build --manifest-path rust/Cargo.toml --lib
+      # 单元测试：gamedata 缺失时依赖 gamedata 的测试自行跳过（setup_gamedata），
+      # 纯解析类测试（reconcile 观测解析 / breakdown 解析）在此真正执行
+      - name: Run Rust tests
+        run: cargo test --manifest-path rust/Cargo.toml --lib
 
   simulate:
     if: github.event_name != 'workflow_dispatch' || github.event.inputs.sim_count != '0'
