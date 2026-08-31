@@ -375,9 +375,13 @@ fn apply_observed_distribution(
     }
 
     // Phase 2b: 缺口训练补入（优先复用本训练腾出的空槽）
+    // 注意：desired[t] 是「可动人数」目标（已扣除固定人员），present_n 也
+    // 必须只数可动成员——若把 fixed（理事长/记者）也算进去，need 会少算
+    // fixed_count 个，导致该训练补人不足（12 回合后记者登场必触发）。
     for t in 0..5 {
-        let present_n = members[t].iter().filter(|m| m.present).count() as i64;
-        let mut need = (desired[t] - present_n).max(0);
+        let present_movable_n =
+            members[t].iter().filter(|m| m.present && !m.fixed).count() as i64;
+        let mut need = (desired[t] - present_movable_n).max(0);
         while need > 0 {
             let Some(person) = surplus.pop() else { break };
             let reuse = members[t]
@@ -1028,7 +1032,7 @@ mod tests {
             ..Default::default()
         };
         let mut game =
-            RamenGame::newgame(102601, &[302424, 302894, 303044, 302924, 303024, 303054], inherit)
+            RamenGame::newgame(102601, &[302424, 302894, 303044, 302924, 303024, 303054], inherit.clone())
                 .expect("newgame 失败");
 
         // 重放前：分布为空

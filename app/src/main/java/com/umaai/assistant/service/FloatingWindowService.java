@@ -24,9 +24,10 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.Locale;
 
 /**
- * 拉面杯浮窗服务（v0.3.4+）。
+ * 拉面杯浮窗服务（v0.3.5+）。
  *
  * 通信架构：
  * - hlpatch so 推送 JSON → HttpDataService(:18766) 或轮询(:18765/summary)
@@ -43,6 +44,13 @@ import java.net.URL;
  * - 训练建议（训练建议：速度训练（mean X · 64次/…ms），来自 Rust Train 阶段补搜）
  * - 训练明细行（速: 速46 力14 27pt 体力-25 失败10% 头3光2）
  * - 运气行（v0.3.4：运:总±X 回±Y，见下）
+ *
+ * v0.3.5 变更：
+ * - 紧凑模式开关：手机屏不够放全部信息——面板右上角新增一枚可点小按钮
+ *   （独立悬浮窗，主面板保持不可触碰不挡游戏）。「简」= 收起状态/训练明细/
+ *   条形图/运气/⚠警告/训练建议，只留回合行+主建议行；「详」= 全部展开。
+ *   状态持久化（SharedPreferences），重开服务保持
+ * - 运气/百分比格式改 Locale.US，避免个别系统区域设置产出本地化数字
  *
  * v0.3.4 变更：
  * - ⚠ 校正警告显示原文（最多2条/每条40字），不再是干巴巴的条数——
@@ -82,6 +90,8 @@ import java.net.URL;
 public final class FloatingWindowService extends Service implements HttpDataService.OnDataListener {
     private static final String TAG = "RamenFloat";
     private static final String CHANNEL = "ramen_overlay";
+    private static final String PREFS = "ramen_overlay";
+    private static final String PREF_COMPACT = "compact";
     private static final int NOTIFICATION_ID = 1401;
     private static final long STALE_MS = 5000;
     private static final int DEFAULT_UMA_ID = 102601;
@@ -96,8 +106,12 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private volatile boolean polling, searchRunning;
     private volatile long lastDataAt;
     private volatile String lastSearchKey = "";
-    private volatile JSONObject lastSearchResult, pendingSummary;
+    private volatile JSONObject lastSearchResult, pendingSummary, lastSummary;
     private Thread searchThread;
+
+    // 紧凑模式（v0.3.5）：true = 只显示回合行+主建议行
+    private volatile boolean compactMode;
+    private TextView toggleBtn;
 
     // 运气追踪（v0.3.4）：
     // - firstMean：第一回合（或新一局最早观测）的 mean，= 总运气基准
@@ -113,7 +127,10 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         super.onCreate();
         createNotificationChannel();
         startForeground(NOTIFICATION_ID, notification("等待拉面杯数据"));
+        compactMode = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getBoolean(PREF_COMPACT, false);
         createPanel();
+        createToggleButton();
         // 决策日志：真实对局数据收集（outcome 的 config 回显本服务固定搜索配置）
         RamenDecisionLogger.init(getFilesDir(), DEFAULT_UMA_ID, DEFAULT_CARDS);
         try {
@@ -138,7 +155,10 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     public void onDestroy() {
         polling = false;
         if (server != null) server.stopServer();
-        if (panel != null && windowManager != null) windowManager.removeView(panel);
+        if (windowManager != null) {
+            if (panel != null) windowManager.removeView(panel);
+            if (toggleBtn != null) windowManager.removeView(toggleBtn);
+        }
         RamenDecisionLogger.flush(); // 收尾当前 run（幂等）
         super.onDestroy();
     }
@@ -155,6 +175,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
             // hlpatch v3.27.22: 有 chara 对象或 stats 对象都接受
             if (!s.has("chara") && !s.has("stats")) return;
             lastDataAt = System.currentTimeMillis();
+            lastSummary = s;
             main.post(() -> render(s, source));
         } catch (Exception ignored) { }
     }
@@ -264,6 +285,10 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         String detail = RamenBoardText.trainingLines(trainings);
         trainingsView.setText(detail.isEmpty() ? "训练数据：无" : detail);
 
+        // 紧凑模式（v0.3.5）：状态行/训练明细收起，只留回合行+主建议行+来源行
+        statusView.setVisibility(compactMode ? View.GONE : View.VISIBLE);
+        trainingsView.setVisibility(compactMode ? View.GONE : View.VISIBLE);
+
         // 来源 + AI 状态
         String aiStatus = UmaNativeBridge.isAvailable() ? "AI就绪" : "安全兜底";
         sourceView.setText(source + " · " + aiStatus);
@@ -302,10 +327,10 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                     }
                     StringBuilder luck = new StringBuilder();
                     if (!Double.isNaN(firstMean)) {
-                        luck.append(" 总").append(String.format("%+.0f", mean - firstMean));
+                        luck.append(" 总").append(String.format(Locale.US, "%+.0f", mean - firstMean));
                     }
                     if (!Double.isNaN(prevMean) && turnNow == prevLuckTurn + 1) {
-                        luck.append(" 回").append(String.format("%+.0f", mean - prevMean));
+                        luck.append(" 回").append(String.format(Locale.US, "%+.0f", mean - prevMean));
                     }
                     if (luck.length() > 0) {
                         b.append("\n运气").append(luck);
@@ -316,42 +341,50 @@ public final class FloatingWindowService extends Service implements HttpDataServ
 
                 // 候选差值（PC 黑板「决策理由」图形版）：喂 BoardChartsView 画横条，
                 // 标签走 RamenBoardText.translate 中文化，选中项绿色；
-                // v0.3.2 起不再输出文字版差值行（「#2 吃面/东京-智 -731」）
-                chartsView.setCandidates(
-                        decision.optJSONArray("candidate_displays"),
-                        decision.optJSONArray("candidate_scores"),
-                        decision.optInt("action_index", 0));
+                // 紧凑模式不画条形图（省空间）
+                if (compactMode) {
+                    chartsView.clear();
+                } else {
+                    chartsView.setCandidates(
+                            decision.optJSONArray("candidate_displays"),
+                            decision.optJSONArray("candidate_scores"),
+                            decision.optInt("action_index", 0));
+                }
 
                 // 决策日志：本回合 summary+decision 一行（按 searchKey 去重，一回合一行）
                 RamenDecisionLogger.onDecision(s, decision, searchKey(s));
 
                 // 训练建议：hlpatch 没发 trainings（非行动画面）时由 Rust 在
                 // Train 阶段补搜返回；trainings 非空时不显示（黑板已有真实明细）
-                JSONObject td = result.optJSONObject("training_decision");
-                if (td != null) {
-                    // decisionLine 输出「建议：X（…）」，前拼「训练」→「训练建议：X（…）」
-                    b.append("\n训练").append(RamenBoardText.decisionLine(td));
+                if (!compactMode) {
+                    JSONObject td = result.optJSONObject("training_decision");
+                    if (td != null) {
+                        // decisionLine 输出「建议：X（…）」，前拼「训练」→「训练建议：X（…）」
+                        b.append("\n训练").append(RamenBoardText.decisionLine(td));
+                    }
                 }
 
                 // 校正警告（v0.3.4）：显示原文而不是干巴巴的条数——用户反馈
                 // 看不懂 ⚠1 是什么。常见为良性近似（feeling_slot 从 remaining
                 // 近似转换）；Rust v0.3.2 的「人头注入」摘要也在这里，可直接
-                // 核对注入是否生效。
-                JSONObject reconcile = result.optJSONObject("reconcile");
-                JSONArray warnings = reconcile == null ? null : reconcile.optJSONArray("warnings");
-                if (warnings != null && warnings.length() > 0) {
-                    StringBuilder wb = new StringBuilder("\n⚠");
-                    int show = Math.min(warnings.length(), 2);
-                    for (int i = 0; i < show; i++) {
-                        if (i > 0) wb.append("；");
-                        String w = warnings.optString(i);
-                        if (w.length() > 40) w = w.substring(0, 40) + "…";
-                        wb.append(w);
+                // 核对注入是否生效。紧凑模式收起。
+                if (!compactMode) {
+                    JSONObject reconcile = result.optJSONObject("reconcile");
+                    JSONArray warnings = reconcile == null ? null : reconcile.optJSONArray("warnings");
+                    if (warnings != null && warnings.length() > 0) {
+                        StringBuilder wb = new StringBuilder("\n⚠");
+                        int show = Math.min(warnings.length(), 2);
+                        for (int i = 0; i < show; i++) {
+                            if (i > 0) wb.append("；");
+                            String w = warnings.optString(i);
+                            if (w.length() > 40) w = w.substring(0, 40) + "…";
+                            wb.append(w);
+                        }
+                        if (warnings.length() > 2) {
+                            wb.append(" 等").append(warnings.length()).append("条");
+                        }
+                        b.append(wb);
                     }
-                    if (warnings.length() > 2) {
-                        wb.append(" 等").append(warnings.length()).append("条");
-                    }
-                    b.append(wb);
                 }
 
                 recommendView.setText(b.toString());
@@ -451,6 +484,49 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         trainingsView = panel.findViewById(R.id.tv_trainings);
         sourceView = panel.findViewById(R.id.tv_source);
         windowManager.addView(panel, p);
+    }
+
+    /**
+     * 紧凑模式开关（v0.3.5）。
+     *
+     * 主面板带 FLAG_NOT_TOUCHABLE（不挡游戏），无法直接放按钮——所以用一枚
+     * 独立的小悬浮窗（仅 FLAG_NOT_FOCUSABLE，可点）贴在面板右上角。
+     * 「简」= 收起详情；「详」= 展开详情。状态持久化。
+     */
+    private void createToggleButton() {
+        toggleBtn = new TextView(this);
+        toggleBtn.setText(compactMode ? "详" : "简");
+        toggleBtn.setTextSize(11);
+        toggleBtn.setTextColor(0xFF202020);
+        toggleBtn.setBackgroundColor(0xCCEEEEEE);
+        toggleBtn.setPadding(dp(7), dp(2), dp(7), dp(2));
+        int type = Build.VERSION.SDK_INT >= 26 ?
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY :
+            WindowManager.LayoutParams.TYPE_PHONE;
+        WindowManager.LayoutParams p = new WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT);
+        p.gravity = Gravity.TOP | Gravity.END;
+        p.x = dp(6);
+        p.y = dp(122);
+        toggleBtn.setOnClickListener(v -> {
+            compactMode = !compactMode;
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .edit().putBoolean(PREF_COMPACT, compactMode).apply();
+            toggleBtn.setText(compactMode ? "详" : "简");
+            JSONObject snap = lastSummary;
+            if (snap != null) {
+                main.post(() -> render(snap, "视图切换"));
+            }
+        });
+        windowManager.addView(toggleBtn, p);
+    }
+
+    private int dp(int v) {
+        return Math.round(v * getResources().getDisplayMetrics().density);
     }
 
     private void startPolling() {
