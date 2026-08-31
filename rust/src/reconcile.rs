@@ -386,7 +386,7 @@ pub fn reconcile(raw: &HlpatchSummary) -> Result<ReconciledState, String> {
     let feeling_types = parse_command_feelings(
         raw.ramen
             .as_ref()
-            .map(|r| &r.command_feelings)
+            .map(|r| r.command_feelings.as_slice())
             .unwrap_or(&[]),
     );
 
@@ -497,7 +497,7 @@ fn parse_support_bonds(
                 let bond = p
                     .get("current_bond")
                     .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
+                    .unwrap_or(0) as i32;
                 if let Some(id) = id {
                     map.insert(id, bond.clamp(0, 100));
                 }
@@ -1168,9 +1168,7 @@ mod tests {
         }"#;
         let raw: HlpatchSummary = serde_json::from_str(json).unwrap();
         let state = reconcile(&raw).unwrap();
-        // training_levels: 101→0(L3), 103→2(L5), 601→0(L2) → 同一下标取最后一个解析值，
-        // 但 parse 是顺序 push，故 0 出现两次。注入端会按"后者覆盖"或"取最后"处理，
-        // 这里只验证解析正确。
+        // training_levels: 101→0(L3), 103→2(L5), 601→0(L2)；同一下标取最后解析值
         let tl: std::collections::HashMap<usize, i32> =
             state.training_levels.iter().cloned().collect();
         assert_eq!(tl.get(&2), Some(&5));
