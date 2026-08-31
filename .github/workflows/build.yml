@@ -53,8 +53,17 @@ jobs:
         run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_optimize
       - name: Build JNI lib
         run: cargo build --manifest-path rust/Cargo.toml --lib
-      # 单元测试：gamedata 缺失时依赖 gamedata 的测试自行跳过（setup_gamedata），
-      # 纯解析类测试（reconcile 观测解析 / breakdown 解析）在此真正执行
+      # 单元测试：v0.4.1 起下载 gamedata，让依赖 gamedata 的测试（含开局第1回合
+      # 回归、run_search 全链路）在 CI 真正执行，不再靠 setup_gamedata 跳过。
+      # 纯解析类测试（reconcile 观测解析 / breakdown 解析）不依赖 gamedata。
+      - name: Download gamedata for tests
+        run: |
+          mkdir -p gamedata
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+            curl -sSL "$BASE/$f" -o "gamedata/$f" || echo "WARN: $f"
+          done
+          ls -la gamedata/
       - name: Run Rust tests
         run: cargo test --manifest-path rust/Cargo.toml --lib
 
