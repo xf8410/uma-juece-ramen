@@ -45,6 +45,17 @@ import java.util.Locale;
  * - 训练明细行（速: 速46 力14 27pt 体力-25 失败10% 头3光2）
  * - 运气行（v0.3.4：运:总±X 回±Y，见下）
  *
+ * v0.4.2 变更（协议对齐 PC 黑板 GameStatusSend）：
+ * - ★ 回合口径修正：hlpatch 的 turn **已是 AI 0-based（0..77）**——黑板协议层
+ *   发送前做了 turn = chara_info.turn - 1，手机版 hlpatch 照抄。浮窗显示
+ *   「第{turn+1}回合 直读(AI:{turn})」；旧版显示 turn-1 是双重换算，作废
+ * - ★ 马娘/支援卡动态提取：搜索不再硬编码 DEFAULT_UMA_ID/固定六卡——
+ *   uma_id 取快照 card_id（换皮 id 原值，如礼服北方飞翔 108202）；支援卡取
+ *   support_cards[] 按黑板协议编码 short_id×10+突破数（"神团 30137 满破
+ *   301374"；马娘 id 不做该变换）。换马娘/换配卡无需改代码
+ * - ★ 第1回合门控：turn<=0 且 trainings 空（SO 尚未读全人头数据）时不触发
+ *   搜索，显示「等待人头数据…」——修复开局没数据就出建议的问题
+ *
  * v0.3.5 变更：
  * - 紧凑模式开关：手机屏不够放全部信息——面板右上角新增一枚可点小按钮
  *   （独立悬浮窗，主面板保持不可触碰不挡游戏）。「简」= 收起状态/训练明细/
@@ -76,16 +87,16 @@ import java.util.Locale;
  * - Rust 侧 v0.3.1 起先重放重建（断线重连）再搜索，非行动画面也能给出
  *   有依据的吃面/训练建议
  *
- * 回合口径：
- * - hlpatch 的 turn 与游戏 UI「第N回合」一致（1-based），直读时标注「直读」
- * - AI（umaai-rs）内部回合从 0 开始，浮窗同时显示 AI 内部值便于核对
+ * 回合口径（v0.4.2 修正）：
+ * - hlpatch 的 turn 已是 AI 0-based（黑板协议层发送前减 1），显示 第{turn+1}回合
  * - 旧版 hlpatch 无 turn 字段时回退 month/half 显示，Rust 侧再推导
  *
- * hlpatch v3.27.22 JSON 格式：
+ * hlpatch v3.27.22+ JSON 格式：
  * - chara 对象（speed/stamina/power/guts/wiz/vital/max_vital/motivation/skill_point/scenario_id）
- * - month(1-12) + half(1-2)，v3.27.17+ 补发 turn
+ * - month(1-12) + half(1-2)，v3.27.17+ 补发 turn（AI 0-based）
  * - 可选 ramen 对象（sozai/feeling/acquisition_gauges/checkpoint_pt）
  * - 顶层 trainings（五项训练收益/失败率/人头/发光，仅行动画面非空）
+ * - 顶层 card_id / support_cards（v0.4.2 动态提取马娘/配卡用）
  */
 public final class FloatingWindowService extends Service implements HttpDataService.OnDataListener {
     private static final String TAG = "RamenFloat";
@@ -94,6 +105,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private static final String PREF_COMPACT = "compact";
     private static final int NOTIFICATION_ID = 1401;
     private static final long STALE_MS = 5000;
+    /** 兜底：快照缺 card_id/support_cards 时使用（编码后的卡 id，short×10+突破） */
     private static final int DEFAULT_UMA_ID = 102601;
     private static final int[] DEFAULT_CARDS = {302424, 302894, 303044, 302924, 303024, 303054};
 
@@ -211,8 +223,20 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         // 决策日志 run 生命周期（开局/中途入局/终盘收尾），先于搜索结果处理
         RamenDecisionLogger.onSummary(s);
 
+        // ★ v0.4.2 第1回合门控：SO 尚未读全人头数据（trainings 空）时不搜索
+        //   ——开局第1回合没数据就出建议是用户实锤的问题。其余回合 trainings
+        //   为空是选面画面/非行动画面（Rust 给吃面建议），属正常路径
+        int turnVal = s.optInt("turn", -1);
+        JSONArray trs0 = s.optJSONArray("trainings");
+        boolean firstTurnNoHeads = turnVal <= 0 && (trs0 == null || trs0.length() == 0);
+
         // 渲染搜索结果（如果有）
         renderSearchResult(s);
+
+        if (firstTurnNoHeads) {
+            if (!searchRunning) recommendView.setText("等待人头数据…（第1回合 SO 未读全）");
+            return;
+        }
 
         // 触发搜索（如果回合变化且 native 可用）
         String key = searchKey(s);
@@ -222,18 +246,17 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     }
 
     private void renderBasicState(JSONObject s, JSONObject chara, String source) {
-        // 回合显示：
-        // - hlpatch 直读 turn（游戏 UI 第N回合，1-based）→ 标「直读」并附 AI 内部值（0-based）
+        // 回合显示（v0.4.2）：
+        // - hlpatch 直读 turn 已是 AI 0-based（黑板协议发送前减 1）
+        //   → 显示 第{turn+1}回合 直读(AI:{turn})；旧版显示 turn-1 是双重换算
         // - 旧版 hlpatch 无 turn → 显示 month/half，Rust 侧推导
         int turn = s.has("turn") ? s.optInt("turn", -1) : -1;
         int month = s.optInt("month", -1);
         int half = s.optInt("half", -1);
 
         String turnText;
-        if (turn > 0) {
-            turnText = "第" + turn + "回合 直读(AI:" + (turn - 1) + ")";
-        } else if (turn == 0) {
-            turnText = "第1回合 直读(AI:0)";
+        if (turn >= 0) {
+            turnText = "第" + (turn + 1) + "回合 直读(AI:" + turn + ")";
         } else if (month > 0 && half > 0) {
             turnText = month + "月" + (half == 1 ? "前" : "后");
         } else {
@@ -315,14 +338,14 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                 // - mean（decision.score）= 模拟到育成结束的期望总分
                 // - 总运气 = 当前 mean − 第一回合 mean（整局相对开局的漂移）
                 // - 当回合运气 = 当前 mean − 上一回合 mean（本回合的增益/波动）
-                // 新一局判定：回合回退（turn 变小）；第1回合强制重设基准；
-                // 中途接入（错过第1回合）以最早观测为近似基准
+                // 新一局判定：回合回退（turn 变小）；第1回合（turn<=0，AI 0-based）
+                // 强制重设基准；中途接入（错过第1回合）以最早观测为近似基准
                 double mean = decision.optDouble("score", 0.0);
                 int turnNow = s.has("turn") ? s.optInt("turn", -1) : -1;
                 String key = searchKey(s);
-                if (mean > 0 && turnNow > 0 && !key.equals(lastLuckKey)) {
+                if (mean > 0 && turnNow >= 0 && !key.equals(lastLuckKey)) {
                     lastLuckKey = key;
-                    if (turnNow == 1 || prevLuckTurn < 0 || turnNow < prevLuckTurn) {
+                    if (turnNow <= 0 || prevLuckTurn < 0 || turnNow < prevLuckTurn) {
                         firstMean = mean;
                     }
                     StringBuilder luck = new StringBuilder();
@@ -424,6 +447,44 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                (r == null ? "" : r.optInt("checkpoint_pt") + ":" + r.optString("sozai"));
     }
 
+    /**
+     * ★ v0.4.2：马娘 id 从快照动态提取——card_id 顶层或 chara 内均可
+     * （换皮 id 原值直传，如礼服北方飞翔 108202；马娘 id 不做任何变换）。
+     * 缺失时回退 DEFAULT_UMA_ID。
+     */
+    static int extractUmaId(JSONObject s) {
+        int id = s.optInt("card_id", 0);
+        if (id <= 0) {
+            JSONObject c = s.optJSONObject("chara");
+            if (c != null) id = c.optInt("card_id", 0);
+        }
+        return id > 0 ? id : DEFAULT_UMA_ID;
+    }
+
+    /**
+     * ★ v0.4.2：支援卡从快照动态提取并按黑板协议编码
+     * id = support_card_id × 10 + limit_break_count
+     * （"神团 30137 满破 301374"；SO 的 support_card_id 是短 id）。
+     * 不足 6 张时用 DEFAULT_CARDS 补齐。
+     */
+    static int[] extractCards(JSONObject s) {
+        int[] out = new int[6];
+        for (int i = 0; i < 6; i++) out[i] = DEFAULT_CARDS[i];
+        JSONArray sc = s.optJSONArray("support_cards");
+        if (sc != null) {
+            int seq = 0;
+            for (int i = 0; i < sc.length() && seq < 6; i++) {
+                JSONObject card = sc.optJSONObject(i);
+                if (card == null) continue;
+                int sid = card.optInt("support_card_id", 0);
+                if (sid <= 0) continue;
+                int lb = card.optInt("limit_break_count", 0);
+                out[seq++] = sid * 10 + Math.max(0, lb);
+            }
+        }
+        return out;
+    }
+
     private void initNativeSearch() {
         new Thread(() -> {
             if (UmaNativeBridge.init(this)) {
@@ -446,8 +507,13 @@ public final class FloatingWindowService extends Service implements HttpDataServ
 
         searchThread = new Thread(() -> {
             JSONObject snap = pendingSummary;
-            JSONObject result = snap == null ? null :
-                UmaNativeBridge.search(snap, DEFAULT_UMA_ID, DEFAULT_CARDS, 0);
+            JSONObject result = null;
+            if (snap != null) {
+                // v0.4.2: 马娘/配卡从快照动态提取（换皮 id 原值 + 卡 id 编码）
+                int umaId = extractUmaId(snap);
+                int[] cards = extractCards(snap);
+                result = UmaNativeBridge.search(snap, umaId, cards, 0);
+            }
             lastSearchResult = result;
             searchRunning = false;
             main.post(() -> {
