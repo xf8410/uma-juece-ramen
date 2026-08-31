@@ -5,7 +5,7 @@ on:
     inputs:
       version:
         description: '版本号 tag（如 v0.3.0）'
-        default: 'v0.3.0'
+        default: 'v0.4.0'
         type: string
       notes:
         description: '发布说明（留空用默认）'
@@ -121,21 +121,28 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$VERSION" "$GITHUB_SHA"
+          git tag -a "$VERSION" -m "release ${VERSION}" "$GITHUB_SHA"
           git push origin "refs/tags/$VERSION"
           NOTES="${{ inputs.notes }}"
           if [ -z "$NOTES" ]; then
             NOTES=$(cat <<'EOF'
-          ## 拉面杯决策浮窗 v0.3.0
+          ## 拉面杯决策浮窗 v0.4.0
 
-          - 直读 hlpatch turn（游戏 UI 第N回合），AI 内部 0-based 自动转换，浮窗显示双口径 `第N回合 直读(AI:M)`
-          - 决策理由（候选差值）+ 训练兜底 + 训练明细并列显示，对齐 PC 黑板
-          - 候选评分复用 last_breakdown，删除二次搜索，4096 次模拟耗时约减半
-          - TrainingEvaluator 兼容 chara 格式实况数据（低体力休息 / 低干劲外出保护恢复）
-          - 直读回合时不再出现"估算年份"警告
+          ### ★ 三路直读注入（模拟盘面与实况对齐）
+          - **羁绊**: `support_cards[].kizuna` / `trainings[].partners[].current_bond`（后者优先）→ `person.friendship`，按 card_id 精确匹配，替掉重放近似
+          - **训练等级**: `training_levels[].level` → `base.train_level_count[idx]`（count = (level-1)*4）
+          - **角标**: `ramen.command_feelings[].feeling_id` → `ramen.train_feeling_type[5]`（1/2/3 → A/B/C）
+          - 字段缺失自动跳过，旧版 hlpatch 行为不变；command_id 兼容 101-105 / 601-605 两套区间
+
+          ### ★ 阶段判定修正
+          - 行动画面（trainings 在场）= 面已选完 → 主决策改为训练建议（旧版错误推荐吃面）
+          - trainings 空 → 按回合区间给吃面建议
+
+          ### 沿用
+          - 断线重连重放 + 直读人头注入 + 推荐策略 rollout（上游 eeae510b）
+          - 要求 hlpatch v3.27.24+（support_cards / training_levels / command_feelings 字段；旧版自动回退）
 
           安装：与通用版同 applicationId（com.umaai.assistant），直接覆盖安装。
-          要求：hlpatch v3.27.17+（拉面杯直读 turn）；旧版也能跑，回退 month/half 推导并带 ⚠ 警告。
           EOF
           )
           fi

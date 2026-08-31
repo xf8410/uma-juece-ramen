@@ -27,6 +27,21 @@
 //! 选风味错位的面。本层把 trainings 解析为 [`ObservedTraining`]，
 //! 由 `inject_state` 之后的人头注入（lib.rs `apply_observed_distribution`）
 //! 搬移可动人员，使模拟分布与实况一致。
+//!
+//! # v0.4.0 直读注入（PR #22）
+//!
+//! 在 v0.3.2 人头注入之外，本层进一步解析三类可直接观测、且重放近似误差大的
+//! 状态，由 `inject_state` 之后消费（详见 lib.rs）：
+//! - 羁绊：`support_cards[].kizuna` 与 `trainings[].partners[].current_bond`
+//!   （后者是训练画面实时累计真值，优先），按 `card_id` 匹配人头写入
+//!   `person.friendship`，替掉 fast_forward 的重放近似。
+//! - 训练等级：`training_levels[].{command_id, level}` → `base.train_level_count[idx]`
+//!   （公式 train_level = count/4 + 1，故 count = (level-1)*4）。
+//! - 角标：`ramen.command_feelings[].{command_id, feeling_id}` →
+//!   `ramen.train_feeling_type[5]`（feeling_id 1/2/3 → A/B/C）。
+//! 全部按"字段缺失则跳过、保留重放近似"处理，保证旧版 hlpatch 行为不变。
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +77,12 @@ pub struct HlpatchSummary {
     pub ramen: Option<HlpatchRamen>,
     #[serde(default)]
     pub trainings: Vec<serde_json::Value>,
+    /// 支援卡列表（v0.4.0 羁绊注入用）
+    #[serde(default)]
+    pub support_cards: Vec<HlpatchSupportCard>,
+    /// 训练等级列表（v0.4.0 等级注入用）
+    #[serde(default)]
+    pub training_levels: Vec<HlpatchTrainingLevel>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -129,6 +150,73 @@ pub struct HlpatchRamen {
     /// 地区 ID（1-based）
     #[serde(default)]
     pub selected_region_ids: Vec<i32>,
+    /// 角标 A/B/C（feeling_id 1/2/3），每训练一个（v0.4.0 角标注入用）
+    #[serde(default)]
+    pub command_feelings: Vec<HlpatchCommandFeeling>,
+}
+
+/// hlpatch 支援卡（v0.4.0 羁绊注入用）。
+///
+/// `support_card_id` 与游戏内 `BasePerson.card_id` 同义（卡 id，如 302424）。
+/// 非支援卡人头（理事长/记者/NPC）在 hlpatch 侧无此结构，故 kizuna 只覆盖支援卡。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HlpatchSupportCard {
+    #[serde(default)]
+    pub position: i32,
+    #[serde(default)]
+    pub support_card_id: Option<u32>,
+    #[serde(default)]
+    pub limit_break_count: i32,
+    /// 该卡当前羁绊（累计真值）
+    #[serde(default)]
+    pub kizuna: i32,
+    #[serde(default)]
+    pub rental_type: i32,
+}
+
+/// hlpatch 训练等级（v0.4.0 等级注入用）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HlpatchTrainingLevel {
+    #[serde(default)]
+    pub command_id: i64,
+    /// 训练等级 1..=5
+    #[serde(default)]
+    pub level: i32,
+}
+
+/// hlpatch 角标（v0.4.0 角标注入用）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HlpatchCommandFeeling {
+    #[serde(default)]
+    pub command_id: i64,
+    /// 1=A / 2=B / 3=C
+    #[serde(default)]
+    pub feeling_id: i32,
+}
+
+/// hlpatch 训练伙伴（trainings[].partners[]，v0.4.0 精确羁绊注入用）。
+///
+/// 只取 `support_card_id` 与 `current_bond` 两项；其余字段（阈值/类型/彩圈）
+/// 暂不使用，保留结构以便后续扩展。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HlpatchPartner {
+    #[serde(default)]
+    pub partner_id: i64,
+    #[serde(default)]
+    pub support_card_id: Option<u32>,
+    /// 该伙伴当前羁绊（累计真值，优先于 kizuna）
+    #[serde(default)]
+    pub current_bond: i32,
+    #[serde(default)]
+    pub is_shining: bool,
+    #[serde(default)]
+    pub support_card_type: i32,
+    #[serde(default)]
+    pub partner_type: i32,
+    #[serde(default)]
+    pub is_tips_event: bool,
+    #[serde(default)]
+    pub name: String,
 }
 
 // ── 校正后的状态 ────────────────────────────────────────────────────
@@ -150,6 +238,12 @@ pub struct ReconciledState {
     pub confidence: Confidence,
     /// 直读训练观测（v0.3.2 人头注入用；非行动画面为空）
     pub observed_trainings: Vec<ObservedTraining>,
+    /// 支援卡羁绊注入：[(card_id, bond)]，已按 current_bond 优先合并（v0.4.0）
+    pub support_bonds: Vec<(u32, i32)>,
+    /// 训练等级注入：[(train_idx, level)]，level∈1..=5（v0.4.0）
+    pub training_levels: Vec<(usize, i32)>,
+    /// 角标注入：[(train_idx, feeling_id)]，feeling_id∈1..=3（v0.4.0）
+    pub feeling_types: Vec<(usize, i32)>,
 }
 
 /// hlpatch 行动画面 `trainings[]` 的观测条目（v0.3.2 人头注入用）。
@@ -222,7 +316,8 @@ impl ReconciledState {
 /// 6. acquisition_gauges 解析：对象数组 → [i32; 3]
 /// 7. 地区 ID 校验：1-based → 0-based
 /// 8. 直读训练观测解析（v0.3.2）
-/// 9. 置信度评估
+/// 9. v0.4.0 注入数据解析：羁绊 / 训练等级 / 角标
+/// 10. 置信度评估
 pub fn reconcile(raw: &HlpatchSummary) -> Result<ReconciledState, String> {
     let mut warnings = Vec::new();
 
@@ -285,6 +380,16 @@ pub fn reconcile(raw: &HlpatchSummary) -> Result<ReconciledState, String> {
     //     不值得为它压低置信度/刷警告）
     let observed_trainings = parse_observed_trainings(&raw.trainings);
 
+    // ⑤c v0.4.0 注入数据解析：羁绊 / 训练等级 / 角标
+    let support_bonds = parse_support_bonds(&raw.support_cards, &raw.trainings);
+    let training_levels = parse_training_levels(&raw.training_levels);
+    let feeling_types = parse_command_feelings(
+        raw.ramen
+            .as_ref()
+            .map(|r| r.command_feelings.as_slice())
+            .unwrap_or(&[]),
+    );
+
     // ⑥ 置信度评估
     let warning_count = warnings.len();
     let confidence = if turn_confidence == TurnConfidence::Reject {
@@ -305,6 +410,9 @@ pub fn reconcile(raw: &HlpatchSummary) -> Result<ReconciledState, String> {
         warnings,
         confidence,
         observed_trainings,
+        support_bonds,
+        training_levels,
+        feeling_types,
     })
 }
 
@@ -320,8 +428,7 @@ fn parse_observed_trainings(raw: &[serde_json::Value]) -> Vec<ObservedTraining> 
         let train_index = item
             .get("command_id")
             .and_then(|v| v.as_i64())
-            .filter(|id| (101..=105).contains(id))
-            .map(|id| (id - 101) as usize)
+            .and_then(command_id_to_train_idx)
             .or_else(|| {
                 item.get("name")
                     .and_then(|v| v.as_str())
@@ -346,6 +453,83 @@ fn parse_observed_trainings(raw: &[serde_json::Value]) -> Vec<ObservedTraining> 
     out
 }
 
+/// hlpatch command_id → 上游训练下标（0=速 1=耐 2=力 3=根 4=智）。
+///
+/// 兼容两套 command_id 区间：
+/// - `101..=105`（行动画面 `trainings[].command_id` 标准区间）
+/// - `601..=605`（部分 /summary 字段使用的区间，如 `training_levels`）
+///
+/// 106（技巧）与未知 id 无对应训练槽，返回 `None`。
+pub fn command_id_to_train_idx(cmd: i64) -> Option<usize> {
+    match cmd {
+        101..=105 => Some((cmd - 101) as usize),
+        601..=605 => Some((cmd - 601) as usize),
+        _ => None,
+    }
+}
+
+/// 解析支援卡羁绊（kizuna）与训练伙伴精确羁绊（current_bond），
+/// 合并为 `card_id → bond`。`current_bond` 优先（训练画面实时累计真值）。
+///
+/// 仅覆盖有 `support_card_id` 的人头（支援卡/友人卡）；理事长/记者/NPC
+/// 在 hlpatch 侧无对应结构，保留重放近似。
+fn parse_support_bonds(
+    support_cards: &[HlpatchSupportCard],
+    trainings: &[serde_json::Value],
+) -> Vec<(u32, i32)> {
+    let mut map: HashMap<u32, i32> = HashMap::new();
+
+    // 1) 支援卡静态羁绊（kizuna）：仅当尚无更精确的 current_bond 时记录
+    for sc in support_cards {
+        if let Some(id) = sc.support_card_id {
+            map.entry(id).or_insert_with(|| sc.kizuna.clamp(0, 100));
+        }
+    }
+
+    // 2) 训练伙伴精确羁绊（current_bond）覆盖
+    for tr in trainings {
+        if let Some(partners) = tr.get("partners").and_then(|p| p.as_array()) {
+            for p in partners {
+                let id = p
+                    .get("support_card_id")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+                let bond = p
+                    .get("current_bond")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32;
+                if let Some(id) = id {
+                    map.insert(id, bond.clamp(0, 100));
+                }
+            }
+        }
+    }
+
+    map.into_iter().collect()
+}
+
+/// 解析训练等级（training_levels[]）为 (train_idx, level)。
+fn parse_training_levels(raw: &[HlpatchTrainingLevel]) -> Vec<(usize, i32)> {
+    let mut out = Vec::new();
+    for tl in raw {
+        if let Some(idx) = command_id_to_train_idx(tl.command_id) {
+            out.push((idx, tl.level.clamp(1, 5)));
+        }
+    }
+    out
+}
+
+/// 解析角标（command_feelings[]）为 (train_idx, feeling_id)。
+fn parse_command_feelings(raw: &[HlpatchCommandFeeling]) -> Vec<(usize, i32)> {
+    let mut out = Vec::new();
+    for cf in raw {
+        if let Some(idx) = command_id_to_train_idx(cf.command_id) {
+            out.push((idx, cf.feeling_id.clamp(0, 3)));
+        }
+    }
+    out
+}
+
 // ── 回合推导 ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -354,7 +538,7 @@ enum TurnConfidence {
     Direct,
     /// 从 month+half+year 推导
     Derived,
-    /// 从属性总量粗估年份后推导
+    /// 从属性总量估算年份后推导
     Estimated,
     /// 无法确定
     Reject,
@@ -756,6 +940,10 @@ mod tests {
         assert_eq!(state.stats.motivation, 5);
         assert!(!state.ramen.has_region_data);
         assert!(state.observed_trainings.is_empty(), "无 trainings → 观测为空");
+        // v0.4.0 新增字段默认空（旧样本无这些结构）
+        assert!(state.support_bonds.is_empty());
+        assert!(state.training_levels.is_empty());
+        assert!(state.feeling_types.is_empty());
     }
 
     /// hlpatch 直读 turn：1-based（与游戏 UI「第N回合」一致），无 warning、High 置信。
@@ -915,5 +1103,95 @@ mod tests {
 
         assert_eq!(state.ramen.feeling_slot, [3, 5, 1]);
         assert_eq!(state.ramen.feeling_slot_source, "int_array");
+    }
+
+    // ── v0.4.0 注入数据解析测试 ──────────────────────────────────────
+
+    #[test]
+    fn test_command_id_to_train_idx() {
+        // 标准区间 101..=105
+        assert_eq!(command_id_to_train_idx(101), Some(0));
+        assert_eq!(command_id_to_train_idx(102), Some(1));
+        assert_eq!(command_id_to_train_idx(103), Some(2));
+        assert_eq!(command_id_to_train_idx(104), Some(3));
+        assert_eq!(command_id_to_train_idx(105), Some(4));
+        // 6xx 区间（training_levels 等字段使用）
+        assert_eq!(command_id_to_train_idx(601), Some(0));
+        assert_eq!(command_id_to_train_idx(605), Some(4));
+        // 技巧 106 / 未知 → None
+        assert_eq!(command_id_to_train_idx(106), None);
+        assert_eq!(command_id_to_train_idx(999), None);
+    }
+
+    #[test]
+    fn test_parse_support_bonds_kizuna_and_current_bond() {
+        let json = r#"{
+            "turn": 10,
+            "chara": {"scenario_id": 14, "speed": 100},
+            "support_cards": [
+                {"support_card_id": 302424, "kizuna": 70},
+                {"support_card_id": 302894, "kizuna": 40}
+            ],
+            "trainings": [
+                {"command_id": 101, "heads": 2, "partners": [
+                    {"support_card_id": 302424, "current_bond": 85},
+                    {"support_card_id": 302894, "current_bond": 55}
+                ]}
+            ]
+        }"#;
+        let raw: HlpatchSummary = serde_json::from_str(json).unwrap();
+        let state = reconcile(&raw).unwrap();
+        // current_bond 优先于 kizuna：302424 → 85（非 70），302894 → 55（非 40）
+        assert_eq!(state.support_bonds.len(), 2);
+        let mut map: std::collections::HashMap<u32, i32> = state.support_bonds.iter().cloned().collect();
+        assert_eq!(map.get(&302424), Some(&85));
+        assert_eq!(map.get(&302894), Some(&55));
+    }
+
+    #[test]
+    fn test_parse_training_levels_and_feelings() {
+        let json = r#"{
+            "turn": 10,
+            "chara": {"scenario_id": 14, "speed": 100},
+            "training_levels": [
+                {"command_id": 101, "level": 3},
+                {"command_id": 103, "level": 5},
+                {"command_id": 601, "level": 2}
+            ],
+            "ramen": {
+                "command_feelings": [
+                    {"command_id": 102, "feeling_id": 1},
+                    {"command_id": 104, "feeling_id": 2},
+                    {"command_id": 105, "feeling_id": 3}
+                ]
+            }
+        }"#;
+        let raw: HlpatchSummary = serde_json::from_str(json).unwrap();
+        let state = reconcile(&raw).unwrap();
+        // training_levels: 101→0(L3), 103→2(L5), 601→0(L2)；同一下标取最后解析值
+        let tl: std::collections::HashMap<usize, i32> =
+            state.training_levels.iter().cloned().collect();
+        assert_eq!(tl.get(&2), Some(&5));
+        // feeling_types: 102→1(A), 104→3(B), 105→4(C)
+        let ft: std::collections::HashMap<usize, i32> =
+            state.feeling_types.iter().cloned().collect();
+        assert_eq!(ft.get(&1), Some(&1));
+        assert_eq!(ft.get(&3), Some(&2));
+        assert_eq!(ft.get(&4), Some(&3));
+    }
+
+    #[test]
+    fn test_injection_data_absent_is_empty() {
+        // 旧版 hlpatch 样本（无 support_cards / training_levels / command_feelings）
+        let json = r#"{
+            "scenario": "Ramen",
+            "turn": 10,
+            "chara": {"scenario_id": 14, "speed": 100, "vital": 50, "max_vital": 100}
+        }"#;
+        let raw: HlpatchSummary = serde_json::from_str(json).unwrap();
+        let state = reconcile(&raw).unwrap();
+        assert!(state.support_bonds.is_empty());
+        assert!(state.training_levels.is_empty());
+        assert!(state.feeling_types.is_empty());
     }
 }
