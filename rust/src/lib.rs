@@ -55,25 +55,27 @@
 //!   ramen.train_feeling_type，替掉 fast_forward 的重放近似。仅消费上游公开
 //!   字段，不改上游。
 //!
-//! v0.4.1（开局第1回合 panic 修复 + CI 测试真跑 + 重放人头归零修复）：
+//! v0.4.1（开局第1回合 panic 修复 + 重放人头归零定性 + 补建门控修正）：
 //! - ★ 实机首测复现：第1回合（内部0）必现 "panic during search"。根因是
 //!   fast_forward(0) 整段跳过，distribution 仍是 newgame 的空 vec（0 行），
 //!   而搜索路径（GameView / Train 阶段候选列举）按 5 行分布取人头 → 越界。
-//!   修复：`ensure_distribution_built` 在重放后分布行数不足时补跑
-//!   Begin+Distribute 建分布（不推进回合），任意回合生效
-//! - ★ fast_forward 的阶段失败此前被 `let _ =` 静默吞掉；现在把失败打到
-//!   stderr（cargo test 失败输出 / logcat 均可见），便于排障
-//! - ★ JNI catch_unwind 把 panic 载荷（String/&str）透出到浮窗错误里，
-//!   不再只显示 "panic during search"
+//!   修复：`ensure_distribution_built` 在重放后补跑 Begin+Distribute 建分布
+//! - ★ JNI catch_unwind 把 panic 载荷（String/&str）透出到浮窗错误里
 //! - ★ CI（build.yml rust-check）下载 gamedata——此前所有依赖 gamedata 的
 //!   测试被 `setup_gamedata()` 静默跳过，"CI 绿"不等于全链路真跑过
-//! - ★ 重放人头归零修复：CI gamedata 实证 fast_forward(31) 后分布 5 行全空
-//!   （人头 0）——分布权重含得意率（deyilv），得意率随羁绊变化，重放初始
-//!   羁绊全 0 → 权重归零 → 全员不落位。修复对齐上游 rng_consistency 的
-//!   `run_turns` 同款处理：set_rule_master 固定种子（逐位可复现）+
-//!   每回合 Distribute 前把人头羁绊锁满 100（真实羁绊随后由 inject_state
-//!   用 kizuna 覆盖）。重放结束清除 rule 流，不带入 MCTS 搜索
-//!   （上游已知问题：rule 流跨候选克隆共享）
+//! - ★ 重放人头归零定性（上游源码 + umaDB 实锤）：`Uma::is_race_turn` 按
+//!   每匹马 races 表判定（umaDB races 数组=内部回合号；102601 美浦波旁
+//!   races=[11,22,29,30,33,43,55,69,71]，内回合 29/30 连续两个生涯比赛回合），
+//!   `run_distribute` 在比赛回合走 `reset_distribution()`（5 空行 0 人头）。
+//!   重放退出点停在内回合 31 的 Begin——0 人头是模拟器**正确行为**，
+//!   此前测试断言「退出点人头>0」写错了（把比赛回合当 bug）
+//! - ★ 因此挖出真 bug 并修复：ensure 门控此前只看「行数<5」，比赛回合后
+//!   有 5 空行就不补跑 → **比赛回合之后的训练回合搜索盘面没有支援卡人头**
+//!   （比 0 行 panic 更隐蔽的质量 bug）。门控改为「行数<5 或 人头==0」，
+//!   补跑 Begin+Distribute 两步封顶（不误跑 RamenSelect 污染状态）
+//! - ★ 重放随机对齐上游 rng_consistency 姿势：set_rule_master 固定种子
+//!   （逐位可复现）+ 每回合 Distribute 前锁满人头羁绊（分布权重含得意率，
+//!   羁绊 0 → 全员不落位）+ 重放结束清除 rule 流（不带入 MCTS）
 
 pub mod ramen_strategy;
 pub mod reconcile;
@@ -166,6 +168,14 @@ pub struct DecisionOutput {
 
 // ── 断线重连（v0.3.1）───────────────────────────────────────────────
 
+/// 分布里的总人头数（person 下标 >= 0 的槽位数）。
+fn distribution_heads(game: &RamenGame) -> usize {
+    game.distribution()
+        .iter()
+        .map(|d| d.iter().filter(|&&p| p >= 0).count())
+        .sum()
+}
+
 /// 从第 0 回合重放模拟到目标回合（内部 0-based 回合数）。
 ///
 /// `inject_state` 只覆盖观测字段（五维/体力/拉面/回合），但训练分布、
@@ -180,25 +190,25 @@ pub struct DecisionOutput {
 /// 使用固定种子的 StdRng：同一快照多次重放结果一致（可复现、可对比）。
 /// 单个阶段失败不阻断重放（继续推进，尽力走到目标回合）。
 ///
-/// # v0.4.1b 重放人头修复（CI gamedata 实证）
+/// # v0.4.1b 重放随机对齐（上游 rng_consistency::run_turns 同款姿势）
 ///
-/// 分布权重含得意率（deyilv），得意率随羁绊变化——重放初始羁绊全 0 时
-/// 权重归零，**全员不落位**（31 回合重放后分布 5 行全 -1）。修复对齐上游
-/// `rng_consistency::run_turns` 同款处理：
 /// 1. `set_rule_master(REPLAY_RULE_MASTER)`——人头分布/角标/回合事件走
 ///    `(master, turn)` 固定流，逐位可复现；
-/// 2. 每回合 Distribute 前把人头羁绊锁满 100（真实羁绊随后由 inject_state
-///    用 hlpatch kizuna 覆盖，此处近似值无残留影响）；
+/// 2. 每回合 Distribute 前把人头羁绊锁满 100（分布权重含得意率，得意率
+///    随羁绊变化；羁绊 0 → 权重归零全员不落位；真实羁绊随后由
+///    inject_state 用 hlpatch kizuna 覆盖）；
 /// 3. 重放结束 `rule_master=None` + `reset_turn_streams()`——rule 流跨
-///    MCTS 候选克隆共享是上游已知问题，重放用完即弃，搜索阶段回退
-///    "调用方 rng" 行为。
+///    MCTS 候选克隆共享是上游已知问题，重放用完即弃。
 ///
-/// # 退出点语义
+/// # 退出点语义（v0.4.1b 定性：上游无 bug）
 ///
 /// 循环在 `game.turn()` 达到目标时退出——此时游戏停在**目标回合的
-/// Begin 阶段**（回合内阶段未执行），调用方必须用
-/// [`ensure_distribution_built`] 补跑 Begin+Distribute 建立本回合分布
-/// （run_search 已这样做）。
+/// Begin 阶段**，`distribution` 承载的是上一回合的落位。若上一回合
+/// 是该马娘的**生涯比赛回合**（上游 `is_race_turn` 按每匹马 races 表
+/// 判定，`run_distribute` 走 `reset_distribution()`），上一回合落位
+/// 就是 5 空行 0 人头——**这是模拟器正确行为**。调用方必须用
+/// [`ensure_distribution_built`] 补建本回合分布（run_search 已这样做，
+/// 其门控按「行数或人头」判断，比赛回合后的训练回合能正确补建）。
 ///
 /// 阶段失败不再静默——前 3 条错误打到 stderr。
 ///
@@ -252,30 +262,33 @@ fn fast_forward(game: &mut RamenGame, target_internal_turn: i32) -> usize {
 /// v0.4.1 修复「开局第1回合 panic during search」。
 ///
 /// 重放循环退出时游戏停在目标回合的 Begin 阶段（内部回合 0 时整段跳过
-/// 更是完全没跑），`distribution` 为空 vec（0 行）。而搜索路径
-/// （GameView / Train 阶段候选列举）按 5 行分布取人头——空分布直接越界
-/// panic（实机首测第1回合必现）。
+/// 更是完全没跑）。搜索路径（GameView / Train 阶段候选列举）按 5 行分布
+/// 取人头——空分布直接越界 panic（实机首测第1回合必现）。
 ///
-/// 这里从当前阶段继续推进，直到 Distribute 执行完、5 行分布建立：
-/// 不跨回合（最多兜 3 步）、不执行 RamenSelect 之后的决策（阶段指针
-/// 停在 RamenSelect，随后由 inject_state / run_search 按观测覆盖为
-/// Train/RamenSelect）；之后 `apply_observed_distribution` 会把人头重排
-/// 到与实况一致。
+/// # 门控（v0.4.1b 修正：看行数也看人头）
 ///
-/// 与 fast_forward 同款处理：set_rule_master 固定种子 + Distribute 前
-/// 锁满人头羁绊（否则权重归零全员不落位），结束即清除。
+/// - 行数 < 5：0 行分布，直接 panic 风险；
+/// - 行数 = 5 但人头 = 0：上一回合是生涯比赛回合（`reset_distribution`
+///   留下的空行），本回合（训练回合）的 Distribute 在重放里从未执行——
+///   不补跑的话搜索盘面没有支援卡人头，MCTS 对空盘面评估，且
+///   `apply_observed_distribution` 因可动成员为 0 而静默失效。
 ///
-/// 只在分布行数不足 5 时触发（重放退出点留有上一回合分布时零开销）；
-/// 返回实际执行的阶段数。
+/// 补跑从当前阶段继续：Begin → Distribute 两步封顶——正好覆盖"退出点在
+/// Begin"的补建需求；**不**执行 RamenSelect（避免污染 pending 状态）。
+/// 若补跑后仍无人头（本回合本身就是比赛回合），照常放行——比赛回合的
+/// 候选列举走 is_race_turn 短路（单"比赛"动作），不索引分布行。
+///
+/// 与 fast_forward 同款：set_rule_master 固定种子 + Distribute 前锁满
+/// 人头羁绊，结束即清除。返回实际执行的阶段数。
 fn ensure_distribution_built(game: &mut RamenGame) -> usize {
-    if game.distribution().len() >= 5 {
+    if game.distribution().len() >= 5 && distribution_heads(game) > 0 {
         return 0;
     }
     let trainer = RecommendedRamenTrainer::for_rollout();
     game.set_rule_master(REPLAY_RULE_MASTER);
     let mut rng = StdRng::seed_from_u64(0x5EED_2026);
     let mut steps = 0usize;
-    while game.distribution().len() < 5 && steps < 3 {
+    while (game.distribution().len() < 5 || distribution_heads(game) == 0) && steps < 2 {
         if game.stage == RamenStage::Distribute {
             for p in game.persons.iter_mut().take(6) {
                 p.friendship = 100;
@@ -289,9 +302,10 @@ fn ensure_distribution_built(game: &mut RamenGame) -> usize {
             break; // 游戏结束
         }
     }
-    if game.distribution().len() < 5 {
+    let heads = distribution_heads(game);
+    if game.distribution().len() < 5 || heads == 0 {
         eprintln!(
-            "ensure_distribution_built: 补跑 {steps} 阶段后分布仍不足 5 行（{} 行），继续但可能异常",
+            "ensure_distribution_built: 补跑 {steps} 阶段后 行数={} 人头={heads}（0 头多为本回合即生涯比赛回合，属正常）",
             game.distribution().len()
         );
     }
@@ -668,8 +682,9 @@ fn apply_observed_distribution(
 /// 1. reconcile hlpatch JSON → ReconciledState
 /// 2. 如果 confidence = Reject，返回错误
 /// 3. newgame → fast_forward（重放重建）→ ensure_distribution_built（v0.4.1，
-///    重放退出点停在 Begin，补跑 Begin+Distribute 建立本回合分布）
-///    → inject_state（覆盖观测值）→ apply_observed_distribution（直读人头注入）
+///    重放退出点停在 Begin、上一回合比赛回合时人头为 0，按「行数或人头」
+///    补跑 Begin+Distribute 建立本回合分布）→ inject_state（覆盖观测值）
+///    → apply_observed_distribution（直读人头注入）
 /// 4. 阶段判定（v0.4.0）：trainings 在场 = 行动画面 = 面已选完 → Train，
 ///    主决策即训练建议；trainings 空 → 按回合区间（RamenSelect 等）
 /// 5. 用上游 `RamenMctsTrainer` 搜索当前决策点
@@ -773,8 +788,9 @@ pub fn run_search(
         replay_steps
     );
 
-    // ★ v0.4.1：重放退出点停在目标回合 Begin（分布空 vec）——搜索路径按
-    //   5 行分布取人头会越界 panic（实机首测第1回合必现）。补跑
+    // ★ v0.4.1：重放退出点停在目标回合 Begin（上一回合是比赛回合时人头为
+    //   0）——搜索路径按 5 行分布取人头，0 行会越界 panic（实机首测第1回合
+    //   必现），5 行 0 头会让 MCTS 对空盘面评估。按「行数或人头」补跑
     //   Begin+Distribute 建立本回合分布后再继续。
     let built_steps = ensure_distribution_built(&mut game);
     if built_steps > 0 {
@@ -1199,7 +1215,8 @@ mod jni_exports {
             "turn_convention": "hlpatch UI 1-based -> AI internal 0-based (turn-1); upstream displays turn()+1",
             "candidate_scores": "last_breakdown_reuse",
             "pr22_direct_injection": "friendship/train_level_count/train_feeling_type from hlpatch",
-            "turn0_distribution_fix": "ensure_distribution_built after replay (exit at Begin, rows empty)",
+            "turn0_distribution_fix": "ensure_distribution_built after replay (exit at Begin)",
+            "race_turn_board_fix": "ensure gate checks rows AND heads (race turn leaves 5 empty rows)",
             "replay_heads_fix": "rule_master seed + friendship=100 before Distribute (deyilv weight)"
         })
         .to_string();
@@ -1271,17 +1288,22 @@ mod tests {
         }
     }
 
-    /// ★ v0.3.1 断线重连核心：重放后回合到位、训练分布可重建。
+    /// ★ v0.3.1 断线重连核心：重放后回合到位、固定种子可复现、rule 流清除。
     ///
-    /// v0.4.1 语义修正：重放循环退出点在目标回合的 **Begin**（回合内阶段
-    /// 未执行），此时 distribution 承载的是上一回合的落位。
-    /// run_search 的真实流程是 fast_forward → ensure_distribution_built
-    /// 补建本回合分布——本测试按同一顺序断言，守住「搜索前置状态必须
-    /// 有非空分布」这条不变量（没有它，搜索路径按 5 行分布索引会越界
-    /// panic，即实机首测第1回合的 panic during search）。
+    /// v0.4.1b 定性（上游源码 + umaDB 实锤）：
+    /// - `Uma::is_race_turn` 按每匹马 races 表判定；102601（美浦波旁）
+    ///   races=[11,22,29,30,33,43,55,69,71]——**内回合 29/30 连续两个生涯
+    ///   比赛回合**，`run_distribute` 走 `reset_distribution()`（5 空行）。
+    /// - 重放退出点停在内回合 31 的 Begin，承载的是内 30（比赛回合）的
+    ///   空分布——退出点 0 人头是**模拟器正确行为**，不是 bug。
     ///
-    /// v0.4.1b：重放内部 set_rule_master + Distribute 前锁满人头羁绊
-    /// （分布权重含得意率，羁绊 0 → 全员不落位，CI gamedata 实证）。
+    /// 本测试守住的真不变量：
+    /// 1. 回合到位、可复现；
+    /// 2. 退出点保留 5 行（比赛回合 reset 的空行，正是 0 行 panic 的反面）；
+    /// 3. ★ ensure 补建门控按「行数或人头」：内 31 是训练回合，补跑
+    ///    Begin+Distribute 后必须有人头（这是比赛回合后训练回合搜索
+    ///    盘面有人头的保障，v0.4.1b 修正的真 bug）；
+    /// 4. rule 流已清除（不带入 MCTS）。
     #[test]
     fn test_fast_forward_rebuilds_distribution() {
         if !setup_gamedata() {
@@ -1297,42 +1319,40 @@ mod tests {
             RamenGame::newgame(102601, &[302424, 302894, 303044, 302924, 303024, 303054], inherit.clone())
                 .expect("newgame 失败");
 
-        // 重放前：分布为空
-        let heads_before: usize = game
-            .distribution()
-            .iter()
-            .map(|d| d.iter().filter(|&&p| p >= 0).count())
-            .sum();
-
         let steps = fast_forward(&mut game, 31);
 
         assert!(steps > 0, "应至少重放一个阶段");
         assert_eq!(game.turn(), 31, "重放后应到达目标回合");
-
-        // v0.4.1b: 重放内已修人头归零——退出点（Begin）应承载上一回合落位
-        let heads_at_exit: usize = game
-            .distribution()
-            .iter()
-            .map(|d| d.iter().filter(|&&p| p >= 0).count())
-            .sum();
-        eprintln!(
-            "重放后（退出点={steps}阶段）分布行数={} 人头数={heads_at_exit}（重放前={heads_before}）",
-            game.distribution().len()
+        assert!(
+            game.rule_master.is_none(),
+            "重放结束应清除 rule 流（不带入 MCTS）"
         );
 
-        // ★ 与 run_search 相同：分布行数不足时补跑 Begin+Distribute
-        let built = ensure_distribution_built(&mut game);
-        eprintln!("ensure_distribution_built 补跑 {built} 阶段");
+        // 退出点：内 30 是比赛回合 → reset 留 5 空行 0 头（模拟器正确行为）
+        assert_eq!(
+            game.distribution().len(),
+            5,
+            "比赛回合 reset 后应保留 5 行分布"
+        );
+        let heads_at_exit = distribution_heads(&game);
+        eprintln!(
+            "重放退出点(内31 Begin): 行数=5 人头数={heads_at_exit}（0=内30比赛回合正常现象）"
+        );
 
-        let heads_after: usize = game
-            .distribution()
-            .iter()
-            .map(|d| d.iter().filter(|&&p| p >= 0).count())
-            .sum();
+        // ★ ensure 补建：门控按「行数或人头」，内 31 训练回合 → 补跑后有人头
+        let built = ensure_distribution_built(&mut game);
+        assert!(
+            built > 0,
+            "比赛回合后的训练回合应触发补建（门控=行数或人头不足）"
+        );
+        let heads_after = distribution_heads(&game);
         assert!(
             heads_after > 0,
-            "补建后训练分布应有人头（重放退出时={heads_at_exit}，行数={}）",
+            "训练回合补建后应有人头（实际={heads_after}，行数={}）",
             game.distribution().len()
+        );
+        eprintln!(
+            "ensure 补跑 {built} 阶段 → 人头数 {heads_at_exit} → {heads_after}"
         );
 
         // 固定种子：重放可复现
@@ -1345,6 +1365,35 @@ mod tests {
         assert_eq!(
             game.uma().five_status, game2.uma().five_status,
             "固定种子下重放结果应一致"
+        );
+    }
+
+    /// 开局第1回合（内部0）：fast_forward 整段跳过（0 行分布），
+    /// ensure 补跑 Begin+Distribute 后应有人头——守住第1回合 panic 不复发
+    #[test]
+    fn test_turn0_replay_skipped_then_ensure_builds() {
+        if !setup_gamedata() {
+            return;
+        }
+
+        let inherit = InheritInfo {
+            blue_count: [15, 3, 0, 0, 0],
+            extra_count: [0, 30, 0, 0, 30, 30],
+            ..Default::default()
+        };
+        let mut game =
+            RamenGame::newgame(102601, &[302424, 302894, 303044, 302924, 303024, 303054], inherit)
+                .expect("newgame 失败");
+
+        let steps = fast_forward(&mut game, 0);
+        assert_eq!(steps, 0, "内部回合 0 重放应整段跳过");
+        assert_eq!(game.distribution().len(), 0, "跳过时分布应为空 vec（0 行）");
+
+        let built = ensure_distribution_built(&mut game);
+        assert!(built > 0, "0 行分布应触发补建");
+        assert!(
+            distribution_heads(&game) > 0,
+            "第1回合（训练回合）补建后应有人头"
         );
     }
 
