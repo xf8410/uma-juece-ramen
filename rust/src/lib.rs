@@ -973,7 +973,7 @@ mod jni_exports {
             if let Err(e) = std::env::set_current_dir(&dir) {
                 let msg = format!("set_current_dir({dir}) 失败: {e}");
                 log::error!("{msg}");
-                format!(r#"{"ok":false,"error":"{}"}"#, msg.replace('"', "'"))
+                format!(r#"{{"ok":false,"error":"{}"}}"#, msg.replace('"', "'"))
             } else {
                 match init_global() {
                     Ok(()) => {
@@ -983,7 +983,7 @@ mod jni_exports {
                     }
                     Err(e) => {
                         log::error!("init_global 失败: {e}");
-                        format!(r#"{"ok":false,"error":"{}"}"#, e.to_string().replace('"', "'"))
+                        format!(r#"{{"ok":false,"error":"{}"}}"#, e.to_string().replace('"', "'"))
                     }
                 }
             }
