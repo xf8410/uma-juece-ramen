@@ -55,18 +55,18 @@
 //!   ramen.train_feeling_type，替掉 fast_forward 的重放近似。仅消费上游公开
 //!   字段，不改上游。
 //!
-//! v0.4.1（开局第1回合 panic 修复）：
+//! v0.4.1（开局第1回合 panic 修复 + CI 测试真跑）：
 //! - ★ 实机首测复现：第1回合（内部0）必现 "panic during search"。根因是
 //!   fast_forward(0) 整段跳过，distribution 仍是 newgame 的空 vec（0 行），
-//!   而 Train 阶段的候选列举按 5 行分布取人头 → 越界。修复：
-//!   `ensure_distribution_built` 在内部回合 0 补跑 Begin+Distribute 两阶段
-//!   建分布（不推进回合），随后 inject_state 覆盖观测字段、
-//!   apply_observed_distribution 按实况人头重排
-//! - ★ fast_forward 的阶段失败此前被 `let _ =` 静默吞掉（turn 能推进但
-//!   distribution 全空正是这条静默路径的产物）；现在把失败打到 stderr
-//!   （cargo test 失败输出 / logcat 均可见），便于排障
+//!   而搜索路径（GameView / Train 阶段候选列举）按 5 行分布取人头 → 越界。
+//!   修复：`ensure_distribution_built` 在重放后分布行数不足时补跑
+//!   Begin+Distribute 建分布（不推进回合），任意回合生效
+//! - ★ fast_forward 的阶段失败此前被 `let _ =` 静默吞掉；现在把失败打到
+//!   stderr（cargo test 失败输出 / logcat 均可见），便于排障
 //! - ★ JNI catch_unwind 把 panic 载荷（String/&str）透出到浮窗错误里，
 //!   不再只显示 "panic during search"
+//! - ★ CI（build.yml rust-check）下载 gamedata——此前所有依赖 gamedata 的
+//!   测试被 `setup_gamedata()` 静默跳过，"CI 绿"不等于全链路真跑过
 
 pub mod ramen_strategy;
 pub mod reconcile;
@@ -168,9 +168,16 @@ pub struct DecisionOutput {
 /// 使用固定种子的 StdRng：同一快照多次重放结果一致（可复现、可对比）。
 /// 单个阶段失败不阻断重放（继续推进，尽力走到目标回合）。
 ///
+/// # 退出点语义（v0.4.1 实测确认）
+///
+/// 循环在 `game.turn()` 达到目标时退出——此时游戏停在**目标回合的
+/// Begin 阶段**（回合内阶段未执行），`distribution` 为空是正常现象
+/// （CI gamedata 测试实证：turn==31 但分布 0 行）。调用方必须用
+/// [`ensure_distribution_built`] 补跑 Begin+Distribute 建立本回合分布
+/// （run_search 已这样做）。
+///
 /// v0.4.1：阶段失败不再静默——前 3 条错误打到 stderr（cargo test 失败
-/// 输出与 logcat 均可见）。CI gamedata 测试实证：turn 能推进但
-/// distribution 全空，正是这条静默路径掩盖了真实错误。
+/// 输出与 logcat 均可见）。
 ///
 /// 返回实际执行的阶段数（诊断用）。
 fn fast_forward(game: &mut RamenGame, target_internal_turn: i32) -> usize {
@@ -208,32 +215,40 @@ fn fast_forward(game: &mut RamenGame, target_internal_turn: i32) -> usize {
 
 /// v0.4.1 修复「开局第1回合 panic during search」。
 ///
-/// 内部回合 0（UI 第1回合）时 `fast_forward(0)` 整段跳过，`distribution`
-/// 仍是 `newgame` 的空 vec（0 行）。而 Train 阶段的候选列举按 5 行分布
-/// 取人头——空分布直接越界 panic。
+/// 重放循环退出时游戏停在目标回合的 Begin 阶段（内部回合 0 时整段跳过
+/// 更是完全没跑），`distribution` 为空 vec（0 行）。而搜索路径
+/// （GameView / Train 阶段候选列举）按 5 行分布取人头——空分布直接越界
+/// panic（实机首测第1回合必现）。
 ///
-/// 这里补跑 Begin + Distribute 两个阶段把 5 行分布建起来：不推进回合、
-/// 不执行 RamenSelect（阶段指针停在 RamenSelect，随后由 inject_state /
-/// run_search 按观测覆盖为 Train/RamenSelect）；之后
-/// `apply_observed_distribution` 会把人头重排到与实况一致。
+/// 这里从当前阶段继续推进，直到 Distribute 执行完、5 行分布建立：
+/// 不跨回合（最多兜 3 步）、不执行 RamenSelect 之后的决策（阶段指针
+/// 停在 RamenSelect，随后由 inject_state / run_search 按观测覆盖为
+/// Train/RamenSelect）；之后 `apply_observed_distribution` 会把人头重排
+/// 到与实况一致。
 ///
-/// 只在内部回合 0 且分布行数不足时触发；返回实际执行的阶段数。
+/// 只在分布行数不足 5 时触发（重放退出点正常留有上一回合分布时零开销）；
+/// 返回实际执行的阶段数。
 fn ensure_distribution_built(game: &mut RamenGame) -> usize {
-    if game.turn() != 0 || game.distribution().len() >= 5 {
+    if game.distribution().len() >= 5 {
         return 0;
     }
     let trainer = RecommendedRamenTrainer::for_rollout();
     let mut rng = StdRng::seed_from_u64(0x5EED_2026);
     let mut steps = 0usize;
-    if let Err(e) = game.run_stage(&trainer, &mut rng) {
-        eprintln!("ensure_distribution_built: Begin 失败: {e}");
-    }
-    steps += 1;
-    if game.next() {
+    while game.distribution().len() < 5 && steps < 3 {
         if let Err(e) = game.run_stage(&trainer, &mut rng) {
-            eprintln!("ensure_distribution_built: Distribute 失败: {e}");
+            eprintln!("ensure_distribution_built: {:?} 失败: {e}", game.stage);
         }
         steps += 1;
+        if !game.next() {
+            break; // 游戏结束
+        }
+    }
+    if game.distribution().len() < 5 {
+        eprintln!(
+            "ensure_distribution_built: 补跑 {steps} 阶段后分布仍不足 5 行（{} 行），继续但可能异常",
+            game.distribution().len()
+        );
     }
     steps
 }
@@ -606,8 +621,8 @@ fn apply_observed_distribution(
 /// 1. reconcile hlpatch JSON → ReconciledState
 /// 2. 如果 confidence = Reject，返回错误
 /// 3. newgame → fast_forward（重放重建）→ ensure_distribution_built（v0.4.1，
-///    内部回合 0 补建分布）→ inject_state（覆盖观测值）
-///    → apply_observed_distribution（直读人头注入，v0.3.2）
+///    重放退出点停在 Begin，补跑 Begin+Distribute 建立本回合分布）
+///    → inject_state（覆盖观测值）→ apply_observed_distribution（直读人头注入）
 /// 4. 阶段判定（v0.4.0）：trainings 在场 = 行动画面 = 面已选完 → Train，
 ///    主决策即训练建议；trainings 空 → 按回合区间（RamenSelect 等）
 /// 5. 用上游 `RamenMctsTrainer` 搜索当前决策点
@@ -711,13 +726,13 @@ pub fn run_search(
         replay_steps
     );
 
-    // ★ v0.4.1：开局第1回合（内部0）重放整段跳过，分布仍是空 vec——
-    //   Train 阶段按 5 行分布索引会越界 panic（实机首测复现）。
-    //   补跑 Begin+Distribute 建分布后再继续。
+    // ★ v0.4.1：重放退出点停在目标回合 Begin（分布空 vec）——搜索路径按
+    //   5 行分布取人头会越界 panic（实机首测第1回合必现）。补跑
+    //   Begin+Distribute 建立本回合分布后再继续。
     let built_steps = ensure_distribution_built(&mut game);
     if built_steps > 0 {
         log::info!(
-            "ensure_distribution_built: {built_steps} stages (turn-0 replay skipped)"
+            "ensure_distribution_built: {built_steps} stages (replay exit at Begin)"
         );
     }
 
@@ -1137,7 +1152,7 @@ mod jni_exports {
             "turn_convention": "hlpatch UI 1-based -> AI internal 0-based (turn-1); upstream displays turn()+1",
             "candidate_scores": "last_breakdown_reuse",
             "pr22_direct_injection": "friendship/train_level_count/train_feeling_type from hlpatch",
-            "turn0_distribution_fix": "ensure_distribution_built runs Begin+Distribute when replay skipped"
+            "turn0_distribution_fix": "ensure_distribution_built after replay (exit at Begin, rows empty)"
         })
         .to_string();
         jstring_from_str(&mut env, &v)
@@ -1208,9 +1223,14 @@ mod tests {
         }
     }
 
-    /// ★ v0.3.1 断线重连核心：重放后回合到位、训练分布已重建。
-    /// 旧版跳回合注入时 distribution 停留在 newgame 初始值（空），
-    /// 这正是"没有训练数据就算不了"的根因。
+    /// ★ v0.3.1 断线重连核心：重放后回合到位、训练分布可重建。
+    ///
+    /// v0.4.1 语义修正：重放循环退出点在目标回合的 **Begin**（回合内阶段
+    /// 未执行），此时 distribution 为空是正常现象（CI gamedata 实证）。
+    /// run_search 的真实流程是 fast_forward → ensure_distribution_built
+    /// 补建本回合分布——本测试按同一顺序断言，守住「搜索前置状态必须
+    /// 有 5 行分布」这条不变量（没有它，Train 阶段候选列举会越界 panic，
+    /// 即实机首测第1回合的 panic during search）。
     #[test]
     fn test_fast_forward_rebuilds_distribution() {
         if !setup_gamedata() {
@@ -1238,18 +1258,39 @@ mod tests {
         assert!(steps > 0, "应至少重放一个阶段");
         assert_eq!(game.turn(), 31, "重放后应到达目标回合");
 
+        // v0.4.1: 重放退出点在 Begin——分布此时为空是预期行为，记录下来
+        let heads_at_exit: usize = game
+            .distribution()
+            .iter()
+            .map(|d| d.iter().filter(|&&p| p >= 0).count())
+            .sum();
+        eprintln!(
+            "重放后（退出点={}阶段）分布行数={} 人头数={heads_at_exit}（重放前={heads_before}）",
+            steps,
+            game.distribution().len()
+        );
+
+        // ★ 与 run_search 相同：补跑 Begin+Distribute 建立本回合分布
+        let built = ensure_distribution_built(&mut game);
+        eprintln!("ensure_distribution_built 补跑 {built} 阶段");
+
         let heads_after: usize = game
             .distribution()
             .iter()
             .map(|d| d.iter().filter(|&&p| p >= 0).count())
             .sum();
-        assert!(heads_after > 0, "重放后训练分布应已重建（重放前={heads_before}）");
+        assert!(
+            heads_after > 0,
+            "补建后训练分布应有人头（重放退出时={heads_at_exit}，行数={}）",
+            game.distribution().len()
+        );
 
         // 固定种子：重放可复现
         let mut game2 =
             RamenGame::newgame(102601, &[302424, 302894, 303044, 302924, 303024, 303054], inherit)
                 .expect("newgame 失败");
         let steps2 = fast_forward(&mut game2, 31);
+        let _ = ensure_distribution_built(&mut game2);
         assert_eq!(steps, steps2, "固定种子下重放阶段数应一致");
         assert_eq!(
             game.uma().five_status, game2.uma().five_status,
@@ -1388,8 +1429,8 @@ mod tests {
 
     /// ★ v0.4.1 回归：开局第1回合（内部0）+ 行动画面 + v0.4.0 三路注入全开，
     /// 搜索不得 panic（实机首测：第1回合必现 panic during search）。
-    /// 根因：fast_forward(0) 整段跳过 → distribution 空 vec → Train 阶段
-    /// 候选列举按 5 行分布索引越界。修复：ensure_distribution_built 补建分布。
+    /// 根因：fast_forward(0) 整段跳过 → distribution 空 vec → 搜索路径
+    /// 按 5 行分布索引越界。修复：ensure_distribution_built 补建分布。
     /// 需要 gamedata（CI rust-check v0.4.1 起下载）。
     #[test]
     fn test_turn1_action_screen_no_panic() {
