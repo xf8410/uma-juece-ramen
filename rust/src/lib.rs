@@ -8,10 +8,13 @@
 //! - `run_search`: 用上游 `RamenMctsTrainer` 搜索，输出 `DecisionInfo` + `GameView`
 //! - JNI exports: `nativeInit` / `nativeSearch` / `nativeVersion`
 //!
-//! 回合口径：
-//! - hlpatch `turn` = 游戏 UI「第N回合」（1-based）
-//! - umaai-rs 内部回合从 0 开始（上游输出统一 `turn()+1`，见 turn_flow.rs），
-//!   `inject_state()` 做 `turn - 1` 转换
+//! 回合口径（v0.4.2 修正：黑板协议层已减 1）：
+//! - hlpatch `turn` **已是 AI 0-based（0..77）**——PC 黑板协议
+//!   （EtherealAO/UmamusumeResponseAnalyzer → xulai1001/UmaAiConnector
+//!   `GameStatusSend.cs`，手机版 hlpatch 照抄）在发送前做了
+//!   `turn = chara_info.turn - 1`。直读原样透传，**本层不再做任何减法**
+//!   （此前 `inject_state` 再减 1 是双重换算，第 2 回合起全部错 1 回合）
+//! - 游戏 UI「第N回合」= AI 内部 N-1；上游显示统一 `turn()+1`
 //!
 //! 回合内阶段顺序（上游 turn_flow.rs 实锤）：
 //!   Begin → Distribute(人头) → RamenSelect(选面) → SpecialSelect → Train(面效果已落地) → NextTurn
@@ -56,7 +59,7 @@
 //!   字段，不改上游。
 //!
 //! v0.4.1（开局第1回合 panic 修复 + 重放人头归零定性 + 补建门控修正）：
-//! - ★ 实机首测复现：第1回合（内部0）必现 "panic during search"。根因是
+//! - ★ 实机首测复现：第1回合必现 "panic during search"。根因是
 //!   fast_forward(0) 整段跳过，distribution 仍是 newgame 的空 vec（0 行），
 //!   而搜索路径（GameView / Train 阶段候选列举）按 5 行分布取人头 → 越界。
 //!   修复：`ensure_distribution_built` 在重放后补跑 Begin+Distribute 建分布
@@ -76,6 +79,24 @@
 //! - ★ 重放随机对齐上游 rng_consistency 姿势：set_rule_master 固定种子
 //!   （逐位可复现）+ 每回合 Distribute 前锁满人头羁绊（分布权重含得意率，
 //!   羁绊 0 → 全员不落位）+ 重放结束清除 rule 流（不带入 MCTS）
+//!
+//! v0.4.2（★协议对齐 PC 黑板 GameStatusSend——用户实锤三修）：
+//! - ★ **turn 双重换算修复**：黑板协议层发送前已 `turn = chara_info.turn - 1`
+//!   （AI 0-based 0..77），手机版 hlpatch 照抄——此前 reconcile 把直读当
+//!   1-based、inject_state 再减 1，**第 2 回合起全部错 1 回合**（比赛回合
+//!   判定/阶段区间/重放目标全偏）。修复：直读原样透传，inject_state 不再 -1
+//! - ★ **支援卡 id 编码**：黑板/上游人头 cardID = `support_card_id×10 +
+//!   突破数`（源码注释"神团 30137 满破 301374"）——SO 短 id（30312）据此
+//!   编码（→303124）后再匹配 `person.card_id`，修复 v0.4.0 羁绊注入全 miss。
+//!   **该编码只适用于支援卡；马娘 id（chara_info.card_id）不做变换**
+//! - ★ **理事长/记者羁绊注入**：evaluation[] target_id 102=理事长、103=记者
+//!   （黑板协议 persons[6]/[7]）——按 person_type 写入 friendship
+//! - ★ **command_id 实测映射修正**（SO 实况：101=速 105=耐 102=力 103=根
+//!   106=智，不连续！）——旧版 101-105 连续映射把耐当智、根当力，还把
+//!   106(智) 直接丢弃；601-605 是**合宿命令**（level 恒 5），不再映射进
+//!   普通训练等级槽
+//! - Java 侧同步（另提交）：浮窗回合显示 第{turn+1}回合 直读(AI:turn)；
+//!   uma_id/deck 从快照动态提取（不再硬编码 102601 固定六卡）
 
 pub mod ramen_strategy;
 pub mod reconcile;
@@ -318,8 +339,9 @@ fn ensure_distribution_built(game: &mut RamenGame) -> usize {
 
 /// 把校正后的状态注入 RamenGame。
 ///
-/// 回合转换：`state.turn` 是 hlpatch 直读的游戏 UI 回合（1-based），
-/// 上游模拟器内部回合从 0 开始（上游显示统一 `turn()+1`），这里做 `-1`。
+/// 回合（v0.4.2）：`state.turn` **已是 AI 0-based 内部回合**——黑板协议层
+/// （GameStatusSend）发送前已减 1，本函数直接使用，**不再做任何转换**
+/// （旧版 `-1` 是双重换算，第 2 回合起全部错 1 回合）。
 ///
 /// 注意：这是"部分重建"，不是完美快照。训练分布 / 羁绊 / 训练等级由
 /// `fast_forward` 重放重建（v0.3.1）+ `apply_observed_distribution`
@@ -332,7 +354,8 @@ fn ensure_distribution_built(game: &mut RamenGame) -> usize {
 /// v0.4.0（PR #22）：末尾额外注入 reconcile 携带的直读观测
 /// （羁绊 / 训练等级 / 角标），替掉上面的重放近似。
 pub fn inject_state(game: &mut RamenGame, state: &mut ReconciledState) -> Result<()> {
-    let internal_turn = (state.turn - 1).max(0);
+    // v0.4.2: 直读 turn 已是 AI 0-based（协议层已减 1），直接使用
+    let internal_turn = state.turn.max(0);
     game.base.turn = internal_turn;
 
     // 五维 + 体力 + 干劲 + 技能点
@@ -402,17 +425,20 @@ pub fn inject_state(game: &mut RamenGame, state: &mut ReconciledState) -> Result
 /// v0.4.0（PR #22）：把 reconcile 解析出的直读观测注入模拟器，
 /// 覆盖 fast_forward 的重放近似。
 ///
-/// 三项均为"字段缺失则跳过、保留重放值"，保证旧版 hlpatch 行为不变：
-/// - 羁绊 `support_bonds`：按 `card_id` 匹配人头，写 `person.friendship`
+/// 各项均为"字段缺失则跳过、保留重放值"，保证旧版 hlpatch 行为不变：
+/// - 羁绊 `support_bonds`：按**编码后 card_id**（short×10+突破，v0.4.2）
+///   匹配人头，写 `person.friendship`
 /// - 训练等级 `training_levels`：`(level-1)*4` 写 `base.train_level_count[idx]`
-///   （上游公式 `train_level = count/4 + 1`）
+///   （上游公式 `train_level = count/4 + 1`；601-605 合宿命令已在解析层剔除）
 /// - 角标 `feeling_types`：`feeling_id 1/2/3 → A/B/C` 写 `ramen.train_feeling_type[5]`
+/// - 理事长/记者 `evaluation_bonds`（v0.4.2）：target 102=理事长(Yayoi)、
+///   103=记者(Reporter)，按 person_type 匹配写 `person.friendship`
 ///
 /// 返回本次注入产生的 warning（由调用方并入 `state.warnings`，透出到小黑板 ⚠ 区）。
 fn inject_observed_details(game: &mut RamenGame, state: &ReconciledState) -> Vec<String> {
     let mut warnings = Vec::new();
 
-    // 1) 羁绊：按 card_id 匹配支援卡人头，写入 person.friendship
+    // 1) 羁绊：按编码后 card_id（short×10+突破）匹配支援卡人头，写入 friendship
     if !state.support_bonds.is_empty() {
         let mut n = 0usize;
         for &(card_id, bond) in &state.support_bonds {
@@ -425,7 +451,7 @@ fn inject_observed_details(game: &mut RamenGame, state: &ReconciledState) -> Vec
             }
         }
         warnings.push(format!(
-            "羁绊注入: 命中 {} 张卡 (观测 {} 项)",
+            "羁绊注入: 命中 {} 张卡 (观测 {} 项, id=短id×10+突破)",
             n,
             state.support_bonds.len()
         ));
@@ -457,6 +483,31 @@ fn inject_observed_details(game: &mut RamenGame, state: &ReconciledState) -> Vec
         }
         game.ramen.train_feeling_type = Some(arr);
         warnings.push(format!("角标注入: {:?}", state.feeling_types));
+    }
+
+    // 4) v0.4.2 理事长/记者羁绊：evaluation target 102=理事长(Yayoi)、
+    //    103=记者(Reporter)——黑板协议 persons[6]/[7]，按 person_type 匹配
+    if !state.evaluation_bonds.is_empty() {
+        let mut hits: Vec<String> = Vec::new();
+        for &(target_id, bond) in &state.evaluation_bonds {
+            let ptype = match target_id {
+                102 => Some(PersonType::Yayoi),
+                103 => Some(PersonType::Reporter),
+                _ => None,
+            };
+            if let Some(pt) = ptype {
+                for p in game.persons.iter_mut() {
+                    if p.person_type == pt {
+                        p.friendship = bond;
+                        hits.push(format!("{}={}", if target_id == 102 { "理事长" } else { "记者" }, bond));
+                        break;
+                    }
+                }
+            }
+        }
+        if !hits.is_empty() {
+            warnings.push(format!("羁绊注入: {}", hits.join(" ")));
+        }
     }
 
     warnings
@@ -780,7 +831,8 @@ pub fn run_search(
 
     // ★ v0.3.1 断线重连：先重放到目标回合（重建分布/羁绊/训练等级），
     //   再用观测值覆盖。跳回合注入的时代，这些字段全是 newgame 初始值。
-    let target_internal = (reconciled.turn - 1).max(0);
+    //   v0.4.2: reconciled.turn 已是 AI 0-based，直接作为重放目标。
+    let target_internal = reconciled.turn.max(0);
     let replay_steps = fast_forward(&mut game, target_internal);
     log::info!(
         "fast_forward: target_turn={} replayed_stages={} (断线重连重建)",
@@ -1200,7 +1252,7 @@ mod jni_exports {
         _class: JClass,
     ) -> jstring {
         let v = serde_json::json!({
-            "version": "0.4.1",
+            "version": "0.4.2",
             "upstream": "xulai1001/umaai-rs",
             "upstream_commit": "eeae510b57ee9d29a475645a05c191e6ef5a6e72",
             "search": "ramen_mcts_trainer",
@@ -1212,9 +1264,12 @@ mod jni_exports {
             "observed_heads_injection": true,
             "stage_detection": "trainings_present_means_train_phase(action_screen)",
             "training_decision": "computed_only_when_hlpatch_trainings_empty",
-            "turn_convention": "hlpatch UI 1-based -> AI internal 0-based (turn-1); upstream displays turn()+1",
+            "turn_convention": "hlpatch turn already AI 0-based (GameStatusSend subtracts 1); NO further conversion",
             "candidate_scores": "last_breakdown_reuse",
             "pr22_direct_injection": "friendship/train_level_count/train_feeling_type from hlpatch",
+            "support_card_id_encoding": "short_id*10+limit_break (blackboard GameStatusSend contract)",
+            "evaluation_bonds": "102=Yayoi 103=Reporter from hlpatch evaluation[]",
+            "command_id_mapping": "101=spd 105=sta 102=pow 103=gut 106=wiz; 601-605=gasshuku(ignored)",
             "turn0_distribution_fix": "ensure_distribution_built after replay (exit at Begin)",
             "race_turn_board_fix": "ensure gate checks rows AND heads (race turn leaves 5 empty rows)",
             "replay_heads_fix": "rule_master seed + friendship=100 before Distribute (deyilv weight)"
@@ -1368,8 +1423,9 @@ mod tests {
         );
     }
 
-    /// 开局第1回合（内部0）：fast_forward 整段跳过（0 行分布），
-    /// ensure 补跑 Begin+Distribute 后应有人头——守住第1回合 panic 不复发
+    /// 开局第1回合（hlpatch turn=0，AI 内部 0）：fast_forward 整段跳过
+    /// （0 行分布），ensure 补跑 Begin+Distribute 后应有人头——
+    /// 守住第1回合 panic 不复发
     #[test]
     fn test_turn0_replay_skipped_then_ensure_builds() {
         if !setup_gamedata() {
@@ -1403,7 +1459,8 @@ mod tests {
             return;
         }
 
-        // hlpatch 直读回合样本：turn=31（UI 第31回合）→ AI 内部 30
+        // hlpatch 直读样本：turn=31 = AI 内部 31（游戏 UI 第32回合）。
+        // v0.4.2 起直读透传，不再二次减 1。
         // 注意：没有 trainings / ramen —— 正是"非行动画面"的真实形态，
         // v0.3.1 起这种输入也应给出完整决策 + 训练建议
         let json = r#"{
@@ -1419,7 +1476,7 @@ mod tests {
 
         // 直读回合无估算 warning
         let reconciled = response.reconcile.as_ref().unwrap();
-        assert_eq!(reconciled.turn, 31);
+        assert_eq!(reconciled.turn, 31, "直读透传（AI 内部 31）");
         assert_eq!(reconciled.turn_source, "direct");
 
         // 搜索可能成功也可能失败（取决于 gamedata 是否完整）
@@ -1483,10 +1540,10 @@ mod tests {
         }
     }
 
-    /// v0.4.0（PR #22）：直读数据解析后携带到 ReconciledState，
-    /// inject_state 末尾注入 person.friendship / train_level_count / train_feeling_type。
+    /// v0.4.0/v0.4.2：直读数据解析后携带到 ReconciledState
+    /// （支援卡 id 用短 id+突破，编码在 reconcile 层完成）
     #[test]
-    fn test_pr22_direct_injection_fields_carried() {
+    fn test_direct_injection_fields_carried() {
         if !setup_gamedata() {
             return;
         }
@@ -1499,49 +1556,64 @@ mod tests {
             },
             "turn": 10,
             "support_cards": [
-                {"support_card_id": 302424, "kizuna": 75},
-                {"support_card_id": 302894, "kizuna": 50}
+                {"support_card_id": 30242, "limit_break_count": 4, "kizuna": 75},
+                {"support_card_id": 30289, "limit_break_count": 4, "kizuna": 50}
+            ],
+            "evaluation": [
+                {"target_id": 102, "evaluation": 100, "current_bond": 100},
+                {"target_id": 103, "evaluation": 80, "current_bond": 42}
             ],
             "training_levels": [
                 {"command_id": 101, "level": 3},
-                {"command_id": 103, "level": 5}
+                {"command_id": 103, "level": 5},
+                {"command_id": 601, "level": 5}
             ],
             "ramen": {
                 "command_feelings": [
                     {"command_id": 102, "feeling_id": 1},
-                    {"command_id": 104, "feeling_id": 2},
-                    {"command_id": 105, "feeling_id": 3}
+                    {"command_id": 105, "feeling_id": 3},
+                    {"command_id": 601, "feeling_id": 2}
                 ]
             }
         }"#;
 
         let response = run_search(json, &test_config(8));
         let reconciled = response.reconcile.as_ref().unwrap();
-        // 解析层已携带三项注入数据
-        assert_eq!(reconciled.support_bonds.len(), 2, "应解析出 2 张卡羁绊");
-        assert_eq!(reconciled.training_levels.len(), 2, "应解析出 2 条训练等级");
-        assert_eq!(reconciled.feeling_types.len(), 3, "应解析出 3 条角标");
-        // 注入应在 warnings 中留痕（inj 注入只在 gamedata 完整、搜索成功路径才执行，
-        // 但 reconcile 层解析一定发生）
+        // 羁绊：短 id 30242(4突)→302424、30289(4突)→302894
+        assert_eq!(reconciled.support_bonds.len(), 2, "应解析出 2 张卡羁绊（编码后）");
+        let bonds: std::collections::HashMap<u32, i32> =
+            reconciled.support_bonds.iter().cloned().collect();
+        assert!(bonds.contains_key(&302424), "30242×10+4 应编码为 302424");
+        assert!(bonds.contains_key(&302894), "30289×10+4 应编码为 302894");
+        // 训练等级：101→槽0 L3、103→槽3 L5；601 合宿剔除
+        assert_eq!(reconciled.training_levels, vec![(0, 3), (3, 5)]);
+        // 角标：102→槽2 A、105→槽1 C；601 合宿剔除
+        assert_eq!(reconciled.feeling_types, vec![(2, 1), (1, 3)]);
+        // 理事长/记者
+        assert_eq!(
+            reconciled.evaluation_bonds,
+            vec![(102, 100), (103, 42)]
+        );
         eprintln!("reconcile warnings: {:?}", reconciled.warnings);
     }
 
-    /// ★ v0.4.1 回归：开局第1回合（内部0）+ 行动画面 + v0.4.0 三路注入全开，
-    /// 搜索不得 panic（实机首测：第1回合必现 panic during search）。
-    /// 根因：fast_forward(0) 整段跳过 → distribution 空 vec → 搜索路径
-    /// 按 5 行分布索引越界。修复：ensure_distribution_built 补建分布。
-    /// 需要 gamedata（CI rust-check v0.4.1 起下载）。
+    /// ★ v0.4.1/v0.4.2 回归：开局第1回合（hlpatch turn=0 = AI 内部 0）+
+    /// 行动画面 + 直读注入全开，搜索不得 panic（实机首测：第1回合必现
+    /// panic during search）。根因：fast_forward(0) 整段跳过 → distribution
+    /// 空 vec → 搜索路径按 5 行分布索引越界。修复：ensure_distribution_built
+    /// 补建分布。需要 gamedata（CI rust-check v0.4.1 起下载）。
     #[test]
-    fn test_turn1_action_screen_no_panic() {
+    fn test_turn0_action_screen_no_panic() {
         if !setup_gamedata() {
             return;
         }
 
         // 形状对齐用户实机首测截图（第1回合）：速165 耐81 力109 根109 智117，
         // 速训练1头/智训练3头，六卡羁绊全 0，训练等级全 1，角标 A/B/C
+        // （v0.4.2: hlpatch turn=0 = 第1回合；command_id 用实测映射）
         let json = r#"{
             "scenario": "Ramen",
-            "turn": 1,
+            "turn": 0,
             "chara": {"speed":165,"stamina":81,"power":109,"guts":109,"wiz":117,
                       "vital":100,"max_vital":100,"motivation":3,
                       "skill_point":320,"scenario_id":14},
@@ -1549,22 +1621,22 @@ mod tests {
                 {"name":"Speed","command_id":101,"is_enable":1,"failure_rate":0,
                  "heads":1,"shining":0,"partner_ids":[],"partners":[],
                  "gains":{"Speed":13,"Power":2,"SkillPt":8,"HP":-20}},
-                {"name":"Wiz","command_id":105,"is_enable":1,"failure_rate":0,
+                {"name":"Wiz","command_id":106,"is_enable":1,"failure_rate":0,
                  "heads":3,"shining":0,"partner_ids":[],"partners":[],
                  "gains":{"Speed":7,"Wisdom":19,"SkillPt":18,"HP":5}}
             ],
             "support_cards": [
-                {"support_card_id":302424,"kizuna":0},
-                {"support_card_id":302894,"kizuna":0},
-                {"support_card_id":303044,"kizuna":0},
-                {"support_card_id":302924,"kizuna":0},
-                {"support_card_id":303024,"kizuna":0},
-                {"support_card_id":303054,"kizuna":0}
+                {"support_card_id":30242,"limit_break_count":4,"kizuna":0},
+                {"support_card_id":30289,"limit_break_count":4,"kizuna":0},
+                {"support_card_id":30304,"limit_break_count":4,"kizuna":0},
+                {"support_card_id":30292,"limit_break_count":4,"kizuna":0},
+                {"support_card_id":30302,"limit_break_count":4,"kizuna":0},
+                {"support_card_id":30305,"limit_break_count":0,"kizuna":0}
             ],
             "training_levels": [
-                {"command_id":601,"level":1},{"command_id":602,"level":1},
-                {"command_id":603,"level":1},{"command_id":604,"level":1},
-                {"command_id":605,"level":1}
+                {"command_id":101,"level":1},{"command_id":102,"level":1},
+                {"command_id":103,"level":1},{"command_id":105,"level":1},
+                {"command_id":106,"level":1}
             ],
             "ramen": {"checkpoint_pt":0,"special_feeling_num":0,"sozai":[0,0,0],
                       "acquisition_gauges":[
@@ -1572,9 +1644,9 @@ mod tests {
                           {"feeling_id":2,"remaining":7},
                           {"feeling_id":3,"remaining":7}],
                       "command_feelings":[
-                          {"command_id":601,"feeling_id":1},
-                          {"command_id":602,"feeling_id":2},
-                          {"command_id":603,"feeling_id":3}]}
+                          {"command_id":101,"feeling_id":1},
+                          {"command_id":102,"feeling_id":2},
+                          {"command_id":103,"feeling_id":3}]}
         }"#;
 
         let response = run_search(json, &test_config(8));
