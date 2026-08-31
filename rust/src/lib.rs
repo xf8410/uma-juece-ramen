@@ -43,12 +43,17 @@
 //!   （卡/友人/NPC）在训练之间搬移，使模拟分布与实况一致
 //! - 友人加入门槛从内部回合 2 降到 1（实况确认：游戏 UI 第2回合友人已在场）
 //!
-//! v0.4.0（阶段判定修正）：
-//! - ★ 修复「行动画面时主决策还在推荐吃面」：上游回合内顺序是
-//!   Distribute → RamenSelect(选面) → Train(面效果落地)。hlpatch trainings
-//!   在场 = 行动画面 = 面已选完，主决策应为训练建议；旧版按回合区间
-//!   强设 RamenSelect，主决策错误地推荐吃面
+//! v0.4.0（阶段判定修正 + 直读注入）：
+//! - ★ 修复「行动画面时主决策还在推荐吃面」：上游回合内顺序 Distribute →
+//!   RamenSelect(选面) → Train(面效果已落地)。hlpatch trainings 在场 =
+//!   行动画面 = 面已选完，主决策应为训练建议；旧版按回合区间强设
+//!   RamenSelect，主决策错误地推荐吃面
 //! - trainings 空（选面画面/非行动画面）→ 主决策 = 吃面建议（按回合区间）
+//! - ★ 直读注入（PR #22）：reconcile 额外解析 羁绊(support_cards/partners)、
+//!   训练等级(training_levels)、角标(command_feelings)，在 inject_state 末尾
+//!   写入上游公开字段 person.friendship / base.train_level_count /
+//!   ramen.train_feeling_type，替掉 fast_forward 的重放近似。仅消费上游公开
+//!   字段，不改上游。
 
 pub mod ramen_strategy;
 pub mod reconcile;
@@ -62,7 +67,7 @@ use serde::Serialize;
 
 use umasim::game::{
     Game, Trainer,
-    ramen::{RamenGame, RamenStage},
+    ramen::{RamenGame, RamenStage, FeelingType},
     InheritInfo, PersonType,
 };
 use umasim::gamedata::init_global;
@@ -188,7 +193,10 @@ fn fast_forward(game: &mut RamenGame, target_internal_turn: i32) -> usize {
 /// - train_level_count：重放近似值（不再固定为 0）
 /// - feeling_queue（诀窍获得顺序队列）：置空
 /// - yearly_* 观测字段：置默认值
-pub fn inject_state(game: &mut RamenGame, state: &ReconciledState) -> Result<()> {
+///
+/// v0.4.0（PR #22）：末尾额外注入 reconcile 携带的直读观测
+/// （羁绊 / 训练等级 / 角标），替掉上面的重放近似。
+pub fn inject_state(game: &mut RamenGame, state: &mut ReconciledState) -> Result<()> {
     let internal_turn = (state.turn - 1).max(0);
     game.base.turn = internal_turn;
 
@@ -249,7 +257,74 @@ pub fn inject_state(game: &mut RamenGame, state: &ReconciledState) -> Result<()>
         game.stage = RamenStage::Train;
     }
 
+    // ★ v0.4.0 直读注入：羁绊 / 训练等级 / 角标（替掉 fast_forward 重放近似）
+    let inj_warnings = inject_observed_details(game, state);
+    state.warnings.extend(inj_warnings);
+
     Ok(())
+}
+
+/// v0.4.0（PR #22）：把 reconcile 解析出的直读观测注入模拟器，
+/// 覆盖 fast_forward 的重放近似。
+///
+/// 三项均为"字段缺失则跳过、保留重放值"，保证旧版 hlpatch 行为不变：
+/// - 羁绊 `support_bonds`：按 `card_id` 匹配人头，写 `person.friendship`
+/// - 训练等级 `training_levels`：`(level-1)*4` 写 `base.train_level_count[idx]`
+///   （上游公式 `train_level = count/4 + 1`）
+/// - 角标 `feeling_types`：`feeling_id 1/2/3 → A/B/C` 写 `ramen.train_feeling_type[5]`
+///
+/// 返回本次注入产生的 warning（由调用方并入 `state.warnings`，透出到小黑板 ⚠ 区）。
+fn inject_observed_details(game: &mut RamenGame, state: &ReconciledState) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // 1) 羁绊：按 card_id 匹配支援卡人头，写入 person.friendship
+    if !state.support_bonds.is_empty() {
+        let mut n = 0usize;
+        for &(card_id, bond) in &state.support_bonds {
+            for p in game.persons.iter_mut() {
+                if p.card_id == Some(card_id) {
+                    p.friendship = bond;
+                    n += 1;
+                    break;
+                }
+            }
+        }
+        warnings.push(format!(
+            "羁绊注入: 命中 {} 张卡 (观测 {} 项)",
+            n,
+            state.support_bonds.len()
+        ));
+    }
+
+    // 2) 训练等级：level → train_level_count（公式 train_level = count/4 + 1）
+    if !state.training_levels.is_empty() {
+        for &(idx, level) in &state.training_levels {
+            if idx < game.base.train_level_count.len() {
+                let lvl = level.clamp(1, 5);
+                game.base.train_level_count[idx] = (lvl - 1) * 4;
+            }
+        }
+        warnings.push(format!("训练等级注入: {:?}", state.training_levels));
+    }
+
+    // 3) 角标：feeling_id(1/2/3) → FeelingType(A/B/C)，写入 ramen.train_feeling_type
+    if !state.feeling_types.is_empty() {
+        let mut arr: [FeelingType; 5] = [FeelingType::A; 5];
+        for &(idx, fid) in &state.feeling_types {
+            if idx < 5 {
+                arr[idx] = match fid {
+                    1 => FeelingType::A,
+                    2 => FeelingType::B,
+                    3 => FeelingType::C,
+                    _ => FeelingType::A,
+                };
+            }
+        }
+        game.ramen.train_feeling_type = Some(arr);
+        warnings.push(format!("角标注入: {:?}", state.feeling_types));
+    }
+
+    warnings
 }
 
 // ── 直读人头注入（v0.3.2）───────────────────────────────────────────
@@ -576,7 +651,7 @@ pub fn run_search(
         replay_steps
     );
 
-    if let Err(e) = inject_state(&mut game, &reconciled) {
+    if let Err(e) = inject_state(&mut game, &mut reconciled) {
         return SearchResponse {
             ok: false,
             view: None,
@@ -898,7 +973,7 @@ mod jni_exports {
             if let Err(e) = std::env::set_current_dir(&dir) {
                 let msg = format!("set_current_dir({dir}) 失败: {e}");
                 log::error!("{msg}");
-                format!(r#"{{"ok":false,"error":"{}"}}"#, msg.replace('"', "'"))
+                format!(r#"{"ok":false,"error":"{}"}"#, msg.replace('"', "'"))
             } else {
                 match init_global() {
                     Ok(()) => {
@@ -908,7 +983,7 @@ mod jni_exports {
                     }
                     Err(e) => {
                         log::error!("init_global 失败: {e}");
-                        format!(r#"{{"ok":false,"error":"{}"}}"#, e.to_string().replace('"', "'"))
+                        format!(r#"{"ok":false,"error":"{}"}"#, e.to_string().replace('"', "'"))
                     }
                 }
             }
@@ -980,7 +1055,8 @@ mod jni_exports {
             "stage_detection": "trainings_present_means_train_phase(action_screen)",
             "training_decision": "computed_only_when_hlpatch_trainings_empty",
             "turn_convention": "hlpatch UI 1-based -> AI internal 0-based (turn-1); upstream displays turn()+1",
-            "candidate_scores": "last_breakdown_reuse"
+            "candidate_scores": "last_breakdown_reuse",
+            "pr22_direct_injection": "friendship/train_level_count/train_feeling_type from hlpatch"
         })
         .to_string();
         jstring_from_str(&mut env, &v)
@@ -1184,5 +1260,48 @@ mod tests {
                 reconciled.warnings
             );
         }
+    }
+
+    /// v0.4.0（PR #22）：直读数据解析后携带到 ReconciledState，
+    /// inject_state 末尾注入 person.friendship / train_level_count / train_feeling_type。
+    #[test]
+    fn test_pr22_direct_injection_fields_carried() {
+        if !setup_gamedata() {
+            return;
+        }
+
+        let json = r#"{
+            "chara": {
+                "speed": 1200, "stamina": 301, "power": 437, "guts": 362, "wiz": 280,
+                "vital": 60, "max_vital": 108, "motivation": 5,
+                "skill_point": 1492, "scenario_id": 14
+            },
+            "turn": 10,
+            "support_cards": [
+                {"support_card_id": 302424, "kizuna": 75},
+                {"support_card_id": 302894, "kizuna": 50}
+            ],
+            "training_levels": [
+                {"command_id": 101, "level": 3},
+                {"command_id": 103, "level": 5}
+            ],
+            "ramen": {
+                "command_feelings": [
+                    {"command_id": 102, "feeling_id": 1},
+                    {"command_id": 104, "feeling_id": 2},
+                    {"command_id": 105, "feeling_id": 3}
+                ]
+            }
+        }"#;
+
+        let response = run_search(json, &test_config(8));
+        let reconciled = response.reconcile.as_ref().unwrap();
+        // 解析层已携带三项注入数据
+        assert_eq!(reconciled.support_bonds.len(), 2, "应解析出 2 张卡羁绊");
+        assert_eq!(reconciled.training_levels.len(), 2, "应解析出 2 条训练等级");
+        assert_eq!(reconciled.feeling_types.len(), 3, "应解析出 3 条角标");
+        // 注入应在 warnings 中留痕（inj 注入只在 gamedata 完整、搜索成功路径才执行，
+        // 但 reconcile 层解析一定发生）
+        eprintln!("reconcile warnings: {:?}", reconciled.warnings);
     }
 }
