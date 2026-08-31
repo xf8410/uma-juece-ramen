@@ -10,14 +10,36 @@
 //! 本模块负责把"脏数据"清洗为模拟器可接受的状态，并记录所有校正动作。
 //! 核心原则：以游戏规则为准，数据脏了按规则钳制，而不是按数据走。
 //!
-//! # 回合口径（重要）
+//! # 回合口径（v0.4.2 重大修正：黑板协议层已减 1）
 //!
-//! - hlpatch 的 `turn` 与游戏 UI「第N回合」一致（1-based，第1回合=1）。
-//!   hlpatch v3.27.17+ 对拉面杯直接发 turn（raw_total_turn_num 校正），
-//!   本层直读，置信度 High，不再做年份估算。
-//! - 上游模拟器 umaai-rs 的内部回合从 0 开始（0..=77），
-//!   `inject_state()` 负责 `turn - 1` 转换，本层保持 1-based 口径。
-//! - hlpatch 若发 `turn: 0`，按「第1回合」处理（内部回合 0，两种口径一致）。
+//! PC 黑板协议（EtherealAO/UmamusumeResponseAnalyzer → xulai1001/UmaAiConnector
+//! `GameStatusSend.cs`，手机版 hlpatch 照抄）在发送前做了
+//! `turn = chara_info.turn - 1`——**/summary 的 turn 已是 AI 0-based（0..77）**。
+//! - 本层对直读 turn **原样透传**（0 = 第1回合，合法）；旧版「1-based」注释作废
+//! - 旧版 hlpatch 无 turn 时按 month/half 推导出的值是 UI 1-based，本层 **-1**
+//!   转 AI 内部口径
+//! - lib.rs `inject_state` 不再做任何减法（此前双重换算，第2回合起全错 1 回合）
+//!
+//! # 支援卡 id 编码（v0.4.2，黑板协议 GameStatusSend 实锤）
+//!
+//! 黑板/上游的人头 cardID = `support_card_id * 10 + limit_break_count`
+//! （源码注释："突破数+10*卡原来的id，例如神团是30137，满破神团就是301374"）。
+//! SO 的 support_card_id 是**短 id**（如 30312），据此编码成 303124 后才能与
+//! 上游 `person.card_id` 匹配。**注意：该编码只适用于支援卡，与马娘 id
+//! （chara_info.card_id）是两套独立 id 空间，马娘 id 不做变换。**
+//!
+//! # evaluation[] 映射（v0.4.2，黑板协议实锤）
+//!
+//! `evaluation_info_array` 的 target_id：102=理事长（persons[6]）、103=记者
+//! （persons[7]）、111=凉花（persons[8]）、1-6=支援卡位——理事长/记者的羁绊条
+//! 就在这张表里（用户实锤），按 person_type 注入。
+//!
+//! # command_id → 训练下标（v0.4.2 实测映射修正）
+//!
+//! SO 实况（用户 URA 回合快照）实证训练 command_id **不连续**：
+//! `101=速 105=耐 102=力 103=根 106=智`。旧版按 101-105 连续映射，
+//! 把耐当智、把根当力。601-605 是**合宿命令**（level 恒 5），与普通训练
+//! 不同槽，不映射（上游合宿期 train_level=5 硬编码，不读 6xx）。
 //!
 //! # 直读训练观测（v0.3.2）
 //!
@@ -33,7 +55,7 @@
 //! 在 v0.3.2 人头注入之外，本层进一步解析三类可直接观测、且重放近似误差大的
 //! 状态，由 `inject_state` 之后消费（详见 lib.rs）：
 //! - 羁绊：`support_cards[].kizuna` 与 `trainings[].partners[].current_bond`
-//!   （后者是训练画面实时累计真值，优先），按 `card_id` 匹配人头写入
+//!   （后者是训练画面实时累计真值，优先），按编码后 card_id 匹配人头写入
 //!   `person.friendship`，替掉 fast_forward 的重放近似。
 //! - 训练等级：`training_levels[].{command_id, level}` → `base.train_level_count[idx]`
 //!   （公式 train_level = count/4 + 1，故 count = (level-1)*4）。
@@ -56,8 +78,8 @@ use umasim::game::ramen::rules::{FEELING_LIMIT, GAUGE_LIMIT};
 pub struct HlpatchSummary {
     #[serde(default)]
     pub version: String,
-    /// hlpatch 直读回合（1-based，与游戏 UI「第N回合」一致）。
-    /// Option 用于区分「字段缺失」和「字段=0」：缺失才走 month/half 推导。
+    /// hlpatch 直读回合。**v0.4.2：已是 AI 0-based（黑板协议发送前减 1）**，
+    /// 0 = 第1回合（合法）；Option 用于区分「字段缺失」和「字段=0」。
     #[serde(default)]
     pub turn: Option<i32>,
     #[serde(default)]
@@ -83,6 +105,9 @@ pub struct HlpatchSummary {
     /// 训练等级列表（v0.4.0 等级注入用）
     #[serde(default)]
     pub training_levels: Vec<HlpatchTrainingLevel>,
+    /// 羁绊/evaluation 表（v0.4.2）：102=理事长、103=记者、111=凉花、1-6=卡位
+    #[serde(default)]
+    pub evaluation: Vec<HlpatchEvaluation>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,8 +182,8 @@ pub struct HlpatchRamen {
 
 /// hlpatch 支援卡（v0.4.0 羁绊注入用）。
 ///
-/// `support_card_id` 与游戏内 `BasePerson.card_id` 同义（卡 id，如 302424）。
-/// 非支援卡人头（理事长/记者/NPC）在 hlpatch 侧无此结构，故 kizuna 只覆盖支援卡。
+/// `support_card_id` 是**短 id**（SO 口径，如 30312）；
+/// v0.4.2 起按黑板协议编码 `short*10 + limit_break_count` 后再参与匹配。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HlpatchSupportCard {
     #[serde(default)]
@@ -194,29 +219,18 @@ pub struct HlpatchCommandFeeling {
     pub feeling_id: i32,
 }
 
-/// hlpatch 训练伙伴（trainings[].partners[]，v0.4.0 精确羁绊注入用）。
+/// hlpatch evaluation 表条目（v0.4.2 理事长/记者羁绊注入用）。
 ///
-/// 只取 `support_card_id` 与 `current_bond` 两项；其余字段（阈值/类型/彩圈）
-/// 暂不使用，保留结构以便后续扩展。
+/// 黑板协议映射：target_id 102=理事长、103=记者、111=凉花、1-6=支援卡位；
+/// 其余（1022/1058/1060/1076/1077/1120…）为剧本伙伴 NPC。
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct HlpatchPartner {
+pub struct HlpatchEvaluation {
     #[serde(default)]
-    pub partner_id: i64,
+    pub target_id: i64,
     #[serde(default)]
-    pub support_card_id: Option<u32>,
-    /// 该伙伴当前羁绊（累计真值，优先于 kizuna）
+    pub evaluation: i32,
     #[serde(default)]
     pub current_bond: i32,
-    #[serde(default)]
-    pub is_shining: bool,
-    #[serde(default)]
-    pub support_card_type: i32,
-    #[serde(default)]
-    pub partner_type: i32,
-    #[serde(default)]
-    pub is_tips_event: bool,
-    #[serde(default)]
-    pub name: String,
 }
 
 // ── 校正后的状态 ────────────────────────────────────────────────────
@@ -224,7 +238,7 @@ pub struct HlpatchPartner {
 /// 校正结果：包含清洗后的状态 + 校正日志 + 置信度
 #[derive(Debug, Clone, Serialize)]
 pub struct ReconciledState {
-    /// 推导出的回合（1-based，与 hlpatch UI 一致）
+    /// AI 内部回合（0-based；直读透传，推导值已 -1）
     pub turn: i32,
     /// 回合来源
     pub turn_source: String,
@@ -238,12 +252,15 @@ pub struct ReconciledState {
     pub confidence: Confidence,
     /// 直读训练观测（v0.3.2 人头注入用；非行动画面为空）
     pub observed_trainings: Vec<ObservedTraining>,
-    /// 支援卡羁绊注入：[(card_id, bond)]，已按 current_bond 优先合并（v0.4.0）
+    /// 支援卡羁绊注入：[(编码后 card_id, bond)]，已按 current_bond 优先合并
+    /// 并按黑板协议编码 short*10+突破（v0.4.2）
     pub support_bonds: Vec<(u32, i32)>,
     /// 训练等级注入：[(train_idx, level)]，level∈1..=5（v0.4.0）
     pub training_levels: Vec<(usize, i32)>,
     /// 角标注入：[(train_idx, feeling_id)]，feeling_id∈1..=3（v0.4.0）
     pub feeling_types: Vec<(usize, i32)>,
+    /// 理事长/记者羁绊注入：[(target_id, bond)]，102=理事长、103=记者（v0.4.2）
+    pub evaluation_bonds: Vec<(i64, i32)>,
 }
 
 /// hlpatch 行动画面 `trainings[]` 的观测条目（v0.3.2 人头注入用）。
@@ -309,7 +326,7 @@ impl ReconciledState {
 /// # 校正步骤
 ///
 /// 1. 场景校验：必须是 Ramen
-/// 2. 回合推导：优先用 turn 字段（1-based 直读），否则从 month+half+stats 推导
+/// 2. 回合推导：直读透传（已 0-based），month+half 推导后 -1
 /// 3. 五维校验：clamp 到 [0, 剧本上限]
 /// 4. 体力校验：clamp 到 [0, max_vital]
 /// 5. sozai 校验：每项 [0, FEELING_LIMIT]，总和 ≤ FEELING_LIMIT
@@ -317,7 +334,8 @@ impl ReconciledState {
 /// 7. 地区 ID 校验：1-based → 0-based
 /// 8. 直读训练观测解析（v0.3.2）
 /// 9. v0.4.0 注入数据解析：羁绊 / 训练等级 / 角标
-/// 10. 置信度评估
+/// 10. v0.4.2 evaluation 解析：理事长/记者羁绊
+/// 11. 置信度评估
 pub fn reconcile(raw: &HlpatchSummary) -> Result<ReconciledState, String> {
     let mut warnings = Vec::new();
 
@@ -390,6 +408,9 @@ pub fn reconcile(raw: &HlpatchSummary) -> Result<ReconciledState, String> {
             .unwrap_or(&[]),
     );
 
+    // ⑤d v0.4.2 evaluation 解析：理事长(102)/记者(103) 羁绊
+    let evaluation_bonds = parse_evaluation_bonds(&raw.evaluation);
+
     // ⑥ 置信度评估
     let warning_count = warnings.len();
     let confidence = if turn_confidence == TurnConfidence::Reject {
@@ -413,6 +434,7 @@ pub fn reconcile(raw: &HlpatchSummary) -> Result<ReconciledState, String> {
         support_bonds,
         training_levels,
         feeling_types,
+        evaluation_bonds,
     })
 }
 
@@ -420,8 +442,9 @@ pub fn reconcile(raw: &HlpatchSummary) -> Result<ReconciledState, String> {
 
 /// 从 hlpatch `trainings[]` 原始 JSON 提取观测人头。
 ///
-/// 训练下标优先用 `command_id`（101..=105 → 0..4），否则按 `name` 匹配
-/// （Speed/Stamina/Power/Guts/Wiz，兼容中文单字）。无法定位训练的条目跳过。
+/// 训练下标优先用 `command_id`（实测映射 101=速 105=耐 102=力 103=根 106=智），
+/// 否则按 `name` 匹配（Speed/Stamina/Power/Guts/Wiz，兼容中文单字）。
+/// 无法定位训练的条目跳过（外出/休息 301/390/401/701/801 等天然跳过）。
 fn parse_observed_trainings(raw: &[serde_json::Value]) -> Vec<ObservedTraining> {
     let mut out = Vec::new();
     for item in raw {
@@ -455,52 +478,72 @@ fn parse_observed_trainings(raw: &[serde_json::Value]) -> Vec<ObservedTraining> 
 
 /// hlpatch command_id → 上游训练下标（0=速 1=耐 2=力 3=根 4=智）。
 ///
-/// 兼容两套 command_id 区间：
-/// - `101..=105`（行动画面 `trainings[].command_id` 标准区间）
-/// - `601..=605`（部分 /summary 字段使用的区间，如 `training_levels`）
+/// # v0.4.2 实测映射（SO 实况 + 黑板 GameStatusSend 佐证，**不连续！**）
 ///
-/// 106（技巧）与未知 id 无对应训练槽，返回 `None`。
+/// - `101=速`、`105=耐`、`102=力`、`103=根`、`106=智`
+/// - `104` 实况未出现，语义未知 → None
+/// - `601..=605` 是**合宿命令**（training_levels 里恒 level5），与普通训练
+///   不同槽，**不映射**——上游合宿期 train_level=5 硬编码，不读 6xx；
+///   旧版把 601-605 映射到 0-4 会把合宿值错写进普通训练等级
+/// - `301/390/401/701/801`（外出/休息）→ None
 pub fn command_id_to_train_idx(cmd: i64) -> Option<usize> {
     match cmd {
-        101..=105 => Some((cmd - 101) as usize),
-        601..=605 => Some((cmd - 601) as usize),
+        101 => Some(0), // 速 Speed
+        105 => Some(1), // 耐 Stamina
+        102 => Some(2), // 力 Power
+        103 => Some(3), // 根 Guts
+        106 => Some(4), // 智 Wiz
         _ => None,
     }
 }
 
 /// 解析支援卡羁绊（kizuna）与训练伙伴精确羁绊（current_bond），
-/// 合并为 `card_id → bond`。`current_bond` 优先（训练画面实时累计真值）。
+/// 合并为 `编码后 card_id → bond`。`current_bond` 优先（训练画面实时累计真值）。
 ///
-/// 仅覆盖有 `support_card_id` 的人头（支援卡/友人卡）；理事长/记者/NPC
-/// 在 hlpatch 侧无对应结构，保留重放近似。
+/// # v0.4.2 编码（黑板协议 GameStatusSend 实锤）
+///
+/// 人头 cardID = `support_card_id * 10 + limit_break_count`（短 id ×10 + 突破数，
+/// "神团 30137 满破 301374"）。SO 的 short id 据此编码后才能与上游
+/// `person.card_id` 匹配——旧版直接用短 id 匹配**全部 miss**。
 fn parse_support_bonds(
     support_cards: &[HlpatchSupportCard],
     trainings: &[serde_json::Value],
 ) -> Vec<(u32, i32)> {
     let mut map: HashMap<u32, i32> = HashMap::new();
+    // 短 id → 突破数（供 partners[] 里的短 id 编码用）
+    let mut limit_by_id: HashMap<u32, i32> = HashMap::new();
 
     // 1) 支援卡静态羁绊（kizuna）：仅当尚无更精确的 current_bond 时记录
     for sc in support_cards {
         if let Some(id) = sc.support_card_id {
-            map.entry(id).or_insert_with(|| sc.kizuna.clamp(0, 100));
+            let lb = sc.limit_break_count.clamp(0, 5);
+            limit_by_id.entry(id).or_insert(lb);
+            let encoded = encode_card_id(id, lb);
+            map.entry(encoded).or_insert_with(|| sc.kizuna.clamp(0, 100));
         }
     }
 
-    // 2) 训练伙伴精确羁绊（current_bond）覆盖
+    // 2) 训练伙伴精确羁绊（current_bond）覆盖（partners[] 里是短 id，编码后覆盖）
     for tr in trainings {
         if let Some(partners) = tr.get("partners").and_then(|p| p.as_array()) {
             for p in partners {
-                let id = p
+                let Some(short_id) = p
                     .get("support_card_id")
                     .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+                    .map(|v| v as u32)
+                else {
+                    continue;
+                };
                 let bond = p
                     .get("current_bond")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0) as i32;
-                if let Some(id) = id {
-                    map.insert(id, bond.clamp(0, 100));
-                }
+                let lb = limit_by_id
+                    .get(&short_id)
+                    .copied()
+                    .unwrap_or(0);
+                let encoded = encode_card_id(short_id, lb);
+                map.insert(encoded, bond.clamp(0, 100));
             }
         }
     }
@@ -508,7 +551,34 @@ fn parse_support_bonds(
     map.into_iter().collect()
 }
 
+/// 黑板协议支援卡编码：`short_id * 10 + limit_break_count`。
+/// short_id 5 位（≤ 99999），编码后 6 位，u32 安全。
+pub fn encode_card_id(short_id: u32, limit_break: i32) -> u32 {
+    short_id
+        .saturating_mul(10)
+        .saturating_add(limit_break.max(0) as u32)
+}
+
+/// 解析 evaluation 表为 (target_id, bond)，只保留 102(理事长)/103(记者)。
+/// `current_bond` 优先，缺失时用 `evaluation`。
+fn parse_evaluation_bonds(raw: &[HlpatchEvaluation]) -> Vec<(i64, i32)> {
+    let mut out = Vec::new();
+    for e in raw {
+        if e.target_id != 102 && e.target_id != 103 {
+            continue;
+        }
+        let bond = if e.current_bond > 0 {
+            e.current_bond
+        } else {
+            e.evaluation
+        };
+        out.push((e.target_id, bond.clamp(0, 100)));
+    }
+    out
+}
+
 /// 解析训练等级（training_levels[]）为 (train_idx, level)。
+/// 601-605（合宿）与未知 command_id 由 [`command_id_to_train_idx`] 返回 None 天然跳过。
 fn parse_training_levels(raw: &[HlpatchTrainingLevel]) -> Vec<(usize, i32)> {
     let mut out = Vec::new();
     for tl in raw {
@@ -544,29 +614,32 @@ enum TurnConfidence {
     Reject,
 }
 
+/// 回合推导（v0.4.2 修正：直读透传，推导值 -1）。
+///
+/// - hlpatch `turn` 已是 AI 0-based（黑板协议 GameStatusSend 发送前减 1），
+///   `0..=77` 合法、`0` = 第1回合——**原样透传，不再改写**；
+/// - month/half/年份推导出的是 UI 1-based 值，**-1** 转 AI 内部口径。
 fn derive_turn(
     raw: &HlpatchSummary,
     stats: &HlpatchStats,
     warnings: &mut Vec<String>,
 ) -> Result<(i32, String, TurnConfidence), String> {
-    // 优先用 turn 字段（hlpatch 直读，1-based，与游戏 UI「第N回合」一致）。
-    // AI（umaai-rs）内部回合从 0 开始，inject_state() 做 -1 转换。
+    // 优先用 turn 字段（hlpatch 直读，AI 0-based）
     if let Some(t) = raw.turn {
-        if (0..=78).contains(&t) {
-            // turn=0 视为第1回合（内部回合 0，两种口径一致）
-            let turn = if t == 0 { 1 } else { t };
-            return Ok((turn, "direct".into(), TurnConfidence::Direct));
+        if (0..=77).contains(&t) {
+            return Ok((t, "direct".into(), TurnConfidence::Direct));
         }
-        warnings.push(format!("turn={t} 越界(0-78)，回退 month/half 推导"));
+        warnings.push(format!("turn={t} 越界(0-77)，回退 month/half 推导"));
     }
 
-    // 从 year + month + half 推导
+    // 从 year + month + half 推导（UI 1-based → -1 转 AI 内部）
     if raw.year > 0 && raw.month >= 1 && raw.month <= 12 && raw.half >= 1 && raw.half <= 2 {
-        let turn = (raw.year - 1) * 24 + (raw.month - 1) * 2 + raw.half;
-        if turn >= 1 && turn <= 78 {
+        let ui_turn = (raw.year - 1) * 24 + (raw.month - 1) * 2 + raw.half;
+        if ui_turn >= 1 && ui_turn <= 78 {
+            let turn = ui_turn - 1;
             warnings.push(format!(
-                "turn 从 year={} month={} half={} 推导为 {}",
-                raw.year, raw.month, raw.half, turn
+                "turn 从 year={} month={} half={} 推导: UI 第{}回合 → AI 内部 {}",
+                raw.year, raw.month, raw.half, ui_turn, turn
             ));
             return Ok((turn, "year+month+half".into(), TurnConfidence::Derived));
         }
@@ -576,10 +649,11 @@ fn derive_turn(
     if raw.month >= 1 && raw.month <= 12 && raw.half >= 1 && raw.half <= 2 {
         let total = stats.speed + stats.stamina + stats.power + stats.guts + stats.wiz;
         let year = estimate_year_from_stats(total);
-        let turn = (year - 1) * 24 + (raw.month - 1) * 2 + raw.half;
+        let ui_turn = (year - 1) * 24 + (raw.month - 1) * 2 + raw.half;
+        let turn = ui_turn - 1;
         warnings.push(format!(
-            "turn 从 month={} half={} + 属性总量{}估算年份{}推导为 {}（近似值）",
-            raw.month, raw.half, total, year, turn
+            "turn 从 month={} half={} + 属性总量{}估算年份{}: UI 第{}回合 → AI 内部 {}（近似值）",
+            raw.month, raw.half, total, year, ui_turn, turn
         ));
         return Ok((turn, "month+half+stats_estimate".into(), TurnConfidence::Estimated));
     }
@@ -902,7 +976,8 @@ fn deserialize_motivation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i32,
 mod tests {
     use super::*;
 
-    /// 用户提供的真实样本（month=4, half=1, 无 turn 字段）
+    /// 用户提供的真实样本（month=4, half=1, 无 turn 字段）：
+    /// UI 推导 (2-1)*24+3*2+1=31（1-based）→ v0.4.2 起 -1 = AI 内部 30
     #[test]
     fn test_reconcile_real_sample() {
         let json = r#"{
@@ -921,38 +996,35 @@ mod tests {
         let raw: HlpatchSummary = serde_json::from_str(json).unwrap();
         let result = reconcile(&raw);
 
-        // 没有 ramen 对象，但 chara 数据完整，应该能推导出回合
         assert!(result.is_ok(), "reconcile 应该成功: {:?}", result.err());
         let state = result.unwrap();
 
-        // 总属性 = 1200+301+437+362+280 = 2580，应该估算为第2年
-        // turn = (2-1)*24 + (4-1)*2 + 1 = 24 + 6 + 1 = 31
-        assert_eq!(state.turn, 31, "从 month=4 half=1 + 属性2580 推导回合");
+        // 总属性 = 2580 → 估算第2年；UI 第31回合 → AI 内部 30
+        assert_eq!(state.turn, 30, "推导 UI 31 → AI 内部 30");
         assert_eq!(state.confidence, Confidence::Medium);
         assert!(
             state
                 .warnings
                 .iter()
-                .any(|w| w.contains("估算年份")),
-            "应该有年份估算的 warning"
+                .any(|w| w.contains("AI 内部")),
+            "应该有口径换算的 warning"
         );
         assert_eq!(state.stats.speed, 1200);
         assert_eq!(state.stats.motivation, 5);
         assert!(!state.ramen.has_region_data);
         assert!(state.observed_trainings.is_empty(), "无 trainings → 观测为空");
-        // v0.4.0 新增字段默认空（旧样本无这些结构）
         assert!(state.support_bonds.is_empty());
         assert!(state.training_levels.is_empty());
         assert!(state.feeling_types.is_empty());
+        assert!(state.evaluation_bonds.is_empty());
     }
 
-    /// hlpatch 直读 turn：1-based（与游戏 UI「第N回合」一致），无 warning、High 置信。
-    /// AI 内部回合由 inject_state 做 -1 转换（31 → 0-based 30）。
+    /// ★ v0.4.2：直读 turn 已是 AI 0-based（黑板协议发送前减 1），原样透传
     #[test]
-    fn test_direct_turn_from_hlpatch_is_ui_one_based() {
+    fn test_direct_turn_is_ai_zero_based_passthrough() {
         let json = r#"{
             "scenario": "Ramen",
-            "turn": 31,
+            "turn": 30,
             "chara": {
                 "speed": 1200, "stamina": 301, "power": 437, "guts": 362, "wiz": 280,
                 "vital": 60, "max_vital": 108, "motivation": 5,
@@ -969,13 +1041,14 @@ mod tests {
         let raw: HlpatchSummary = serde_json::from_str(json).unwrap();
         let state = reconcile(&raw).unwrap();
 
-        assert_eq!(state.turn, 31, "直读第31回合（与游戏 UI 一致）");
+        assert_eq!(state.turn, 30, "直读 AI 内部 30，透传不改写（UI 第31回合）");
         assert_eq!(state.turn_source, "direct");
         assert_eq!(state.confidence, Confidence::High, "直读且无校正 → High");
         assert!(state.warnings.is_empty(), "直读回合不应产生估算 warning");
     }
 
-    /// v0.3.2：trainings 解析为观测人头（command_id 与 name 两条路径）
+    /// v0.3.2：trainings 解析为观测人头。
+    /// v0.4.2 数据对齐实测映射（101=速 105=耐 102=力 103=根 106=智）
     #[test]
     fn test_observed_trainings_parsed() {
         let json = r#"{
@@ -984,20 +1057,29 @@ mod tests {
             "chara": {"scenario_id": 14, "speed": 100, "vital": 50, "max_vital": 100},
             "trainings": [
                 {"name": "Speed", "command_id": 101, "heads": 2, "shining": 1},
-                {"name": "Power", "command_id": 103, "heads": 3, "shining": 0},
-                {"name": "Wiz", "command_id": 105, "heads": 1, "shining": 2}
+                {"name": "Stamina", "command_id": 105, "heads": 3, "shining": 0},
+                {"name": "Power", "command_id": 102, "heads": 5, "shining": 0},
+                {"name": "Guts", "command_id": 103, "heads": 3, "shining": 0},
+                {"name": "Wiz", "command_id": 106, "heads": 4, "shining": 2}
             ]
         }"#;
         let raw: HlpatchSummary = serde_json::from_str(json).unwrap();
         let state = reconcile(&raw).unwrap();
-        assert_eq!(state.observed_trainings.len(), 3, "三条观测全部解析");
-        assert_eq!(state.observed_trainings[0].train_index, 0);
-        assert_eq!(state.observed_trainings[0].heads, 2);
-        assert_eq!(state.observed_trainings[2].train_index, 4);
-        assert_eq!(state.observed_trainings[2].shining, 2);
+        assert_eq!(state.observed_trainings.len(), 5, "五条观测全部解析");
+        // 每条都落到正确的训练槽（v0.4.2 之前 105→4/102→1/103→2 全错位）
+        let by_idx: std::collections::HashMap<usize, i32> = state
+            .observed_trainings
+            .iter()
+            .map(|o| (o.train_index, o.heads))
+            .collect();
+        assert_eq!(by_idx.get(&0), Some(&2), "速 101→0");
+        assert_eq!(by_idx.get(&1), Some(&3), "耐 105→1（旧版错映射到 4）");
+        assert_eq!(by_idx.get(&2), Some(&5), "力 102→2（旧版错映射到 1）");
+        assert_eq!(by_idx.get(&3), Some(&3), "根 103→3（旧版错映射到 2）");
+        assert_eq!(by_idx.get(&4), Some(&4), "智 106→4（旧版 106 无映射被丢弃）");
     }
 
-    /// turn=0 按第1回合处理（内部回合 0，两种口径一致）；
+    /// turn=0 = 第1回合（AI 内部 0，合法直读）；
     /// turn 缺失时才走 month/half 推导。
     #[test]
     fn test_turn_zero_is_first_turn_and_missing_turn_falls_back() {
@@ -1005,11 +1087,11 @@ mod tests {
             serde_json::from_str(r#"{"scenario":"Ramen","turn":0,"chara":{"scenario_id":14,"speed":100}}"#)
                 .unwrap();
         let s0 = reconcile(&zero).unwrap();
-        assert_eq!(s0.turn, 1, "turn=0 → 第1回合");
+        assert_eq!(s0.turn, 0, "turn=0 = 第1回合（AI 内部 0），透传");
         assert_eq!(s0.turn_source, "direct");
 
         let missing: HlpatchSummary =
-            serde_json::from_str(r#"{"scenario":"Ramen","chara":{"scenario_id":14,"speed":100}}"#)
+            serde_json::from_str(r#"{\"scenario\":\"Ramen\",\"chara\":{\"scenario_id\":14,\"speed\":100}}"#.replace("\\\"", "\"").as_str())
                 .unwrap();
         assert_eq!(missing.turn, None);
         // 无 turn 且无 month/half → 无法确定
@@ -1042,7 +1124,7 @@ mod tests {
         let raw: HlpatchSummary = serde_json::from_str(json).unwrap();
         let state = reconcile(&raw).unwrap();
 
-        // turn 直接可用
+        // 直读透传（AI 内部 10）
         assert_eq!(state.turn, 10);
         assert_eq!(state.turn_source, "direct");
         assert_eq!(state.confidence, Confidence::Medium); // 有 feeling_slot 近似 warning
@@ -1051,9 +1133,6 @@ mod tests {
         assert_eq!(state.ramen.feeling_stock, [3, 2, 1]);
 
         // acquisition_gauges 近似转换
-        // remaining=2 → slot=7-2=5
-        // remaining=0 → slot=7-0=7，但 clamp 到 6
-        // remaining=5 → slot=7-5=2
         assert_eq!(state.ramen.feeling_slot, [5, 6, 2]);
         assert_eq!(state.ramen.feeling_slot_source, "object_array_approximated");
 
@@ -1105,49 +1184,62 @@ mod tests {
         assert_eq!(state.ramen.feeling_slot_source, "int_array");
     }
 
-    // ── v0.4.0 注入数据解析测试 ──────────────────────────────────────
+    // ── v0.4.0/v0.4.2 注入数据解析测试 ──────────────────────────────
 
+    /// ★ v0.4.2 实测映射：101=速 105=耐 102=力 103=根 106=智；
+    /// 104 未知、601-605 合宿 → None
     #[test]
     fn test_command_id_to_train_idx() {
-        // 标准区间 101..=105
-        assert_eq!(command_id_to_train_idx(101), Some(0));
-        assert_eq!(command_id_to_train_idx(102), Some(1));
-        assert_eq!(command_id_to_train_idx(103), Some(2));
-        assert_eq!(command_id_to_train_idx(104), Some(3));
-        assert_eq!(command_id_to_train_idx(105), Some(4));
-        // 6xx 区间（training_levels 等字段使用）
-        assert_eq!(command_id_to_train_idx(601), Some(0));
-        assert_eq!(command_id_to_train_idx(605), Some(4));
-        // 技巧 106 / 未知 → None
-        assert_eq!(command_id_to_train_idx(106), None);
+        assert_eq!(command_id_to_train_idx(101), Some(0), "速");
+        assert_eq!(command_id_to_train_idx(105), Some(1), "耐（旧版错映射 4）");
+        assert_eq!(command_id_to_train_idx(102), Some(2), "力（旧版错映射 1）");
+        assert_eq!(command_id_to_train_idx(103), Some(3), "根（旧版错映射 2）");
+        assert_eq!(command_id_to_train_idx(106), Some(4), "智（旧版直接丢弃）");
+        assert_eq!(command_id_to_train_idx(104), None, "未知语义");
+        assert_eq!(command_id_to_train_idx(601), None, "合宿命令不映射（旧版错映射 0）");
+        assert_eq!(command_id_to_train_idx(605), None, "合宿命令不映射（旧版错映射 4）");
+        assert_eq!(command_id_to_train_idx(301), None, "外出");
+        assert_eq!(command_id_to_train_idx(390), None, "休息");
         assert_eq!(command_id_to_train_idx(999), None);
     }
 
+    /// ★ v0.4.2 编码：cardId = short*10 + limit_break（黑板协议实锤）
+    #[test]
+    fn test_encode_card_id() {
+        assert_eq!(encode_card_id(30137, 4), 301374, "神团满破 301374");
+        assert_eq!(encode_card_id(30312, 4), 303124);
+        assert_eq!(encode_card_id(30305, 0), 303050, "友人卡 0 突破");
+        assert_eq!(encode_card_id(30242, 4), 302424);
+    }
+
+    /// v0.4.2：kizuna/current_bond 合并 + 编码后键
     #[test]
     fn test_parse_support_bonds_kizuna_and_current_bond() {
         let json = r#"{
             "turn": 10,
             "chara": {"scenario_id": 14, "speed": 100},
             "support_cards": [
-                {"support_card_id": 302424, "kizuna": 70},
-                {"support_card_id": 302894, "kizuna": 40}
+                {"support_card_id": 30242, "limit_break_count": 4, "kizuna": 70},
+                {"support_card_id": 30289, "limit_break_count": 4, "kizuna": 40}
             ],
             "trainings": [
                 {"command_id": 101, "heads": 2, "partners": [
-                    {"support_card_id": 302424, "current_bond": 85},
-                    {"support_card_id": 302894, "current_bond": 55}
+                    {"support_card_id": 30242, "current_bond": 85},
+                    {"support_card_id": 30289, "current_bond": 55}
                 ]}
             ]
         }"#;
         let raw: HlpatchSummary = serde_json::from_str(json).unwrap();
         let state = reconcile(&raw).unwrap();
-        // current_bond 优先于 kizuna：302424 → 85（非 70），302894 → 55（非 40）
+        // current_bond 优先于 kizuna：30242(4突)→302424:85，30289(4突)→302894:55
         assert_eq!(state.support_bonds.len(), 2);
-        let mut map: std::collections::HashMap<u32, i32> = state.support_bonds.iter().cloned().collect();
-        assert_eq!(map.get(&302424), Some(&85));
-        assert_eq!(map.get(&302894), Some(&55));
+        let mut map: std::collections::HashMap<u32, i32> =
+            state.support_bonds.iter().cloned().collect();
+        assert_eq!(map.get(&302424), Some(&85), "短id 30242 编码为 302424");
+        assert_eq!(map.get(&302894), Some(&55), "短id 30289 编码为 302894");
     }
 
+    /// v0.4.2：601-605 合宿等级不再写进普通训练槽
     #[test]
     fn test_parse_training_levels_and_feelings() {
         let json = r#"{
@@ -1156,33 +1248,59 @@ mod tests {
             "training_levels": [
                 {"command_id": 101, "level": 3},
                 {"command_id": 103, "level": 5},
-                {"command_id": 601, "level": 2}
+                {"command_id": 601, "level": 5},
+                {"command_id": 605, "level": 5}
             ],
             "ramen": {
                 "command_feelings": [
                     {"command_id": 102, "feeling_id": 1},
-                    {"command_id": 104, "feeling_id": 2},
-                    {"command_id": 105, "feeling_id": 3}
+                    {"command_id": 105, "feeling_id": 2},
+                    {"command_id": 601, "feeling_id": 3}
                 ]
             }
         }"#;
         let raw: HlpatchSummary = serde_json::from_str(json).unwrap();
         let state = reconcile(&raw).unwrap();
-        // training_levels: 101→0(L3), 103→2(L5), 601→0(L2)；同一下标取最后解析值
+        // training_levels: 101→0(L3), 103→3(L5)；601/605 合宿被丢弃
         let tl: std::collections::HashMap<usize, i32> =
             state.training_levels.iter().cloned().collect();
-        assert_eq!(tl.get(&2), Some(&5));
-        // feeling_types: 102→1(A), 104→3(B), 105→4(C)
+        assert_eq!(tl.len(), 2, "合宿 601/605 不应出现");
+        assert_eq!(tl.get(&0), Some(&3));
+        assert_eq!(tl.get(&3), Some(&5), "根 103→槽 3（旧版错映射 2）");
+        // feeling_types: 102→2(A), 105→1(B)；601 合宿被丢弃
         let ft: std::collections::HashMap<usize, i32> =
             state.feeling_types.iter().cloned().collect();
-        assert_eq!(ft.get(&1), Some(&1));
-        assert_eq!(ft.get(&3), Some(&2));
-        assert_eq!(ft.get(&4), Some(&3));
+        assert_eq!(ft.len(), 2, "合宿角标不应出现");
+        assert_eq!(ft.get(&2), Some(&1), "力 102→槽 2");
+        assert_eq!(ft.get(&1), Some(&2), "耐 105→槽 1");
+    }
+
+    /// v0.4.2：evaluation 表解析出理事长(102)/记者(103)羁绊
+    #[test]
+    fn test_parse_evaluation_bonds() {
+        let json = r#"{
+            "turn": 20,
+            "chara": {"scenario_id": 14, "speed": 100},
+            "evaluation": [
+                {"target_id": 1, "partner_id": 1, "evaluation": 100, "current_bond": 100},
+                {"target_id": 102, "partner_id": 102, "evaluation": 100, "current_bond": 100},
+                {"target_id": 103, "partner_id": 103, "evaluation": 80, "current_bond": 42},
+                {"target_id": 104, "partner_id": 104, "evaluation": 0, "current_bond": 0},
+                {"target_id": 1120, "partner_id": 1120, "evaluation": 0, "current_bond": 0}
+            ]
+        }"#;
+        let raw: HlpatchSummary = serde_json::from_str(json).unwrap();
+        let state = reconcile(&raw).unwrap();
+        assert_eq!(
+            state.evaluation_bonds,
+            vec![(102, 100), (103, 42)],
+            "只保留 102=理事长/103=记者；103 取 current_bond=42"
+        );
     }
 
     #[test]
     fn test_injection_data_absent_is_empty() {
-        // 旧版 hlpatch 样本（无 support_cards / training_levels / command_feelings）
+        // 旧版 hlpatch 样本（无 support_cards / training_levels / command_feelings / evaluation）
         let json = r#"{
             "scenario": "Ramen",
             "turn": 10,
@@ -1193,5 +1311,6 @@ mod tests {
         assert!(state.support_bonds.is_empty());
         assert!(state.training_levels.is_empty());
         assert!(state.feeling_types.is_empty());
+        assert!(state.evaluation_bonds.is_empty());
     }
 }
