@@ -54,6 +54,19 @@
 //!   写入上游公开字段 person.friendship / base.train_level_count /
 //!   ramen.train_feeling_type，替掉 fast_forward 的重放近似。仅消费上游公开
 //!   字段，不改上游。
+//!
+//! v0.4.1（开局第1回合 panic 修复）：
+//! - ★ 实机首测复现：第1回合（内部0）必现 "panic during search"。根因是
+//!   fast_forward(0) 整段跳过，distribution 仍是 newgame 的空 vec（0 行），
+//!   而 Train 阶段的候选列举按 5 行分布取人头 → 越界。修复：
+//!   `ensure_distribution_built` 在内部回合 0 补跑 Begin+Distribute 两阶段
+//!   建分布（不推进回合），随后 inject_state 覆盖观测字段、
+//!   apply_observed_distribution 按实况人头重排
+//! - ★ fast_forward 的阶段失败此前被 `let _ =` 静默吞掉（turn 能推进但
+//!   distribution 全空正是这条静默路径的产物）；现在把失败打到 stderr
+//!   （cargo test 失败输出 / logcat 均可见），便于排障
+//! - ★ JNI catch_unwind 把 panic 载荷（String/&str）透出到浮窗错误里，
+//!   不再只显示 "panic during search"
 
 pub mod ramen_strategy;
 pub mod reconcile;
@@ -155,6 +168,10 @@ pub struct DecisionOutput {
 /// 使用固定种子的 StdRng：同一快照多次重放结果一致（可复现、可对比）。
 /// 单个阶段失败不阻断重放（继续推进，尽力走到目标回合）。
 ///
+/// v0.4.1：阶段失败不再静默——前 3 条错误打到 stderr（cargo test 失败
+/// 输出与 logcat 均可见）。CI gamedata 测试实证：turn 能推进但
+/// distribution 全空，正是这条静默路径掩盖了真实错误。
+///
 /// 返回实际执行的阶段数（诊断用）。
 fn fast_forward(game: &mut RamenGame, target_internal_turn: i32) -> usize {
     if target_internal_turn <= 0 {
@@ -168,13 +185,55 @@ fn fast_forward(game: &mut RamenGame, target_internal_turn: i32) -> usize {
     let mut steps = 0usize;
     // 防御上限：每回合最多 8 个阶段再留余量，避免异常状态死循环
     let guard_max = (target_internal_turn as usize + 2) * 8 + 64;
+    let mut err_logged = 0usize;
     // 与上游 run_full_game 相同的推进语义：先执行当前阶段，再推进
     while game.turn() < target_internal_turn && steps < guard_max {
-        let _ = game.run_stage(&trainer, &mut rng);
+        if let Err(e) = game.run_stage(&trainer, &mut rng) {
+            if err_logged < 3 {
+                eprintln!(
+                    "fast_forward: run_stage 失败 @turn={} stage={:?}: {e}",
+                    game.turn(),
+                    game.stage
+                );
+                err_logged += 1;
+            }
+        }
         steps += 1;
         if !game.next() {
             break; // 游戏结束
         }
+    }
+    steps
+}
+
+/// v0.4.1 修复「开局第1回合 panic during search」。
+///
+/// 内部回合 0（UI 第1回合）时 `fast_forward(0)` 整段跳过，`distribution`
+/// 仍是 `newgame` 的空 vec（0 行）。而 Train 阶段的候选列举按 5 行分布
+/// 取人头——空分布直接越界 panic。
+///
+/// 这里补跑 Begin + Distribute 两个阶段把 5 行分布建起来：不推进回合、
+/// 不执行 RamenSelect（阶段指针停在 RamenSelect，随后由 inject_state /
+/// run_search 按观测覆盖为 Train/RamenSelect）；之后
+/// `apply_observed_distribution` 会把人头重排到与实况一致。
+///
+/// 只在内部回合 0 且分布行数不足时触发；返回实际执行的阶段数。
+fn ensure_distribution_built(game: &mut RamenGame) -> usize {
+    if game.turn() != 0 || game.distribution().len() >= 5 {
+        return 0;
+    }
+    let trainer = RecommendedRamenTrainer::for_rollout();
+    let mut rng = StdRng::seed_from_u64(0x5EED_2026);
+    let mut steps = 0usize;
+    if let Err(e) = game.run_stage(&trainer, &mut rng) {
+        eprintln!("ensure_distribution_built: Begin 失败: {e}");
+    }
+    steps += 1;
+    if game.next() {
+        if let Err(e) = game.run_stage(&trainer, &mut rng) {
+            eprintln!("ensure_distribution_built: Distribute 失败: {e}");
+        }
+        steps += 1;
     }
     steps
 }
@@ -546,7 +605,8 @@ fn apply_observed_distribution(
 /// 流程：
 /// 1. reconcile hlpatch JSON → ReconciledState
 /// 2. 如果 confidence = Reject，返回错误
-/// 3. newgame → fast_forward（重放重建）→ inject_state（覆盖观测值）
+/// 3. newgame → fast_forward（重放重建）→ ensure_distribution_built（v0.4.1，
+///    内部回合 0 补建分布）→ inject_state（覆盖观测值）
 ///    → apply_observed_distribution（直读人头注入，v0.3.2）
 /// 4. 阶段判定（v0.4.0）：trainings 在场 = 行动画面 = 面已选完 → Train，
 ///    主决策即训练建议；trainings 空 → 按回合区间（RamenSelect 等）
@@ -650,6 +710,16 @@ pub fn run_search(
         target_internal,
         replay_steps
     );
+
+    // ★ v0.4.1：开局第1回合（内部0）重放整段跳过，分布仍是空 vec——
+    //   Train 阶段按 5 行分布索引会越界 panic（实机首测复现）。
+    //   补跑 Begin+Distribute 建分布后再继续。
+    let built_steps = ensure_distribution_built(&mut game);
+    if built_steps > 0 {
+        log::info!(
+            "ensure_distribution_built: {built_steps} stages (turn-0 replay skipped)"
+        );
+    }
 
     if let Err(e) = inject_state(&mut game, &mut reconciled) {
         return SearchResponse {
@@ -1021,13 +1091,23 @@ mod jni_exports {
         let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_search(&state_str, &config)
         }))
-        .map_err(|_| SearchResponse {
-            ok: false,
-            view: None,
-            decision: None,
-            training_decision: None,
-            reconcile: None,
-            error: Some("panic during search".into()),
+        .map_err(|payload| {
+            // v0.4.1：把 panic 消息透出到浮窗，不再只显示 "panic during search"
+            let msg = if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else {
+                "unknown panic (非字符串载荷)".to_string()
+            };
+            SearchResponse {
+                ok: false,
+                view: None,
+                decision: None,
+                training_decision: None,
+                reconcile: None,
+                error: Some(format!("panic during search: {msg}")),
+            }
         })
         .unwrap_or_else(|err| err);
 
@@ -1042,7 +1122,7 @@ mod jni_exports {
         _class: JClass,
     ) -> jstring {
         let v = serde_json::json!({
-            "version": "0.4.0",
+            "version": "0.4.1",
             "upstream": "xulai1001/umaai-rs",
             "upstream_commit": "eeae510b57ee9d29a475645a05c191e6ef5a6e72",
             "search": "ramen_mcts_trainer",
@@ -1056,7 +1136,8 @@ mod jni_exports {
             "training_decision": "computed_only_when_hlpatch_trainings_empty",
             "turn_convention": "hlpatch UI 1-based -> AI internal 0-based (turn-1); upstream displays turn()+1",
             "candidate_scores": "last_breakdown_reuse",
-            "pr22_direct_injection": "friendship/train_level_count/train_feeling_type from hlpatch"
+            "pr22_direct_injection": "friendship/train_level_count/train_feeling_type from hlpatch",
+            "turn0_distribution_fix": "ensure_distribution_built runs Begin+Distribute when replay skipped"
         })
         .to_string();
         jstring_from_str(&mut env, &v)
@@ -1303,5 +1384,70 @@ mod tests {
         // 注入应在 warnings 中留痕（inj 注入只在 gamedata 完整、搜索成功路径才执行，
         // 但 reconcile 层解析一定发生）
         eprintln!("reconcile warnings: {:?}", reconciled.warnings);
+    }
+
+    /// ★ v0.4.1 回归：开局第1回合（内部0）+ 行动画面 + v0.4.0 三路注入全开，
+    /// 搜索不得 panic（实机首测：第1回合必现 panic during search）。
+    /// 根因：fast_forward(0) 整段跳过 → distribution 空 vec → Train 阶段
+    /// 候选列举按 5 行分布索引越界。修复：ensure_distribution_built 补建分布。
+    /// 需要 gamedata（CI rust-check v0.4.1 起下载）。
+    #[test]
+    fn test_turn1_action_screen_no_panic() {
+        if !setup_gamedata() {
+            return;
+        }
+
+        // 形状对齐用户实机首测截图（第1回合）：速165 耐81 力109 根109 智117，
+        // 速训练1头/智训练3头，六卡羁绊全 0，训练等级全 1，角标 A/B/C
+        let json = r#"{
+            "scenario": "Ramen",
+            "turn": 1,
+            "chara": {"speed":165,"stamina":81,"power":109,"guts":109,"wiz":117,
+                      "vital":100,"max_vital":100,"motivation":3,
+                      "skill_point":320,"scenario_id":14},
+            "trainings": [
+                {"name":"Speed","command_id":101,"is_enable":1,"failure_rate":0,
+                 "heads":1,"shining":0,"partner_ids":[],"partners":[],
+                 "gains":{"Speed":13,"Power":2,"SkillPt":8,"HP":-20}},
+                {"name":"Wiz","command_id":105,"is_enable":1,"failure_rate":0,
+                 "heads":3,"shining":0,"partner_ids":[],"partners":[],
+                 "gains":{"Speed":7,"Wisdom":19,"SkillPt":18,"HP":5}}
+            ],
+            "support_cards": [
+                {"support_card_id":302424,"kizuna":0},
+                {"support_card_id":302894,"kizuna":0},
+                {"support_card_id":303044,"kizuna":0},
+                {"support_card_id":302924,"kizuna":0},
+                {"support_card_id":303024,"kizuna":0},
+                {"support_card_id":303054,"kizuna":0}
+            ],
+            "training_levels": [
+                {"command_id":601,"level":1},{"command_id":602,"level":1},
+                {"command_id":603,"level":1},{"command_id":604,"level":1},
+                {"command_id":605,"level":1}
+            ],
+            "ramen": {"checkpoint_pt":0,"special_feeling_num":0,"sozai":[0,0,0],
+                      "acquisition_gauges":[
+                          {"feeling_id":1,"remaining":7},
+                          {"feeling_id":2,"remaining":7},
+                          {"feeling_id":3,"remaining":7}],
+                      "command_feelings":[
+                          {"command_id":601,"feeling_id":1},
+                          {"command_id":602,"feeling_id":2},
+                          {"command_id":603,"feeling_id":3}]}
+        }"#;
+
+        let response = run_search(json, &test_config(8));
+        assert!(
+            response.ok,
+            "开局第1回合搜索不应失败: {:?}",
+            response.error
+        );
+        let decision = response.decision.as_ref().expect("应有主决策");
+        assert!(!decision.candidate_displays.is_empty(), "应有候选动作");
+        eprintln!(
+            "第1回合搜索成功: {} (n={} source={})",
+            decision.action_display, decision.search_n, decision.source
+        );
     }
 }
