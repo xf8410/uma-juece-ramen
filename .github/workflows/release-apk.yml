@@ -121,7 +121,7 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$VERSION" "$GITHUB_SHA"
+          git tag -a "$VERSION" -m "release ${VERSION}" "$GITHUB_SHA"
           git push origin "refs/tags/$VERSION"
           NOTES="${{ inputs.notes }}"
           if [ -z "$NOTES" ]; then
