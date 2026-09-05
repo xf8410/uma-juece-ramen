@@ -246,7 +246,8 @@ public final class FloatingWindowService extends Service implements HttpDataServ
      *   本函数（指纹不同）→ 升级为带人头搜索；
      *   3s 超时才放行一次无人头搜索（结果标 ⚠无人头）
      * - searchRunning 期间到达的人头推送：key 已不同，搜索完成后 render
-     *   会再次进入本函数自动补搜（自动升级，无需额外队列）
+     *   会再次进入本函数自动补搜（自动升级，无需额外队列）；
+     *   同 key 的回调推送则被 searchedKey 标记 SKIP（v0.3.6 防重复搜索）
      */
     private void maybeTriggerSearch(JSONObject s) {
         if (searchRunning || !UmaNativeBridge.isAvailable()) return;
@@ -481,12 +482,16 @@ public final class FloatingWindowService extends Service implements HttpDataServ
 
     /**
      * 触发搜索（v0.3.6）。
+     * 唯一搜索入口（RUN_NOW 与超时放行两条路径都汇到这里）：
+     * 进入即对 key 打 markSearched 标——此后同 key 的推送/搜索完成回调
+     * 再次进入 maybeTriggerSearch 一律 SKIP，杜绝同 key 循环搜索。
      *
      * @param hasHeads 本次快照是否带 trainings 人头（false 时结果标 ⚠无人头）
      */
     private void triggerSearch(JSONObject s, String key, boolean hasHeads) {
         searchRunning = true;
         lastSearchKey = key;
+        gate.markSearched(key); // 防重复搜索：本 key 已触发，同 key 再来由 gate SKIP
         pendingSummary = s;
         recommendView.setText("模拟搜索中..." + TrainingsGate.headsWarning(hasHeads));
 

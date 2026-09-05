@@ -56,6 +56,7 @@ final class TrainingsGate {
 
     private String waitedKey = "";     // 已在等人头的 key（防重复起等待）
     private String releasedKey = "";   // 已放行无人头搜索的 key（只放行一次）
+    private String searchedKey = "";   // 已实际触发过搜索的 key（防同 key 重复搜索）
 
     /**
      * 搜索去重键（v0.3.6）：直读 turn + month/half + vital + motivation +
@@ -81,7 +82,8 @@ final class TrainingsGate {
      * 回合新推送进入时调用。返回本回合应采取的动作：
      * - WAIT：人头未到且在防抖窗口内 → 先不搜，等人头推送（onTrainingsArrived 再触发）
      * - RUN_NOW：可以直接搜（带人头 / 或窗口超时放行无人头）
-     * - SKIP：同回合已处理过（重复推送/无人头已放行过）
+     * - SKIP：同回合已处理过（重复推送/无人头已放行过/有人头同 key 已搜过，
+     *   见 markSearched）
      *
      * @param key       searchKey(s) 的结果
      * @param obs       trainings 观测
@@ -91,6 +93,12 @@ final class TrainingsGate {
         // 有人头：直接可搜（旧逻辑里这本来就是最佳时机）
         if (obs.present) {
             waitedKey = "";
+            // v0.3.6 防重复搜索：同 key 已触发过搜索 → SKIP。
+            // 修复两类循环触发——①搜索完成回调 render(fresh,"搜索完成") 带同一条
+            // 有人头 summary 重新进入本方法再次 RUN_NOW；②trainings 非空但人头
+            // 全 0 时 present 恒为 true，同 key 无条件 RUN_NOW 反复命中循环搜索。
+            // key 变化（人头晚到、回合推进、人头数变化）不含在此列，照常触发。
+            if (key.equals(searchedKey)) return Decision.skip();
             return Decision.runNow(true);
         }
         // 无人头：
@@ -120,6 +128,17 @@ final class TrainingsGate {
     /** 人头推送到达（等待期间）：放行带人头搜索 */
     void onTrainingsArrived() {
         waitedKey = "";
+    }
+
+    /**
+     * 标记该 key 的搜索已实际触发（v0.3.6 防重复搜索）。
+     * 所有触发搜索的路径（onNewSummary 的 RUN_NOW、超时放行的无人头搜索）
+     * 统一在 FloatingWindowService.triggerSearch 入口调用本方法打标——
+     * 之后同 key 再次进入 onNewSummary 一律 SKIP；key 变化（人头晚到、
+     * 回合推进）产生新 key 不受影响，照常触发。
+     */
+    void markSearched(String key) {
+        searchedKey = key;
     }
 
     /** 是否对该 key 已放行过无人头搜索 */
@@ -160,6 +179,9 @@ final class TrainingsGate {
     void onSearchFailed(String key) {
         if (key.equals(failedKey)) failedCount++;
         else { failedKey = key; failedCount = 1; }
+        // 失败后解除本回合防重标记：bug2 的减半重试依赖「搜索完成后 render
+        // 回到 onNewSummary」再触发，不解除会把失败重试拦死（行为回归）
+        if (key.equals(searchedKey)) searchedKey = "";
     }
 
     /** 该 key 失败了几次（0 = 没失败过） */

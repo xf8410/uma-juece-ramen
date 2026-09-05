@@ -97,6 +97,72 @@ public class TrainingsGateTest {
         assertTrue(d.hasHeads);
     }
 
+    // ── 防重复搜索（v0.3.6 浮窗同 key 循环 bug） ─────────────────────
+
+    @Test public void sameKeyWithHeadsSecondArrivalSkips() {
+        // 场景1：有人头 summary 触发搜索后，搜索完成回调 render(fresh,"搜索完成")
+        // 带同一条 summary 重新进入 → 同 key 第二次到来必须 SKIP（不重复触发）
+        TrainingsGate gate = new TrainingsGate();
+        String key = TrainingsGate.searchKey(summary("31", TRAININGS));
+        TrainingsGate.Obs obs = TrainingsGate.Obs.fromSummary(summary("31", TRAININGS));
+        TrainingsGate.Decision first = gate.onNewSummary(key, obs, 1000);
+        assertTrue(first.isRunNow());
+        assertTrue(first.hasHeads);
+        gate.markSearched(key); // triggerSearch 统一入口打标
+        assertTrue(gate.onNewSummary(key, obs, 2000).isSkip());
+        assertTrue(gate.onNewSummary(key, obs, 3000).isSkip()); // 持续重推也拦
+    }
+
+    @Test public void zeroHeadsTrainingsSecondArrivalSkips() {
+        // 场景2：trainings 非空但人头全 0 → present=true（既有语义），同 key
+        // 不得无条件 RUN_NOW 循环搜索；指纹须与无人头 noT 可区分
+        String zeroHeads = "[{\"name\":\"Speed\",\"command_id\":101,\"heads\":0,\"shining\":0}," +
+                           "{\"name\":\"Power\",\"command_id\":103,\"heads\":0,\"shining\":0}]";
+        String key = TrainingsGate.searchKey(summary("31", zeroHeads));
+        assertTrue(key, key.endsWith(":0h0s"));
+        assertFalse(key.endsWith(":noT"));
+        TrainingsGate gate = new TrainingsGate();
+        TrainingsGate.Obs obs = TrainingsGate.Obs.fromSummary(summary("31", zeroHeads));
+        assertTrue(obs.present);
+        assertTrue(gate.onNewSummary(key, obs, 1000).isRunNow());
+        gate.markSearched(key);
+        assertTrue(gate.onNewSummary(key, obs, 2000).isSkip());
+    }
+
+    @Test public void lateHeadsNewKeyTriggersAfterNoHeadSearch() {
+        // 场景3：无人头先超时放行搜索，人头晚到产生新 key → 新 key 正常触发
+        TrainingsGate gate = new TrainingsGate();
+        String noT = TrainingsGate.searchKey(summary("31", null));
+        TrainingsGate.Obs noTObs = TrainingsGate.Obs.fromSummary(summary("31", null));
+        assertTrue(gate.onNewSummary(noT, noTObs, 1000).isWait());
+        assertTrue(gate.releaseWithoutTrainings(noT)); // 3s 超时放行（⚠ 无人头）
+        gate.markSearched(noT); // 无人头搜索已触发
+        assertTrue(gate.onNewSummary(noT, noTObs, 5000).isSkip()); // 旧 key 拦重复
+        // 人头晚到：指纹 0h0s/4h2s 与 noT 不同 → 新 key，必须正常 RUN_NOW
+        String withT = TrainingsGate.searchKey(summary("31", TRAININGS));
+        TrainingsGate.Obs obs = TrainingsGate.Obs.fromSummary(summary("31", TRAININGS));
+        assertFalse(noT.equals(withT));
+        TrainingsGate.Decision d = gate.onNewSummary(withT, obs, 6000);
+        assertTrue(d.isRunNow());
+        assertTrue(d.hasHeads);
+        gate.markSearched(withT);
+        assertTrue(gate.onNewSummary(withT, obs, 7000).isSkip()); // 补搜后闭环
+    }
+
+    @Test public void searchFailureClearsSearchedMarkForRetry() {
+        // bug2 联动：搜索失败必须解除防重标记，否则同 key 减半重试被拦死（行为回归）
+        TrainingsGate gate = new TrainingsGate();
+        String key = TrainingsGate.searchKey(summary("31", TRAININGS));
+        TrainingsGate.Obs obs = TrainingsGate.Obs.fromSummary(summary("31", TRAININGS));
+        assertTrue(gate.onNewSummary(key, obs, 1000).isRunNow());
+        gate.markSearched(key);
+        assertTrue(gate.onNewSummary(key, obs, 1500).isSkip()); // 成功语义：拦
+        gate.onSearchFailed(key);
+        assertEquals(1, gate.failureCount(key));
+        // 失败后同 key 再来 → 重试放行（次数减半由 triggerSearch 侧 retrySearchN 处理）
+        assertTrue(gate.onNewSummary(key, obs, 2000).isRunNow());
+    }
+
     // ── 失败重试（bug2） ─────────────────────────────────────────────
 
     @Test public void failureCountTracksPerKey() {
