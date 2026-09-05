@@ -18,25 +18,32 @@ import java.util.Locale;
 import java.util.UUID;
 
 /**
- * 训练数据上传器（数据零落盘直传 GitHub）。
+ * 训练数据上传器（App 直传 GitHub，可选保底通道）。
  *
- * RamenDecisionLogger 产出的 JSONL 行只进 RAM 队列，后台单线程攒批经
+ * 定位（持久化层上线后降级）：数据持久化的唯一权威是 TrainingDataStore
+ * （私有目录按 run 分文件全量保留）；本类只做「开关式可选保底」——用户
+ * 在设置里填了凭据并打开开关才工作，不填 token 不工作，行为保持不变。
+ *
+ * RamenDecisionLogger 产出的 JSONL 行进 RAM 双区，后台单线程攒批经
  * GitHub Contents API 直传远端仓库（main 分支）。HTTP 200/201 → 这批数据
  * 立即从内存释放；5xx/网络异常 → 留队列等下轮重试；4xx（凭据失效等重试
  * 无意义）→ 直接丢弃并记入错误状态（状态里可见）。任何分支都不写文件、
  * 不写游戏目录。
  *
- * 队列上限 200 条，满了丢最旧并累计丢弃数（新数据比旧数据对调参更有价值，
- * 丢最旧是刻意取舍）；溢出开始时经 OverflowListener 提示一次，队列清空后
- * 重置，下次溢出再提示，避免刷屏。
+ * RAM 双区（同一对象引用，不复制数据）：
+ * - pending 上传队列：ArrayDeque&lt;RamenRecord&gt;，上限 2000 条，满了丢最旧
+ *   并累计丢弃数（新数据比旧数据对调参更有价值，丢最旧是刻意取舍）；
+ *   溢出开始时经 OverflowListener 提示一次，队列清空后重置，下次溢出再
+ *   提示，避免刷屏
+ * - recent 环形缓存：上限 2000 条，记录产生时与 enqueue 同时机进入；
+ *   上传成功从 pending 删除时 recent 保留，环形超限丢最旧。本机 HTTP
+ *   API 的 /data 已改为读持久化层，recent 仅作会话内热数据与 /status
+ *   的 recent_len 计数来源
  *
  * 攒批触发：队列 ≥40 条，或距上次上传 ≥60 秒（两者先到先传）。积压超过
  * 单文件容量时自动分多次传（单文件行数/字节有上限，避免超出 Contents API
  * 请求体积限制）。文件名 data/{yyyyMMdd}/{HHmmss-SSS}-{uuid8}.jsonl 全局
  * 唯一 → 永远 201 新建，不存在并发覆盖。
- *
- * 无凭据或开关关闭时队列照常工作（容量/丢弃逻辑不变），补上凭据后下一轮
- * 自动把积攒数据传出去。
  *
  * 纯 Java（无 android.* 依赖），可 JVM 单测；HTTP 层抽为 Transport 接口，
  * 测试注入 fake transport。
@@ -62,6 +69,8 @@ public final class GitHubUploader {
     static final String REPO_CONTENTS = "repos/xf8410/uma-lamianbei-yuchengshuju/contents/";
 
     static final int MAX_QUEUE = 2000;
+    /** recent 环形缓存上限（与 pending 各自独立超限丢最旧）。 */
+    static final int MAX_RECENT = 2000;
     static final int BATCH_TRIGGER_LINES = 40;
     static final int MAX_BATCH_LINES = 60;
     static final int MAX_BATCH_BYTES = 512 * 1024;
@@ -70,7 +79,10 @@ public final class GitHubUploader {
     static final long IDLE_POLL_MS = 5_000L;
 
     private final Object lock = new Object();
-    private final ArrayDeque<String> queue = new ArrayDeque<>();
+    /** pending 上传队列（与 recent 存同一批 RamenRecord 引用）。 */
+    private final ArrayDeque<RamenRecord> queue = new ArrayDeque<>();
+    /** recent 环形缓存：记录产生时进入，上传成功不删，超限丢最旧。 */
+    private final ArrayDeque<RamenRecord> recent = new ArrayDeque<>();
     private final Transport transport;
     private final long flushIntervalMs;
 
@@ -78,8 +90,11 @@ public final class GitHubUploader {
     private boolean enabled;
     private boolean uploading;
     private int uploadAttempts;
+    private int uploadedTotal;
     private int totalDropped;
     private boolean overflowNotified;
+    /** enqueue(String) 兜底路径的进程内序号（正常路径 seq 由持久化层分配）。 */
+    private long standaloneSeq;
     private String lastError;
     private long lastErrorAt;
     private String lastUploadPath;
@@ -123,9 +138,31 @@ public final class GitHubUploader {
         }
     }
 
-    /** 追加一行 JSONL；队列满时丢最旧并计数（溢出开始时回调提示一次）。 */
+    /**
+     * 追加一行 JSONL（无持久化层上下文的兜底入口）：进程内自动分配序号并
+     * 进双区；队列满时丢最旧并计数（溢出开始时回调提示一次）。
+     */
     public void enqueue(String jsonlLine) {
         if (jsonlLine == null || jsonlLine.isEmpty()) return;
+        RamenRecord record;
+        synchronized (lock) {
+            record = new RamenRecord(jsonlLine, ++standaloneSeq);
+        }
+        addRecordLocked(record);
+    }
+
+    /**
+     * 追加一条已带 seq 的记录（正常路径：seq 由 TrainingDataStore 分配，
+     * 与磁盘全局位置一致）。进双区：pending 上传队列 + recent 环形缓存
+     * （同一对象引用）；队列满时丢最旧并计数（溢出开始时回调提示一次）。
+     */
+    public void enqueueRecord(RamenRecord record) {
+        if (record == null || record.jsonl == null || record.jsonl.isEmpty()) return;
+        addRecordLocked(record);
+    }
+
+    /** 双区入队（同一引用）：pending 溢出丢最旧计数，recent 环形超限丢最旧。 */
+    private void addRecordLocked(RamenRecord record) {
         boolean notifyOverflow = false;
         synchronized (lock) {
             if (queue.size() >= MAX_QUEUE) {
@@ -134,7 +171,9 @@ public final class GitHubUploader {
                 notifyOverflow = !overflowNotified;
                 overflowNotified = true;
             }
-            queue.addLast(jsonlLine);
+            queue.addLast(record);
+            if (recent.size() >= MAX_RECENT) recent.pollFirst(); // 环形超限丢最旧（静默）
+            recent.addLast(record);
             lock.notifyAll();
         }
         if (notifyOverflow) {
@@ -171,6 +210,36 @@ public final class GitHubUploader {
     public int getQueueSize() {
         synchronized (lock) {
             return queue.size();
+        }
+    }
+
+    /** recent 环形缓存当前条数（本机 HTTP API /status 的 recent_len）。 */
+    public int getRecentSize() {
+        synchronized (lock) {
+            return recent.size();
+        }
+    }
+
+    /** 累计成功上传条数（200/201 的记录总数；DELETE /data 不清零）。 */
+    public int getUploadedTotal() {
+        synchronized (lock) {
+            return uploadedTotal;
+        }
+    }
+
+    /**
+     * 清空内存双区（pending + recent），返回两区合计条数（各自分别计数
+     * 之和，同一记录在两区会被计两次）。丢弃/上传累计计数保留不清零；
+     * 队列清空 → 溢出提示复位（与上传成功清空同语义，复位逻辑不破坏）。
+     */
+    public int clearAllData() {
+        synchronized (lock) {
+            int deleted = queue.size() + recent.size();
+            queue.clear();
+            recent.clear();
+            overflowNotified = false; // 队列已空，溢出提示复位
+            lock.notifyAll();
+            return deleted;
         }
     }
 
@@ -213,7 +282,9 @@ public final class GitHubUploader {
                 o.put("credential_set", credential != null);
                 o.put("queue_lines", queue.size());
                 o.put("queue_max", MAX_QUEUE);
+                o.put("recent_lines", recent.size());
                 o.put("dropped_total", totalDropped);
+                o.put("uploaded_total", uploadedTotal);
                 o.put("upload_attempts", uploadAttempts);
                 o.put("last_upload_path", lastUploadPath == null ? "" : lastUploadPath);
                 o.put("last_upload_at", lastUploadAt);
@@ -259,7 +330,7 @@ public final class GitHubUploader {
     }
 
     private void uploadOneBatch() {
-        String[] batch;
+        RamenRecord[] batch;
         synchronized (lock) {
             if (queue.isEmpty()) return;
             batch = drainBatchLocked();
@@ -274,7 +345,7 @@ public final class GitHubUploader {
         try {
             apiPath = buildApiPath();
             StringBuilder payload = new StringBuilder();
-            for (String line : batch) payload.append(line).append('\n');
+            for (RamenRecord record : batch) payload.append(record.jsonl).append('\n');
             String b64 = Base64.getEncoder()
                     .encodeToString(payload.toString().getBytes(StandardCharsets.UTF_8));
             int code = transport.upload(apiPath, credential, b64);
@@ -310,6 +381,7 @@ public final class GitHubUploader {
                     if (succeeded) {
                         lastUploadPath = apiPath;
                         lastUploadAt = System.currentTimeMillis();
+                        uploadedTotal += batch.length;
                     }
                     if (queue.isEmpty()) overflowNotified = false; // 溢出提示复位
                 }
@@ -319,22 +391,22 @@ public final class GitHubUploader {
     }
 
     /** 出队攒一批：行数与字节双上限；单行超限也至少带走一行，避免卡队。 */
-    private String[] drainBatchLocked() {
-        List<String> out = new ArrayList<>();
+    private RamenRecord[] drainBatchLocked() {
+        List<RamenRecord> out = new ArrayList<>();
         long bytes = 0;
         while (!queue.isEmpty() && out.size() < MAX_BATCH_LINES) {
-            String line = queue.peekFirst();
-            int len = line.getBytes(StandardCharsets.UTF_8).length + 1;
+            RamenRecord record = queue.peekFirst();
+            int len = record.jsonl.getBytes(StandardCharsets.UTF_8).length + 1;
             if (!out.isEmpty() && bytes + len > MAX_BATCH_BYTES) break;
             queue.pollFirst();
-            out.add(line);
+            out.add(record);
             bytes += len;
         }
-        return out.toArray(new String[0]);
+        return out.toArray(new RamenRecord[0]);
     }
 
     /** 上传失败：按原顺序放回队头（FIFO 不变）；容量满则按丢最旧原则腾位。 */
-    private void requeueFrontLocked(String[] batch) {
+    private void requeueFrontLocked(RamenRecord[] batch) {
         for (int i = batch.length - 1; i >= 0; i--) {
             if (queue.size() >= MAX_QUEUE) {
                 queue.pollFirst();

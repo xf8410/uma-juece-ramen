@@ -193,4 +193,56 @@ public class GitHubUploaderTest {
         assertEquals(3, uploadedLines(t).size());
         assertEquals(0, u.getQueueSize());
     }
+
+    // ── 本机 HTTP API 适配（双区 / 计数 / 清盘） ─────────────────────
+
+    @Test public void enqueueRecordFeedsBothZonesKeepsRecentAndCountsUploaded() throws Exception {
+        FakeTransport t = new FakeTransport();
+        GitHubUploader u = uploader(t);
+        // 正常路径：持久化层分配 seq 的记录引用进双区（同一对象）
+        for (int i = 0; i < 3; i++) u.enqueueRecord(new RamenRecord("{\"i\":" + i + "}", i + 1L));
+        u.awaitAttempts(1, 3000);
+        assertTrue(u.awaitDrained(3000));
+        assertEquals("上传成功清空队列", 0, u.getQueueSize());
+        assertEquals("recent 不随上传清空（会话内热数据 + recent_len 来源）", 3, u.getRecentSize());
+        assertEquals("uploaded_total 累计成功上传条数", 3, u.getUploadedTotal());
+        assertEquals(3, uploadedLines(t).size());
+    }
+
+    @Test public void recentRingDropsOldestSilentlyAtCapacity() {
+        FakeTransport t = new FakeTransport();
+        GitHubUploader u = new GitHubUploader(t, 80L);
+        u.setCredential("test-credential");
+        u.setEnabled(false); // 关开关：行为确定，不触发上传
+        for (int i = 0; i < 2010; i++) u.enqueueRecord(new RamenRecord("{\"i\":" + i + "}", i + 1L));
+        assertEquals("pending 队列 2000 上限丢最旧计数", 2000, u.getQueueSize());
+        assertEquals("recent 环形缓存 2000 独立丢最旧", 2000, u.getRecentSize());
+        assertEquals("丢弃只计 pending 溢出（recent 静默）", 10, u.getTotalDropped());
+    }
+
+    @Test public void clearAllDataEmptiesBothZonesKeepsCountersResetsNotice() {
+        FakeTransport t = new FakeTransport();
+        GitHubUploader u = new GitHubUploader(t, 80L);
+        u.setCredential("test-credential");
+        u.setEnabled(false);
+        AtomicInteger overflowCallbacks = new AtomicInteger();
+        u.setOverflowListener(dropped -> overflowCallbacks.incrementAndGet());
+
+        for (int i = 0; i < 2050; i++) u.enqueue("{\"i\":" + i + "}");
+        assertEquals(50, u.getTotalDropped());
+        assertEquals("溢出提示一次", 1, overflowCallbacks.get());
+
+        int deleted = u.clearAllData();
+        assertEquals("两区合计（同一记录在 queue/recent 各计一次）", 4000, deleted);
+        assertEquals(0, u.getQueueSize());
+        assertEquals(0, u.getRecentSize());
+        assertEquals("累计丢弃保留不清零", 50, u.getTotalDropped());
+        assertEquals("队列清空 → 溢出提示复位（不破坏复位语义）", 1, overflowCallbacks.get());
+
+        // 复位后再次溢出：再提示一次，丢弃计数继续累加
+        for (int i = 0; i < 2050; i++) u.enqueue("{\"j\":" + i + "}");
+        assertEquals("丢弃累计继续", 100, u.getTotalDropped());
+        assertEquals("复位后再次提示", 2, overflowCallbacks.get());
+        assertEquals(2000, u.getQueueSize());
+    }
 }
