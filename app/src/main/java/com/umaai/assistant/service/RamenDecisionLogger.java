@@ -10,11 +10,15 @@ import java.util.Locale;
 /**
  * 决策日志 — 真实对局数据收集，喂 rust/src/optimize.rs 调参。
  *
- * v0.3.6 起数据零落盘：每回合（hlpatch summary + Rust decision）合成一行
- * JSONL，只进 RAM 队列（GitHubUploader），后台攒批 HTTPS 直传 GitHub 仓库
- * xf8410/uma-lamianbei-yuchengshuju（Contents API，main 分支）。收到 200/201
- * 这批数据立即从内存删除；失败留队列重试（上限 2000 条，满了丢最旧并提示）。
- * 任何代码分支都不写文件、不写游戏目录。
+ * 数据去向双通道（v0.3.7 起）：
+ * - 持久化（唯一权威）：TrainingDataStore 写 App 私有目录 training_data/
+ *   （按 run 分文件、全量保留、逐条 write+force ≤1 秒落盘），本机 HTTP
+ *   API 的 /data 直接读它，进程重启后数据与 seq 延续
+ * - App 直传（可选保底）：JSONL 行同时进 RAM 双区（GitHubUploader），
+ *   攒批直传 GitHub 仓库 xf8410/uma-lamianbei-yuchengshuju（Contents API，
+ *   main 分支）。开关式：设置里填了凭据并打开开关才工作；收到 200/201
+ *   这批数据立即从内存删除；失败留队列重试（上限 2000 条，满了丢最旧并
+ *   提示）。任何代码分支都不写文件、不写游戏目录
  *
  * JSONL 行格式一字未改（PC 端离线工具按 run 分组消费，兼容是硬要求）：
  * <pre>
@@ -38,7 +42,7 @@ import java.util.Locale;
  * 对照模拟器策略分、outcome 作回归目标，校准 rust/strategy_optimized.json。
  * （fans 键名对齐协议 chara_info.fans；fan_count 为兼容别名，两键同值输出）
  *
- * 纯 Java（无 android.* 依赖），可 JVM 单测；上传失败静默（不影响浮窗）。
+ * 纯 Java（无 android.* 依赖），可 JVM 单测；失败静默（不影响浮窗）。
  */
 public final class RamenDecisionLogger {
     /** 拉面杯最后一回合：3 年 × 24 回合 + 超级拉面 5 回合（协议 CONFIRMED） */
@@ -52,6 +56,7 @@ public final class RamenDecisionLogger {
     private static String lastTurnKey;
     private static JSONObject lastSummary;
     private static GitHubUploader uploader;
+    private static TrainingDataStore store;
 
     private RamenDecisionLogger() {}
 
@@ -61,8 +66,10 @@ public final class RamenDecisionLogger {
      *
      * @param credential 远端同步凭据（null/空白 = 未配置，队列照常积攒）
      * @param enabled    上传总开关
+     * @param dataStore  持久化层（null = 降级为仅内存队列，/data 无数据）
      */
-    public static void init(int configUmaId, int[] configCards, String credential, boolean enabled) {
+    public static void init(int configUmaId, int[] configCards, String credential,
+                            boolean enabled, TrainingDataStore dataStore) {
         synchronized (LOCK) {
             umaId = configUmaId;
             cards = configCards == null ? new int[0] : configCards.clone();
@@ -70,6 +77,7 @@ public final class RamenDecisionLogger {
             outcomeWritten = false;
             lastTurnKey = null;
             lastSummary = null;
+            store = dataStore;
             GitHubUploader u = ensureUploaderLocked();
             u.setCredential(credential);
             u.setEnabled(enabled);
@@ -168,6 +176,13 @@ public final class RamenDecisionLogger {
         return uploader;
     }
 
+    /** 本机 HTTP API 数据源（包私有）：RAM 双区所在的上传器实例。 */
+    static GitHubUploader uploaderForApi() {
+        synchronized (LOCK) {
+            return ensureUploaderLocked();
+        }
+    }
+
     private static void startRunLocked() {
         String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
         runId = "r" + stamp;
@@ -233,15 +248,40 @@ public final class RamenDecisionLogger {
                 || summary.has("fans") || summary.has("fan_count");
     }
 
-    /** 只进 RAM 队列（GitHubUploader），绝不写文件 —— 数据零落盘红线。 */
+    /**
+     * 数据双通道出站（数据不丢）：
+     * - 持久化（唯一权威）：TrainingDataStore.append 分配 seq（与磁盘全局
+     *   位置一致）并异步落盘（≤1 秒，逐条 write+force）
+     * - RAM 上传队列（可选保底）：同一记录引用进 pending + recent 双区
+     * 持久化层异常时降级为仅内存队列（数据仍可被上传通道带走）。
+     */
     private static void enqueueLocked(JSONObject line) {
-        ensureUploaderLocked().enqueue(line.toString());
+        String jsonl = line.toString();
+        GitHubUploader u = ensureUploaderLocked();
+        TrainingDataStore s = store;
+        if (s != null) {
+            try {
+                RamenRecord record = s.append(runId, jsonl);
+                if (record != null) {
+                    u.enqueueRecord(record);
+                    return;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        u.enqueue(jsonl); // 兜底：仅内存（无持久化层或其异常时）
     }
 
     // ── 测试辅助（包私有） ────────────────────────────────────────────
 
     /** 测试专用：注入预配置的上传器（fake transport），并重置 run 生命周期。 */
     static void initForTest(int configUmaId, int[] configCards, GitHubUploader testUploader) {
+        initForTest(configUmaId, configCards, testUploader, null);
+    }
+
+    /** 测试专用：同上，并注入持久化层（临时目录实例）。 */
+    static void initForTest(int configUmaId, int[] configCards, GitHubUploader testUploader,
+                            TrainingDataStore testStore) {
         synchronized (LOCK) {
             umaId = configUmaId;
             cards = configCards == null ? new int[0] : configCards.clone();
@@ -250,6 +290,7 @@ public final class RamenDecisionLogger {
             lastTurnKey = null;
             lastSummary = null;
             uploader = testUploader;
+            store = testStore;
         }
     }
 

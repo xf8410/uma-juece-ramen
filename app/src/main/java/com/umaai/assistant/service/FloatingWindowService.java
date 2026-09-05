@@ -19,6 +19,7 @@ import android.view.WindowManager;
 import android.widget.TextView;
 import android.widget.Toast;
 import androidx.core.app.NotificationCompat;
+import com.umaai.assistant.BuildConfig;
 import com.umaai.assistant.R;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -105,6 +106,8 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private static final long STALE_MS = 5000;
     private static final int DEFAULT_UMA_ID = 102601;
     private static final int[] DEFAULT_CARDS = {302424, 302894, 303044, 302924, 303024, 303054};
+    /** 服务销毁前等待持久化写盘队列清空的上限（毫秒）。 */
+    private static final long STORE_FLUSH_MS = 2_000;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private WindowManager windowManager;
@@ -112,6 +115,10 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private TextView turnView, recommendView, statusView, ramenView, trainingsView, sourceView;
     private BoardChartsView chartsView;
     private HttpDataService server;
+    /** 持久化层（私有目录 training_data/，数据全量保留；null = 创建失败降级仅内存）。 */
+    private TrainingDataStore trainingStore;
+    /** 本机 HTTP API（127.0.0.1:18767，回环隔离；null = 启动失败不影响浮窗）。 */
+    private RamenHttpApiServer apiServer;
     private volatile boolean polling, searchRunning;
     private volatile long lastDataAt;
     private volatile String lastSearchKey = "";
@@ -140,12 +147,25 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                 .getBoolean(PREF_COMPACT, false);
         createPanel();
         createToggleButton();
+        // 持久化层（唯一权威）：私有目录 training_data/ 按 run 分文件全量保留，
+        // 逐条 write+force ≤1 秒落盘；失败重试不丢数据（回调只记日志）。
+        // 创建失败降级为仅内存队列（直传保底仍可用），不影响浮窗
+        try {
+            trainingStore = new TrainingDataStore(getFilesDir()); // 内部自建 training_data/ 子目录
+            trainingStore.setWriteErrorListener((msg, pending) ->
+                    Log.e(TAG, "training_data write failed (pending " + pending + "): " + msg));
+        } catch (Exception e) {
+            Log.e(TAG, "training data store init failed, memory-only mode", e);
+            trainingStore = null;
+        }
         // 决策日志：真实对局数据收集（outcome 的 config 回显本服务固定搜索配置）。
-        // 数据零落盘：只进 RAM 队列，攒批直传远端仓库（凭据/开关存私有配置）
+        // 双通道：持久化（唯一权威）+ RAM 队列攒批直传远端仓库（可选保底，
+        // 凭据/开关存私有配置）
         SharedPreferences syncPrefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         RamenDecisionLogger.init(DEFAULT_UMA_ID, DEFAULT_CARDS,
                 syncPrefs.getString(GitHubUploadSettings.PREF_CREDENTIAL, ""),
-                syncPrefs.getBoolean(GitHubUploadSettings.PREF_ENABLED, false));
+                syncPrefs.getBoolean(GitHubUploadSettings.PREF_ENABLED, false),
+                trainingStore);
         // 队列满丢最旧：提示一次即可（溢出开始时回调，队列清空后复位）
         RamenDecisionLogger.setOverflowListener(dropped ->
                 main.post(() -> Toast.makeText(this,
@@ -157,6 +177,16 @@ public final class FloatingWindowService extends Service implements HttpDataServ
             Log.e(TAG, "HTTP server start failed", e);
             stopSelf();
             return;
+        }
+        // 本机 HTTP API（127.0.0.1:18767，回环隔离硬要求）：供 Agora-Workbench
+        // 读取/清空训练数据。启动失败只记日志，不影响浮窗主功能
+        try {
+            apiServer = new RamenHttpApiServer(RamenDecisionLogger.uploaderForApi(),
+                    trainingStore, this::summaryForApi, BuildConfig.VERSION_NAME);
+            apiServer.startServer();
+        } catch (Exception e) {
+            Log.e(TAG, "API server start failed", e);
+            apiServer = null;
         }
         startPolling();
         initNativeSearch();
@@ -172,16 +202,75 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     public void onDestroy() {
         polling = false;
         if (server != null) server.stopServer();
+        if (apiServer != null) apiServer.stopServer();
         if (windowManager != null) {
             if (panel != null) windowManager.removeView(panel);
             if (toggleBtn != null) windowManager.removeView(toggleBtn);
         }
-        RamenDecisionLogger.flush(); // 收尾当前 run（幂等）
+        RamenDecisionLogger.flush(); // 收尾当前 run（幂等，outcome 入持久化+内存双通道）
+        if (trainingStore != null) {
+            trainingStore.flushPending(STORE_FLUSH_MS); // 尽量写完最后几条再退
+            trainingStore.shutdown();
+        }
         super.onDestroy();
     }
 
     @Override
     public void onDataReceived(String data) { consume(data, "实时"); }
+
+    // ── 本机 HTTP API：GET /summary 数据源 ────────────────────────────
+
+    /**
+     * 当前黑板/训练状态摘要（浮窗渲染所用的最后一条 hlpatch summary +
+     * 最近一次搜索结果）。无数据时返回 turn=-1。字段自定（契约只要求
+     * 含 turn 与关键状态摘要），主线程外被 API 线程调用，只读 volatile。
+     */
+    private JSONObject summaryForApi() {
+        JSONObject out = new JSONObject();
+        try {
+            JSONObject s = lastSummary;
+            if (s == null) {
+                out.put("turn", -1);
+                out.put("has_data", false);
+                return out;
+            }
+            out.put("has_data", true);
+            out.put("turn", s.optInt("turn", -1));
+            out.put("month", s.optInt("month", -1));
+            out.put("half", s.optInt("half", -1));
+            JSONObject chara = s.optJSONObject("chara");
+            if (chara == null) chara = s.optJSONObject("stats");
+            if (chara != null) {
+                JSONObject c = new JSONObject();
+                c.put("speed", chara.optInt("speed"));
+                c.put("stamina", chara.optInt("stamina"));
+                c.put("power", chara.optInt("power"));
+                c.put("guts", chara.optInt("guts"));
+                c.put("wiz", chara.optInt("wiz"));
+                c.put("vital", chara.optInt("vital", -1));
+                c.put("max_vital", chara.optInt("max_vital", -1));
+                c.put("motivation", chara.optString("motivation", ""));
+                c.put("skill_point", chara.optInt("skill_point", -1));
+                out.put("chara", c);
+            }
+            JSONObject ramen = s.optJSONObject("ramen");
+            if (ramen != null) out.put("ramen", ramen);
+            out.put("ai_ready", UmaNativeBridge.isAvailable());
+            out.put("searching", searchRunning);
+            out.put("data_age_ms", System.currentTimeMillis() - lastDataAt);
+            JSONObject result = lastSearchResult;
+            if (result != null && result.optBoolean("ok", false)) {
+                JSONObject decision = result.optJSONObject("decision");
+                if (decision != null) out.put("decision", decision);
+                JSONObject td = result.optJSONObject("training_decision");
+                if (td != null) out.put("training_decision", td);
+            }
+            return out;
+        } catch (Exception e) {
+            // Android put 声明受检异常；以上全为固定结构，实际不会触发
+            return out;
+        }
+    }
 
     // ── 数据接收 ──────────────────────────────────────────────────────
 

@@ -220,4 +220,54 @@ public class RamenDecisionLoggerTest {
                         "vital", "max_vital", "skill_point", "fans", "fan_count", "checkpoint_pt")),
                 new HashSet<>(fieldNames(out.getJSONObject("final"))));
     }
+
+    // ── 持久化双通道路由（本机 HTTP API 适配） ───────────────────────
+
+    @Test public void decisionsRouteThroughStoreWithMatchingSeqAndUpload() throws Exception {
+        java.io.File parent = new java.io.File(tmpRoot(), "logger-" + System.nanoTime());
+        TrainingDataStore store = new TrainingDataStore(parent, 10L);
+        FakeTransport t = new FakeTransport();
+        RamenDecisionLogger.initForTest(102601, new int[]{1, 2}, uploader(t), store);
+        try {
+            JSONObject s1 = summary(1, 120, 0);
+            RamenDecisionLogger.onSummary(s1);
+            RamenDecisionLogger.onDecision(s1, decision(), "1:6:1:80:絕好:0:2:2:1");
+            JSONObject s2 = summary(2, 130, 10);
+            RamenDecisionLogger.onSummary(s2);
+            RamenDecisionLogger.onDecision(s2, decision(), "2:6:1:80:絕好:0:2:2:1");
+            RamenDecisionLogger.flush(); // 收尾 outcome 行
+            RamenDecisionLogger.awaitIdle();
+            assertTrue("落盘 ≤1 秒预算（逐条 write+force）", store.flushPending(1_000));
+
+            // 上传通道与持久化层是同一条数据的两个出口：行一致、seq 一致、不重不漏
+            List<String> uploaded = uploadedLines(t);
+            List<RamenRecord> persisted = store.read(0, 100);
+            assertEquals("两通道行数一致", uploaded.size(), persisted.size());
+            assertTrue("至少覆盖 turn 与 outcome 两类行", persisted.size() >= 2);
+            for (int i = 0; i < persisted.size(); i++) {
+                assertEquals("同一记录：上传行 == 落盘行（JSONL 字段一字不改）",
+                        uploaded.get(i), persisted.get(i).jsonl);
+                assertTrue("seq 由持久化层分配且单调 ≥1", persisted.get(i).seq >= 1);
+            }
+            assertTrue(store.getPersistedLines() >= 2);
+        } finally {
+            store.shutdown();
+            deleteRecursively(parent);
+        }
+    }
+
+    /** 测试根目录：默认 build/tmp-tests（gitignored）；可用 -Dramen.test.tmpdir
+     *  覆盖（个别网络文件系统存在写后可见性怪癖，本地验证可指到本地盘）。 */
+    private static java.io.File tmpRoot() {
+        String override = System.getProperty("ramen.test.tmpdir");
+        return new java.io.File(override != null ? override : "build/tmp-tests");
+    }
+
+    private static void deleteRecursively(java.io.File f) {
+        java.io.File[] children = f.listFiles();
+        if (children != null) {
+            for (java.io.File c : children) deleteRecursively(c);
+        }
+        f.delete();
+    }
 }
