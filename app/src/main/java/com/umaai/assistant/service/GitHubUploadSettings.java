@@ -74,7 +74,7 @@ final class GitHubUploadSettings {
 
     private static LinearLayout buildPanel(Service svc) {
         JSONObject st = status();
-        boolean onNow = st.optBoolean("enabled", false);
+        boolean onNow = st != null && st.optBoolean("enabled", false);
         String credentialNow = svc.getSharedPreferences(PREFS_NAME, Service.MODE_PRIVATE)
                 .getString(PREF_CREDENTIAL, "");
 
@@ -171,17 +171,18 @@ final class GitHubUploadSettings {
         return b;
     }
 
+    /** 读取上传状态；解析失败返回 null（describeStatus 兜底"状态不可用"）。 */
     private static JSONObject status() {
         try {
             return new JSONObject(RamenDecisionLogger.uploadStatus());
         } catch (Exception e) {
-            return new JSONObject();
+            return null;
         }
     }
 
     /** 队列/丢弃/最近结果一行文，与本地接口 GET /decision_log 同源。 */
     private static String describeStatus(JSONObject s) {
-        if (s.length() == 0) return "状态不可用";
+        if (s == null || s.length() == 0) return "状态不可用";
         String err = s.optString("last_error", "");
         String path = s.optString("last_upload_path", "");
         String recent;

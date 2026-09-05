@@ -1,5 +1,6 @@
 package com.umaai.assistant.service;
 
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.IOException;
@@ -206,18 +207,23 @@ public final class GitHubUploader {
     /** 本地接口展示用：上传状态 JSON（队列条数/累计丢弃/最近结果/最近错误）。 */
     public String statusJson() {
         synchronized (lock) {
-            JSONObject o = new JSONObject();
-            o.put("enabled", enabled);
-            o.put("credential_set", credential != null);
-            o.put("queue_lines", queue.size());
-            o.put("queue_max", MAX_QUEUE);
-            o.put("dropped_total", totalDropped);
-            o.put("upload_attempts", uploadAttempts);
-            o.put("last_upload_path", lastUploadPath == null ? "" : lastUploadPath);
-            o.put("last_upload_at", lastUploadAt);
-            o.put("last_error", lastError == null ? "" : lastError);
-            o.put("last_error_at", lastErrorAt);
-            return o.toString();
+            try {
+                JSONObject o = new JSONObject();
+                o.put("enabled", enabled);
+                o.put("credential_set", credential != null);
+                o.put("queue_lines", queue.size());
+                o.put("queue_max", MAX_QUEUE);
+                o.put("dropped_total", totalDropped);
+                o.put("upload_attempts", uploadAttempts);
+                o.put("last_upload_path", lastUploadPath == null ? "" : lastUploadPath);
+                o.put("last_upload_at", lastUploadAt);
+                o.put("last_error", lastError == null ? "" : lastError);
+                o.put("last_error_at", lastErrorAt);
+                return o.toString();
+            } catch (JSONException e) {
+                // Android 端 put 声明受检异常；纯类型值实际不会触发
+                return "{\"status_error\":\"json_build_failed\"}";
+            }
         }
     }
 
@@ -416,11 +422,18 @@ public final class GitHubUploader {
         @Override
         public int upload(String apiPath, String credential, String base64Content) throws IOException {
             String name = apiPath.substring(apiPath.lastIndexOf('/') + 1);
-            JSONObject body = new JSONObject();
-            body.put("message", "sync " + name);
-            body.put("content", base64Content);
-            body.put("branch", "main");
-            byte[] out = body.toString().getBytes(StandardCharsets.UTF_8);
+            byte[] out;
+            try {
+                JSONObject body = new JSONObject();
+                body.put("message", "sync " + name);
+                body.put("content", base64Content);
+                body.put("branch", "main");
+                out = body.toString().getBytes(StandardCharsets.UTF_8);
+            } catch (JSONException e) {
+                // Android 端 put 声明受检异常；固定结构实际不会触发，
+                // 真发生则按网络异常处理（留队重试）
+                throw new IOException("request build failed", e);
+            }
 
             HttpURLConnection c = (HttpURLConnection) new URL(API_BASE + apiPath).openConnection();
             try {
