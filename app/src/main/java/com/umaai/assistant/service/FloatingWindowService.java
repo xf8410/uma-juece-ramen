@@ -5,6 +5,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.graphics.PixelFormat;
 import android.os.Build;
 import android.os.Handler;
@@ -16,6 +17,7 @@ import android.view.LayoutInflater;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.TextView;
+import android.widget.Toast;
 import androidx.core.app.NotificationCompat;
 import com.umaai.assistant.R;
 import org.json.JSONArray;
@@ -33,9 +35,10 @@ import java.util.Locale;
  * - hlpatch so 推送 JSON → HttpDataService(:18766) 或轮询(:18765/summary)
  * - JSON 透传给 UmaNativeBridge.search() → Rust reconcile + 重放重建 + MCTS 搜索
  * - 返回结构化 JSON（view + decision + training_decision + reconcile）→ 渲染浮窗
- * - 决策日志：每回合 summary+decision 一行、局末 outcome 一行追加到
- *   decision_log.jsonl（RamenDecisionLogger，GET /decision_log 可拉取），
- *   目标是喂 rust/src/optimize.rs 用真实对局校准 strategy_optimized.json
+ * - 决策日志：每回合 summary+decision 一行、局末 outcome 一行，只进 RAM
+ *   队列（RamenDecisionLogger → GitHubUploader）攒批直传 GitHub 仓库，
+ *   数据零落盘；GET /decision_log 返回上传状态；长按「简/详」按钮可打开
+ *   上传设置（GitHubUploadSettings）
  *
  * 显示内容（对齐 PC 黑板，EtherealAO 版）：
  * - 主建议 + 搜索规模（建议：吃面/函馆-耐（mean 66972 · 4096次/12.7s））
@@ -51,6 +54,12 @@ import java.util.Locale;
  *   条形图/运气/⚠警告/训练建议，只留回合行+主建议行；「详」= 全部展开。
  *   状态持久化（SharedPreferences），重开服务保持
  * - 运气/百分比格式改 Locale.US，避免个别系统区域设置产出本地化数字
+ *
+ * v0.3.6 变更：
+ * - 数据零落盘直传 GitHub：RamenDecisionLogger 产出的 JSONL 行不再写文件，
+ *   只进 RAM 队列，后台攒批（约40条或60秒）直传远端仓库；失败留队列重试，
+ *   队列满丢最旧时 Toast 提示一次。长按「简/详」小按钮打开上传设置
+ *   （凭据 + 开关，存私有配置）
  *
  * v0.3.4 变更：
  * - ⚠ 校正警告显示原文（最多2条/每条40字），不再是干巴巴的条数——
@@ -131,8 +140,16 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                 .getBoolean(PREF_COMPACT, false);
         createPanel();
         createToggleButton();
-        // 决策日志：真实对局数据收集（outcome 的 config 回显本服务固定搜索配置）
-        RamenDecisionLogger.init(getFilesDir(), DEFAULT_UMA_ID, DEFAULT_CARDS);
+        // 决策日志：真实对局数据收集（outcome 的 config 回显本服务固定搜索配置）。
+        // 数据零落盘：只进 RAM 队列，攒批直传远端仓库（凭据/开关存私有配置）
+        SharedPreferences syncPrefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        RamenDecisionLogger.init(DEFAULT_UMA_ID, DEFAULT_CARDS,
+                syncPrefs.getString(GitHubUploadSettings.PREF_CREDENTIAL, ""),
+                syncPrefs.getBoolean(GitHubUploadSettings.PREF_ENABLED, false));
+        // 队列满丢最旧：提示一次即可（溢出开始时回调，队列清空后复位）
+        RamenDecisionLogger.setOverflowListener(dropped ->
+                main.post(() -> Toast.makeText(this,
+                        "上传队列已满，已丢弃最旧 " + dropped + " 条", Toast.LENGTH_LONG).show()));
         try {
             server = new HttpDataService(this);
             server.startServer();
@@ -521,6 +538,11 @@ public final class FloatingWindowService extends Service implements HttpDataServ
             if (snap != null) {
                 main.post(() -> render(snap, "视图切换"));
             }
+        });
+        // 长按：打开上传设置（凭据 + 开关，App 内操作，无需 PC/adb）
+        toggleBtn.setOnLongClickListener(v -> {
+            GitHubUploadSettings.show(this);
+            return true;
         });
         windowManager.addView(toggleBtn, p);
     }
