@@ -38,48 +38,57 @@ import java.util.Locale;
  *   目标是喂 rust/src/optimize.rs 用真实对局校准 strategy_optimized.json
  *
  * 显示内容（对齐 PC 黑板，EtherealAO 版）：
- * - 主建议 + 搜索规模（建议：吃面/函馆-耐（mean 66972 · 4096次/12.7s））
+ * - 主建议 + 搜索规模（建议：吃面/函馆-耐（终局均分 66972 · 4096次/12.7s））
  * - 候选条形图（BoardChartsView：每候选一行 标签+比例条+相对差值，选中项绿色，
  *   喂 decision 的 candidate_displays/candidate_scores/action_index）
- * - 训练建议（训练建议：速度训练（mean X · 64次/…ms），来自 Rust Train 阶段补搜）
- * - 训练明细行（速: 速46 力14 27pt 体力-25 失败10% 头3光2）
+ * - 训练建议（建议：耐×5（较次优 +312 · 64次/…ms），来自 Rust Train 阶段补搜；
+ *   显示相对差值而非绝对 mean——绝对分是终局期望总分，对"这回合练谁"没意义）
+ * - 训练明细行（速: 速46 力14 27pt 体力-25 失败10% 人数3光2）
  * - 运气行（v0.3.4：运:总±X 回±Y，见下）
  *
+ * v0.3.6 变更（决策可信度三连修）：
+ * - ★ bug1 防提前计算：hlpatch 同一回合会推两种 summary——回合初（trainings
+ *   空）和行动画面（trainings 带真实人头）。旧 searchKey 不含 trainings 指纹，
+ *   回合初先到先搜（无人头假盘面），人头晚到因 key 相同不再重搜。现在：
+ *   ① searchKey 纳入 trainings 指纹（TrainingsGate.searchKey）；
+ *   ② 无人头先等人头 3s（TrainingsGate 状态机），等不到才放行并标
+ *   「⚠无人头(已等待3s)」；③ 人头到达产生新 key 自动触发带人头补搜。
+ *   MCTS 从此默认对真实人头盘面评估（v0.3.2 人头注入真正吃到数据）
+ * - ★ bug2 搜索失败可见可重试：UmaNativeBridge 返回 null（JNI 异常等）旧版
+ *   落到"等待搜索…"永远卡住。现在 null 显式转 {"ok":false,"error":"native无结果"}
+ *   并显示「搜索失败(第N次)：原因」；同 key 自动以减半搜索次数重试一次
+ *   （4096→2048，下限 32），重试结果与首试同样走正常渲染
+ * - bug4 分清两种分：主建议行 mean 标注「终局均分」（模拟到育成结束的期望
+ *   总分，五位数，不是本回合得分）；训练建议行改用 trainingAdviceLine 显示
+ *   「较次优 +Δ」差值（选训练的依据），不再显示五位数绝对分；本回合真实
+ *   收益继续由 hlpatch trainings 明细行承担（v0.3.1 定位不变）
+ * - bug3 文案：人头计数统一「人数N」（RamenBoardText，SO 数据链路零改动）
+ *
  * v0.3.5 变更：
- * - 紧凑模式开关：手机屏不够放全部信息——面板右上角新增一枚可点小按钮
- *   （独立悬浮窗，主面板保持不可触碰不挡游戏）。「简」= 收起状态/训练明细/
- *   条形图/运气/⚠警告/训练建议，只留回合行+主建议行；「详」= 全部展开。
- *   状态持久化（SharedPreferences），重开服务保持
+ * - 紧凑模式开关：面板右上角新增一枚可点小按钮（独立悬浮窗，主面板保持
+ *   不可触碰不挡游戏）。「简」= 收起状态/训练明细/条形图/运气/⚠警告/
+ *   训练建议，只留回合行+主建议行；「详」= 全部展开。状态持久化
  * - 运气/百分比格式改 Locale.US，避免个别系统区域设置产出本地化数字
  *
  * v0.3.4 变更：
- * - ⚠ 校正警告显示原文（最多2条/每条40字），不再是干巴巴的条数——
- *   用户反馈看不懂 ⚠1 是什么；同时 Rust v0.3.2 的「人头注入」摘要
+ * - ⚠ 校正警告显示原文（最多2条/每条40字）；Rust v0.3.2 的「人头注入」摘要
  *   也会出现在警告里，可直接核对注入是否生效
  * - 运气追踪：mean 是「模拟到育成结束的期望总分」——第一回合的 mean
- *   记为本局基准；运气:总 = 当前 mean − 基准（整局相对开局的漂移）；
- *   运气:回 = 当前 mean − 上一回合 mean（本回合的增益/波动）。
- *   中途接入（错过第1回合）时以最早观测为近似基准
+ *   记为本局基准；运气:总 = 当前 mean − 基准；运气:回 = 当前 mean − 上一回合 mean
  *
  * v0.3.3 变更：
  * - 接入 RamenDecisionLogger（数据收集）：日志写盘在后台单线程，不影响渲染
  *
  * v0.3.2 变更：
- * - 候选差值从文字行（「#2 吃面/东京-智 -731」）改为 tv_turn 下方的候选条形图
- *   （BoardChartsView，Canvas 绘制，无候选/评分全 0 时自动隐藏不占空间）
+ * - 候选差值改为 BoardChartsView 条形图
  *
  * v0.3.1 变更：
- * - 删除 Java 端「训练兜底」（TrainingEvaluator）：小黑板已有 hlpatch 真实训练
- *   明细，Java 端再算一遍纯属浪费算力，且质量远低于模拟器搜索
- * - hlpatch 没发 trainings（非行动画面）时，Rust 在 Train 阶段补搜并返回
- *   training_decision，浮窗显示「训练建议：…」；trainings 非空时不显示该行
- * - Rust 侧 v0.3.1 起先重放重建（断线重连）再搜索，非行动画面也能给出
- *   有依据的吃面/训练建议
+ * - 删除 Java 端「训练兜底」；hlpatch 没发 trainings 时 Rust 在 Train 阶段
+ *   补搜并返回 training_decision
  *
  * 回合口径：
  * - hlpatch 的 turn 与游戏 UI「第N回合」一致（1-based），直读时标注「直读」
  * - AI（umaai-rs）内部回合从 0 开始，浮窗同时显示 AI 内部值便于核对
- * - 旧版 hlpatch 无 turn 字段时回退 month/half 显示，Rust 侧再推导
  *
  * hlpatch v3.27.22 JSON 格式：
  * - chara 对象（speed/stamina/power/guts/wiz/vital/max_vital/motivation/skill_point/scenario_id）
@@ -96,6 +105,8 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private static final long STALE_MS = 5000;
     private static final int DEFAULT_UMA_ID = 102601;
     private static final int[] DEFAULT_CARDS = {302424, 302894, 303044, 302924, 303024, 303054};
+    /** 基准搜索次数（用户指定 4096；重试时自动减半，下限 32） */
+    private static final int BASE_SEARCH_N = 4096;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private WindowManager windowManager;
@@ -108,6 +119,12 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private volatile String lastSearchKey = "";
     private volatile JSONObject lastSearchResult, pendingSummary, lastSummary;
     private Thread searchThread;
+
+    /** v0.3.6：trainings 完整性状态机（防提前计算）+ 失败重试计数 */
+    private final TrainingsGate gate = new TrainingsGate();
+    /** v0.3.6：等待窗口到期检查（防抖定时器）；同一 key 只排一次 */
+    private Runnable pendingWaitCheck;
+    private String pendingWaitKey = "";
 
     // 紧凑模式（v0.3.5）：true = 只显示回合行+主建议行
     private volatile boolean compactMode;
@@ -214,11 +231,56 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         // 渲染搜索结果（如果有）
         renderSearchResult(s);
 
-        // 触发搜索（如果回合变化且 native 可用）
-        String key = searchKey(s);
-        if (!key.equals(lastSearchKey) && !searchRunning && UmaNativeBridge.isAvailable()) {
-            triggerSearch(s, key);
+        // v0.3.6：gate 调度的搜索触发（替代旧的 key 不等判断）
+        maybeTriggerSearch(s);
+    }
+
+    /**
+     * v0.3.6 搜索触发（bug1 防提前计算核心）。
+     *
+     * 时序：回合初 hlpatch 先推无 trainings 的 summary（旧版此时立刻搜索，
+     * 人头晚到后 key 相同不再重搜 → MCTS 对假盘面算完）。
+     * 现在经 TrainingsGate 状态机分派：
+     * - 带人头推送（行动画面）→ 立即 RUN_NOW(hasHeads=true)
+     * - 无人头推送 → 先等人头 3s（WAIT），期间人头到达会以新 key 再次进入
+     *   本函数（指纹不同）→ 升级为带人头搜索；
+     *   3s 超时才放行一次无人头搜索（结果标 ⚠无人头）
+     * - searchRunning 期间到达的人头推送：key 已不同，搜索完成后 render
+     *   会再次进入本函数自动补搜（自动升级，无需额外队列）
+     */
+    private void maybeTriggerSearch(JSONObject s) {
+        if (searchRunning || !UmaNativeBridge.isAvailable()) return;
+
+        String key = TrainingsGate.searchKey(s);
+        TrainingsGate.Obs obs = TrainingsGate.Obs.fromSummary(s);
+        long now = System.currentTimeMillis();
+
+        TrainingsGate.Decision d = gate.onNewSummary(key, obs, now);
+        if (d.isSkip()) return;
+
+        if (d.isWait()) {
+            // 排一次超时检查：窗口到期仍无人头 → 放行无人头搜索
+            if (!key.equals(pendingWaitKey)) {
+                pendingWaitKey = key;
+                if (pendingWaitCheck != null) main.removeCallbacks(pendingWaitCheck);
+                pendingWaitCheck = () -> {
+                    JSONObject snap = lastSummary;
+                    if (snap == null || searchRunning) return;
+                    String k = TrainingsGate.searchKey(snap);
+                    if (!k.equals(key)) return; // 已被人头推送接管
+                    if (gate.releaseWithoutTrainings(k)) {
+                        triggerSearch(snap, k, false);
+                    }
+                };
+                main.postDelayed(pendingWaitCheck, TrainingsGate.TRAININGS_WAIT_MS);
+            }
+            recommendView.setText("等训练人头…（" + (TrainingsGate.TRAININGS_WAIT_MS / 1000) + "s 内到则按人头搜）");
+            return;
         }
+
+        // RUN_NOW（带人头 / 或状态机允许的立即搜索）
+        gate.onTrainingsArrived(); // 清等待标记（幂等）
+        triggerSearch(s, key, d.hasHeads);
     }
 
     private void renderBasicState(JSONObject s, JSONObject chara, String source) {
@@ -312,14 +374,11 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                 StringBuilder b = new StringBuilder(RamenBoardText.decisionLine(decision));
 
                 // 运气追踪（v0.3.4）：
-                // - mean（decision.score）= 模拟到育成结束的期望总分
-                // - 总运气 = 当前 mean − 第一回合 mean（整局相对开局的漂移）
-                // - 当回合运气 = 当前 mean − 上一回合 mean（本回合的增益/波动）
-                // 新一局判定：回合回退（turn 变小）；第1回合强制重设基准；
-                // 中途接入（错过第1回合）以最早观测为近似基准
+                // - mean（decision.score）= 模拟到育成结束的期望总分（「终局均分」）
+                // - 总运气 = 当前 mean − 第一回合 mean；当回合运气 = 当前 mean − 上一回合 mean
                 double mean = decision.optDouble("score", 0.0);
                 int turnNow = s.has("turn") ? s.optInt("turn", -1) : -1;
-                String key = searchKey(s);
+                String key = TrainingsGate.searchKey(s);
                 if (mean > 0 && turnNow > 0 && !key.equals(lastLuckKey)) {
                     lastLuckKey = key;
                     if (turnNow == 1 || prevLuckTurn < 0 || turnNow < prevLuckTurn) {
@@ -352,22 +411,21 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                 }
 
                 // 决策日志：本回合 summary+decision 一行（按 searchKey 去重，一回合一行）
-                RamenDecisionLogger.onDecision(s, decision, searchKey(s));
+                RamenDecisionLogger.onDecision(s, decision, TrainingsGate.searchKey(s));
 
-                // 训练建议：hlpatch 没发 trainings（非行动画面）时由 Rust 在
-                // Train 阶段补搜返回；trainings 非空时不显示（黑板已有真实明细）
+                // 训练建议（v0.3.6 bug4）：显示「较次优 +Δ」差值而非绝对 mean——
+                // 训练补搜的 mean 是模拟到终局的期望总分（五位数），对"这回合练谁"
+                // 没有直接意义；差值才是选训练的依据。hlpatch 发了 trainings 时
+                // Rust 不补搜（td 为 null），真实收益走明细行
                 if (!compactMode) {
                     JSONObject td = result.optJSONObject("training_decision");
                     if (td != null) {
-                        // decisionLine 输出「建议：X（…）」，前拼「训练」→「训练建议：X（…）」
-                        b.append("\n训练").append(RamenBoardText.decisionLine(td));
+                        b.append("\n训练").append(RamenBoardText.trainingAdviceLine(td));
                     }
                 }
 
-                // 校正警告（v0.3.4）：显示原文而不是干巴巴的条数——用户反馈
-                // 看不懂 ⚠1 是什么。常见为良性近似（feeling_slot 从 remaining
-                // 近似转换）；Rust v0.3.2 的「人头注入」摘要也在这里，可直接
-                // 核对注入是否生效。紧凑模式收起。
+                // 校正警告（v0.3.4）：显示原文而不是干巴巴的条数。
+                // 紧凑模式收起。
                 if (!compactMode) {
                     JSONObject reconcile = result.optJSONObject("reconcile");
                     JSONArray warnings = reconcile == null ? null : reconcile.optJSONArray("warnings");
@@ -394,10 +452,11 @@ public final class FloatingWindowService extends Service implements HttpDataServ
 
         chartsView.clear();
 
+        // v0.3.6 bug2：失败显式呈现（不再落到"等待搜索…"卡住）
         if (result != null && !result.optBoolean("ok", false)) {
             String error = result.optString("error", "");
             if (!error.isEmpty()) {
-                recommendView.setText("搜索失败：" + error);
+                recommendView.setText(TrainingsGate.failureText(error, gate.failureCount(lastSearchKey)));
                 return;
             }
         }
@@ -407,22 +466,6 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     }
 
     // ── 搜索触发 ──────────────────────────────────────────────────────
-
-    /**
-     * 搜索去重键：直读 turn（若有）+ month/half + vital + motivation + sozai。
-     * 不再依赖 sozai 字符串（格式不稳定）以外的推断值。
-     */
-    static String searchKey(JSONObject s) {
-        JSONObject chara = s.optJSONObject("chara");
-        JSONObject stats = s.optJSONObject("stats");
-        JSONObject c = chara != null ? chara : stats;
-        JSONObject r = s.optJSONObject("ramen");
-
-        int turn = s.has("turn") ? s.optInt("turn", -1) : -1;
-        return turn + ":" + s.optInt("month") + ":" + s.optInt("half") + ":" +
-               (c == null ? "" : c.optInt("vital") + ":" + c.optString("motivation")) + ":" +
-               (r == null ? "" : r.optInt("checkpoint_pt") + ":" + r.optString("sozai"));
-    }
 
     private void initNativeSearch() {
         new Thread(() -> {
@@ -436,22 +479,47 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         }, "NativeInit").start();
     }
 
-    private void triggerSearch(JSONObject s, String key) {
+    /**
+     * 触发搜索（v0.3.6）。
+     *
+     * @param hasHeads 本次快照是否带 trainings 人头（false 时结果标 ⚠无人头）
+     */
+    private void triggerSearch(JSONObject s, String key, boolean hasHeads) {
         searchRunning = true;
         lastSearchKey = key;
         pendingSummary = s;
-        recommendView.setText("模拟搜索中...");
+        recommendView.setText("模拟搜索中..." + TrainingsGate.headsWarning(hasHeads));
 
         if (searchThread != null && searchThread.isAlive()) return;
 
+        // bug2：失败重试——同 key 失败 N 次后搜索次数减半（4096→2048→…，下限 32）
+        final int searchN = TrainingsGate.retrySearchN(BASE_SEARCH_N, gate.failureCount(key));
+
         searchThread = new Thread(() -> {
             JSONObject snap = pendingSummary;
-            JSONObject result = snap == null ? null :
-                UmaNativeBridge.search(snap, DEFAULT_UMA_ID, DEFAULT_CARDS, 0);
+            JSONObject result = null;
+            if (snap != null) {
+                try {
+                    result = UmaNativeBridge.search(snap, DEFAULT_UMA_ID, DEFAULT_CARDS, searchN);
+                } catch (Throwable t) {
+                    Log.e(TAG, "native search threw", t);
+                    result = null;
+                }
+            }
+            // bug2：null（JNI 异常/未初始化等）显式转失败结构，UI 才有得显示
+            if (result == null) {
+                try {
+                    result = new JSONObject("{\"ok\":false,\"error\":\"native无结果(异常或未初始化)\"}");
+                } catch (Exception ignored) { }
+            }
+            if (result != null && !result.optBoolean("ok", false)) {
+                gate.onSearchFailed(key); // 记失败 → 下次自动减半重试
+            }
             lastSearchResult = result;
             searchRunning = false;
             main.post(() -> {
-                if (snap != null) render(snap, "搜索完成");
+                JSONObject fresh = lastSummary;
+                if (fresh != null) render(fresh, "搜索完成");
             });
         }, "NativeSearch");
         searchThread.setDaemon(true);
