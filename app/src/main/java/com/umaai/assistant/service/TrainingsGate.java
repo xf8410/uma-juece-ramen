@@ -97,7 +97,7 @@ final class TrainingsGate {
         // - 该回合从未见过且没等待过 → 进入等待窗口
         if (!key.equals(waitedKey) && !key.equals(releasedKey)) {
             waitedKey = key;
-            return Decision.wait(now + TRAININGS_WAIT_MS);
+            return Decision.waitForHeads(now + TRAININGS_WAIT_MS);
         }
         // - 已在等待且窗口未超时 → 继续等（重复推送）
         // 调用方持有 deadline 判断超时；这里对「等待中重复推送」返回 SKIP
@@ -141,7 +141,8 @@ final class TrainingsGate {
         }
 
         static Decision runNow(boolean hasHeads) { return new Decision(Kind.RUN_NOW, hasHeads, 0); }
-        static Decision wait(long deadline) { return new Decision(Kind.WAIT, false, deadline); }
+        // 注意：不能叫 wait(long)——与 Object.wait(long) 撞名（静态方法不能"覆盖"Object）
+        static Decision waitForHeads(long deadline) { return new Decision(Kind.WAIT, false, deadline); }
         static Decision skip() { return new Decision(Kind.SKIP, false, 0); }
 
         boolean isWait() { return kind == Kind.WAIT; }
