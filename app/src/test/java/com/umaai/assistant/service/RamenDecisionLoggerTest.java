@@ -3,8 +3,12 @@ package com.umaai.assistant.service;
 import org.json.JSONObject;
 import org.junit.Test;
 
-import java.io.File;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 
 import static org.junit.Assert.assertEquals;
@@ -12,24 +16,47 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * RamenDecisionLogger 的 JVM 单测：纯 Java 实现，无 Android 依赖。
- * 覆盖：回合行去重、summary+decision 结构、outcome 三收尾路径（新局开/结算 fans/flush）、
- * fans 双键输出、decision 缺省不落行、readLog 空态。
+ * 数据去向由注入的 fake transport（GitHubUploader.Transport）采集，不落盘。
+ * 覆盖：回合行去重、summary+decision 结构、outcome 三收尾路径（新局开/结算
+ * fans/flush）、fans 双键输出、decision 缺省不落行、JSONL 字段集合一字不改。
  */
 public class RamenDecisionLoggerTest {
 
-    private static File tempDir() {
-        // 每个用例独立临时目录；init() 会把日志指到 dir/decision_log.jsonl
-        return new File(System.getProperty("java.io.tmpdir"),
-                "ramen-dl-test-" + System.nanoTime());
+    /** 收集上传批次的 fake transport：记录 (路径, 解码后的内容)。 */
+    static class FakeTransport implements GitHubUploader.Transport {
+        final List<String> paths = new ArrayList<>();
+        final List<String> contents = new ArrayList<>();
+
+        @Override
+        public int upload(String apiPath, String credential, String base64Content) {
+            paths.add(apiPath);
+            contents.add(new String(Base64.getDecoder().decode(base64Content), StandardCharsets.UTF_8));
+            return 201;
+        }
     }
 
-    private static List<String> logLines() throws Exception {
-        String all = RamenDecisionLogger.readLog();
+    private static GitHubUploader uploader(FakeTransport t) {
+        GitHubUploader u = new GitHubUploader(t, 80L);
+        u.setCredential("test-credential");
+        u.setEnabled(true);
+        return u;
+    }
+
+    private static List<String> uploadedLines(FakeTransport t) {
         List<String> out = new ArrayList<>();
-        for (String l : all.split("\n")) {
-            if (!l.trim().isEmpty()) out.add(l);
+        for (String c : t.contents) {
+            for (String l : c.split("\n")) {
+                if (!l.trim().isEmpty()) out.add(l);
+            }
         }
         return out;
+    }
+
+    private static List<String> fieldNames(JSONObject o) {
+        List<String> keys = new ArrayList<>();
+        Iterator<String> it = o.keys();
+        while (it.hasNext()) keys.add(it.next());
+        return keys;
     }
 
     private static JSONObject summary(int turn, int speed, int checkpointPt) throws Exception {
@@ -61,7 +88,8 @@ public class RamenDecisionLoggerTest {
     }
 
     @Test public void turnLoggedOncePerKeyWithSummaryAndDecision() throws Exception {
-        RamenDecisionLogger.init(tempDir(), 102601, new int[]{1, 2});
+        FakeTransport t = new FakeTransport();
+        RamenDecisionLogger.initForTest(102601, new int[]{1, 2}, uploader(t));
         JSONObject s = summary(1, 120, 0);
         RamenDecisionLogger.onSummary(s);
         String key = "1:6:1:80:絕好:0:2:2:1"; // 与 FloatingWindowService.searchKey 同构
@@ -70,7 +98,7 @@ public class RamenDecisionLoggerTest {
         RamenDecisionLogger.onDecision(s, decision(), key);
         RamenDecisionLogger.awaitIdle();
 
-        List<String> lines = logLines();
+        List<String> lines = uploadedLines(t);
         assertEquals(1, lines.size());
         JSONObject line = new JSONObject(lines.get(0));
         assertEquals("turn", line.getString("type"));
@@ -83,13 +111,14 @@ public class RamenDecisionLoggerTest {
     }
 
     @Test public void outcomeWrittenWhenNextRunStarts() throws Exception {
-        RamenDecisionLogger.init(tempDir(), 102601, new int[]{1, 2});
+        FakeTransport t = new FakeTransport();
+        RamenDecisionLogger.initForTest(102601, new int[]{1, 2}, uploader(t));
         RamenDecisionLogger.onSummary(summary(1, 100, 0));
         RamenDecisionLogger.onSummary(summary(77, 1200, 4600)); // 终盘最后一条
         RamenDecisionLogger.onSummary(summary(1, 90, 0));       // 新一局开始 → 上一局收尾
         RamenDecisionLogger.awaitIdle();
 
-        List<String> lines = logLines();
+        List<String> lines = uploadedLines(t);
         assertEquals(1, lines.size());
         JSONObject line = new JSONObject(lines.get(0));
         assertEquals("outcome", line.getString("type"));
@@ -105,17 +134,18 @@ public class RamenDecisionLoggerTest {
         // 新 run 已开启；仅 onSummary 不产生 turn 行，也不重复 outcome
         RamenDecisionLogger.onSummary(summary(2, 95, 10));
         RamenDecisionLogger.awaitIdle();
-        assertEquals(1, logLines().size());
+        assertEquals(1, uploadedLines(t).size());
     }
 
     @Test public void outcomeOnFansSignatureAtFinalTurn() throws Exception {
-        RamenDecisionLogger.init(tempDir(), 102601, new int[]{1, 2});
+        FakeTransport t = new FakeTransport();
+        RamenDecisionLogger.initForTest(102601, new int[]{1, 2}, uploader(t));
         JSONObject s = summary(77, 1300, 4700);
         s.getJSONObject("chara").put("fans", 71234); // 结算画面签名
         RamenDecisionLogger.onSummary(s);
         RamenDecisionLogger.awaitIdle();
 
-        List<String> lines = logLines();
+        List<String> lines = uploadedLines(t);
         assertEquals(1, lines.size());
         JSONObject fin = new JSONObject(lines.get(0)).getJSONObject("final");
         assertEquals(71234, fin.getLong("fans"));
@@ -123,32 +153,71 @@ public class RamenDecisionLoggerTest {
     }
 
     @Test public void flushWritesOutcomeOnce() throws Exception {
-        RamenDecisionLogger.init(tempDir(), 102601, new int[]{1, 2});
+        FakeTransport t = new FakeTransport();
+        RamenDecisionLogger.initForTest(102601, new int[]{1, 2}, uploader(t));
         RamenDecisionLogger.onSummary(summary(40, 1100, 3200));
         RamenDecisionLogger.flush();
         RamenDecisionLogger.awaitIdle();
-        List<String> lines = logLines();
+        List<String> lines = uploadedLines(t);
         assertEquals(1, lines.size());
         assertEquals("outcome", new JSONObject(lines.get(0)).getString("type"));
 
         // 幂等：再 flush 不产生第二条 outcome
         RamenDecisionLogger.flush();
         RamenDecisionLogger.awaitIdle();
-        assertEquals(1, logLines().size());
+        assertEquals(1, uploadedLines(t).size());
     }
 
-    @Test public void noLineWithoutDecisionAndEmptyReadWhenFresh() throws Exception {
-        RamenDecisionLogger.init(tempDir(), 102601, new int[]{1, 2});
-        assertEquals("", RamenDecisionLogger.readLog());
+    @Test public void noLineWithoutDecisionAndEmptyWhenFresh() throws Exception {
+        FakeTransport t = new FakeTransport();
+        RamenDecisionLogger.initForTest(102601, new int[]{1, 2}, uploader(t));
 
         RamenDecisionLogger.onSummary(summary(5, 200, 100));
         RamenDecisionLogger.onDecision(summary(5, 200, 100), null, "k"); // 无 decision 不落行
         RamenDecisionLogger.awaitIdle();
-        assertEquals(0, logLines().size());
+        assertEquals(0, uploadedLines(t).size());
 
         // run 尚未开启时 decision 也能自动开 run
         RamenDecisionLogger.onDecision(summary(5, 200, 100), decision(), "k2");
         RamenDecisionLogger.awaitIdle();
-        assertEquals(1, logLines().size());
+        assertEquals(1, uploadedLines(t).size());
+    }
+
+    @Test public void jsonlLineFormatUnchanged() throws Exception {
+        FakeTransport t = new FakeTransport();
+        RamenDecisionLogger.initForTest(102601, new int[]{1, 2}, uploader(t));
+        JSONObject s = summary(3, 150, 200);
+        RamenDecisionLogger.onSummary(s);
+        RamenDecisionLogger.onDecision(s, decision(), "3:6:1:80:絕好:0:2:2:1");
+        RamenDecisionLogger.awaitIdle();
+
+        assertEquals(1, t.contents.size());
+        String content = t.contents.get(0);
+        assertTrue("JSONL 每行以换行结尾", content.endsWith("\n"));
+        String[] rows = content.split("\n");
+        assertEquals(1, rows.length);
+
+        // turn 行字段集合一字不改（PC 端离线工具按 run 分组消费）
+        JSONObject line = new JSONObject(rows[0]);
+        assertEquals(
+                new HashSet<>(Arrays.asList("type", "run", "ts", "turn", "summary", "key", "decision")),
+                new HashSet<>(fieldNames(line)));
+        assertEquals("turn", line.getString("type"));
+
+        // outcome 行字段集合一字不改
+        JSONObject s77 = summary(77, 1400, 4800);
+        s77.getJSONObject("chara").put("max_vital", 100);
+        s77.getJSONObject("chara").put("fans", 80000);
+        RamenDecisionLogger.onSummary(s77); // 终盘 + fans → 收尾
+        RamenDecisionLogger.awaitIdle();
+        String outcomeRow = uploadedLines(t).get(1);
+        JSONObject out = new JSONObject(outcomeRow);
+        assertEquals(
+                new HashSet<>(Arrays.asList("type", "run", "ts", "final", "config")),
+                new HashSet<>(fieldNames(out)));
+        assertEquals(
+                new HashSet<>(Arrays.asList("turn", "speed", "stamina", "power", "guts", "wiz",
+                        "vital", "max_vital", "skill_point", "fans", "fan_count", "checkpoint_pt")),
+                new HashSet<>(fieldNames(out.getJSONObject("final"))));
     }
 }

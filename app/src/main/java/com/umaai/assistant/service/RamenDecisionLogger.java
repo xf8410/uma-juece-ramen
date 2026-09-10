@@ -3,23 +3,20 @@ package com.umaai.assistant.service;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
-import java.io.IOException;
-import java.io.PrintWriter;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 
 /**
- * 决策日志（decision_log.jsonl）— 真实对局数据收集，喂 rust/src/optimize.rs 调参。
+ * 决策日志 — 真实对局数据收集，喂 rust/src/optimize.rs 调参。
  *
- * 每回合（hlpatch summary + Rust decision）追加一行 JSONL，单线程后台写盘：
+ * v0.3.6 起数据零落盘：每回合（hlpatch summary + Rust decision）合成一行
+ * JSONL，只进 RAM 队列（GitHubUploader），后台攒批 HTTPS 直传 GitHub 仓库
+ * xf8410/uma-lamianbei-yuchengshuju（Contents API，main 分支）。收到 200/201
+ * 这批数据立即从内存删除；失败留队列重试（上限 2000 条，满了丢最旧并提示）。
+ * 任何代码分支都不写文件、不写游戏目录。
+ *
+ * JSONL 行格式一字未改（PC 端离线工具按 run 分组消费，兼容是硬要求）：
  * <pre>
  * {"type":"turn","run":"r20260829_012233","ts":1787966553000,"turn":12,"key":"12:…",
  *  "summary":{…hlpatch 推送的 JSON 原样…},"decision":{…Rust DecisionOutput…}}
@@ -35,55 +32,69 @@ import java.util.concurrent.TimeUnit;
  * 收尾时机（每局恰好一条 outcome，先到先写，幂等）：
  * - 下一局 turn<=1 出现 → 用上一局「最后一条 summary」收尾（结算画面若可见即最终值）
  * - 终盘（turn>=77）后 summary 出现 fans/fan_count 字段（结算画面签名）→ 立即收尾
- * - 服务 onDestroy（flush）
+ * - 服务 onDestroy（flush，顺带触发一次立即上传）
  *
  * 设计目标：离线工具按 run 分组 —— summary 喂 Rust reconcile 重放重建、decision
  * 对照模拟器策略分、outcome 作回归目标，校准 rust/strategy_optimized.json。
  * （fans 键名对齐协议 chara_info.fans；fan_count 为兼容别名，两键同值输出）
  *
- * 文件位置：getFilesDir()/decision_log.jsonl；超 4MB 轮转为 .1（只留一代）。
- * 拉取：HttpDataService GET /decision_log（adb forward tcp:18766 后 curl）。
- *
- * 纯 Java（无 android.* 依赖），可 JVM 单测；写盘失败静默（不影响浮窗）。
+ * 纯 Java（无 android.* 依赖），可 JVM 单测；上传失败静默（不影响浮窗）。
  */
 public final class RamenDecisionLogger {
-    private static final long MAX_BYTES = 4L * 1024 * 1024;
     /** 拉面杯最后一回合：3 年 × 24 回合 + 超级拉面 5 回合（协议 CONFIRMED） */
     private static final int FINAL_TURN = 77;
 
     private static final Object LOCK = new Object();
-    private static final ExecutorService IO = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "RamenDecisionLog");
-        t.setDaemon(true);
-        return t;
-    });
-
-    private static File logFile;
     private static int umaId;
     private static int[] cards = new int[0];
     private static String runId;
     private static boolean outcomeWritten;
     private static String lastTurnKey;
     private static JSONObject lastSummary;
+    private static GitHubUploader uploader;
 
     private RamenDecisionLogger() {}
 
-    /** 服务启动时初始化；重复调用会重置 run 生命周期（视为新服务会话）。 */
-    public static void init(File filesDir, int configUmaId, int[] configCards) {
+    /**
+     * 服务启动时初始化；重复调用会重置 run 生命周期（视为新服务会话），
+     * 但 RAM 上传队列跨服务重启保留（进程存活时后台继续传）。
+     *
+     * @param credential 远端同步凭据（null/空白 = 未配置，队列照常积攒）
+     * @param enabled    上传总开关
+     */
+    public static void init(int configUmaId, int[] configCards, String credential, boolean enabled) {
         synchronized (LOCK) {
-            logFile = filesDir == null ? null : new File(filesDir, "decision_log.jsonl");
             umaId = configUmaId;
             cards = configCards == null ? new int[0] : configCards.clone();
             runId = null;
             outcomeWritten = false;
             lastTurnKey = null;
             lastSummary = null;
+            GitHubUploader u = ensureUploaderLocked();
+            u.setCredential(credential);
+            u.setEnabled(enabled);
+        }
+    }
+
+    /** 设置面板保存后实时生效（凭据 + 开关），不影响已积攒队列。 */
+    public static void setUploadConfig(String credential, boolean enabled) {
+        synchronized (LOCK) {
+            GitHubUploader u = ensureUploaderLocked();
+            u.setCredential(credential);
+            u.setEnabled(enabled);
+        }
+    }
+
+    /** 队列溢出（丢最旧）提示回调：溢出开始时回调一次，队列清空后重置。 */
+    public static void setOverflowListener(GitHubUploader.OverflowListener l) {
+        synchronized (LOCK) {
+            ensureUploaderLocked().setOverflowListener(l);
         }
     }
 
     /**
      * 每条拉面杯 summary 进来时调用（render 的 isRamen 分支）。
-     * 只做 run 生命周期管理：开局/中途入局/终盘收尾，本身不写文件。
+     * 只做 run 生命周期管理：开局/中途入局/终盘收尾，本身不产生数据行。
      */
     public static void onSummary(JSONObject summary) {
         if (summary == null) return;
@@ -135,30 +146,27 @@ public final class RamenDecisionLogger {
         } catch (Exception ignored) { }
     }
 
-    /** 服务销毁时收尾当前 run（幂等，重复调用不产生第二条 outcome）。 */
+    /** 服务销毁时收尾当前 run（幂等，重复调用不产生第二条 outcome），并触发一次立即上传。 */
     public static void flush() {
         synchronized (LOCK) {
             flushOutcomeLocked();
+            if (uploader != null) uploader.flushNow();
         }
     }
 
-    /** HttpDataService GET /decision_log：返回日志全文（无文件/为空返回空串）。 */
-    public static String readLog() {
+    /** 本地接口（GET /decision_log）：返回上传状态 JSON（队列条数/累计丢弃/最近结果）。 */
+    public static String uploadStatus() {
         synchronized (LOCK) {
-            if (logFile == null || !logFile.exists()) return "";
-            try (BufferedReader r = new BufferedReader(new FileReader(logFile))) {
-                StringBuilder b = new StringBuilder();
-                char[] buf = new char[8192];
-                int n;
-                while ((n = r.read(buf)) != -1) b.append(buf, 0, n);
-                return b.toString();
-            } catch (IOException e) {
-                return "";
-            }
+            return ensureUploaderLocked().statusJson();
         }
     }
 
     // ── 内部 ──────────────────────────────────────────────────────────
+
+    private static GitHubUploader ensureUploaderLocked() {
+        if (uploader == null) uploader = new GitHubUploader();
+        return uploader;
+    }
 
     private static void startRunLocked() {
         String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
@@ -225,33 +233,32 @@ public final class RamenDecisionLogger {
                 || summary.has("fans") || summary.has("fan_count");
     }
 
+    /** 只进 RAM 队列（GitHubUploader），绝不写文件 —— 数据零落盘红线。 */
     private static void enqueueLocked(JSONObject line) {
-        final String text = line.toString();
-        IO.execute(() -> appendLine(text));
-    }
-
-    private static void appendLine(String text) {
-        synchronized (LOCK) {
-            if (logFile == null) return;
-            try {
-                if (logFile.exists() && logFile.length() > MAX_BYTES) {
-                    File old = new File(logFile.getParentFile(), logFile.getName() + ".1");
-                    if (old.exists()) old.delete();
-                    logFile.renameTo(old);
-                }
-                try (PrintWriter w = new PrintWriter(new FileWriter(logFile, true))) {
-                    w.println(text);
-                }
-            } catch (IOException ignored) { }
-        }
+        ensureUploaderLocked().enqueue(line.toString());
     }
 
     // ── 测试辅助（包私有） ────────────────────────────────────────────
 
-    /** 等待后台写盘队列清空（单线程队列尾部放哨兵任务）。 */
+    /** 测试专用：注入预配置的上传器（fake transport），并重置 run 生命周期。 */
+    static void initForTest(int configUmaId, int[] configCards, GitHubUploader testUploader) {
+        synchronized (LOCK) {
+            umaId = configUmaId;
+            cards = configCards == null ? new int[0] : configCards.clone();
+            runId = null;
+            outcomeWritten = false;
+            lastTurnKey = null;
+            lastSummary = null;
+            uploader = testUploader;
+        }
+    }
+
+    /** 等待上传队列清空（测试用：fake transport 下确定收敛）。 */
     static void awaitIdle() {
-        try {
-            IO.submit(() -> { }).get(10, TimeUnit.SECONDS);
-        } catch (Exception ignored) { }
+        GitHubUploader u;
+        synchronized (LOCK) {
+            u = uploader;
+        }
+        if (u != null) u.awaitDrained(10_000);
     }
 }
