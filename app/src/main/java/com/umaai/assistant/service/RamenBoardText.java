@@ -8,13 +8,24 @@ import org.json.JSONObject;
  *
  * 目标显示效果（竖排平铺，每个候选一行）：
  * <pre>
- * 建议：吃面/函馆-耐（mean 66972 · 4096次/12.7s）
+ * 建议：吃面/函馆-耐（终局均分 66972 · 4096次/12.7s）
  * #0 不吃面 -999
  * #2 吃面/东京-智 -731
  * #3 吃面/中山-速力智 -42
- * 速 速46 力14 27pt 体力-25 失败10% 头3光2
- * 耐 耐36 根12 19pt 体力-26 失败10% 头5
+ * 速 速46 力14 27pt 体力-25 失败10% 人数3光2
+ * 耐 耐36 根12 19pt 体力-26 人数5
+ * 训练建议：耐×5（较次优 +312 · 64次/1.2s）
  * </pre>
+ *
+ * v0.3.6 显示语义修正：
+ * - 主建议行的 mean 标注为「终局均分」——它是模拟到育成结束的期望总分，
+ *   不是本回合得分（避免五位数被误读成本回合训练得分）
+ * - 训练建议行改用 {@link #trainingAdviceLine}：去掉绝对 mean，
+ *   改显示「较次优 +Δ」（差值才是选训练的依据）；本回合真实收益
+ *   仍由 hlpatch trainings 明细行承担
+ * - 人头计数统一写作「人数N」（训练明细「头3」→「人数3」，上游候选文本
+ *   「人N」→「人数N」）。友人也是人数的一种，无需特判——替换规则
+ *   仅命中「人」后紧跟数字的情况，「友人出行」等不含数字的词不受影响
  *
  * 数据来源：
  * - 决策/候选：Rust DecisionOutput（action_display + candidate_displays/candidate_scores）
@@ -23,7 +34,7 @@ import org.json.JSONObject;
 public final class RamenBoardText {
     private RamenBoardText() {}
 
-    /** 主建议行：`建议：吃面/函馆-耐（mean 66972 · 4096次/12.7s）` */
+    /** 主建议行：`建议：吃面/函馆-耐（终局均分 66972 · 4096次/12.7s）` */
     public static String decisionLine(JSONObject decision) {
         if (decision == null) return "";
         String action = translate(decision.optString("action_display", "?")).replace('\n', ' ');
@@ -31,11 +42,11 @@ public final class RamenBoardText {
         int n = decision.optInt("search_n", 0);
         long ms = decision.optLong("elapsed_ms", 0);
         double score = decision.optDouble("score", 0.0);
-        if (n > 0 || ms > 0) {
+        if (n > 0 || ms > 0 || score != 0.0) {
             b.append("（");
             boolean first = true;
             if (score != 0.0) {
-                b.append("mean ").append((long) score);
+                b.append("终局均分 ").append((long) score);
                 first = false;
             }
             if (n > 0) {
@@ -51,6 +62,71 @@ public final class RamenBoardText {
             b.append('）');
         }
         return b.toString();
+    }
+
+    /**
+     * 训练建议行（Rust Train 阶段补搜结果）：`建议：耐×5（较次优 +312 · 64次/1.2s）`。
+     *
+     * 与主建议行的区别：不显示绝对 mean（那是模拟到终局的全局期望分，
+     * 五位数对"这回合练哪个"毫无意义），改显示选中动作相对次优候选的
+     * 差值 Δ——Δ 越大说明该训练优势越大；Δ 接近 0 说明练哪个都差不多。
+     * 候选评分缺失（全 0，手写兜底路径）时只显示搜索规模，不显示差值。
+     */
+    public static String trainingAdviceLine(JSONObject trainingDecision) {
+        if (trainingDecision == null) return "";
+        String action = translate(trainingDecision.optString("action_display", "?")).replace('\n', ' ');
+        StringBuilder b = new StringBuilder("建议：").append(action);
+        int n = trainingDecision.optInt("search_n", 0);
+        long ms = trainingDecision.optLong("elapsed_ms", 0);
+        double bestDelta = bestVsSecondDelta(trainingDecision);
+
+        b.append("（");
+        boolean first = true;
+        if (bestDelta != 0.0) {
+            b.append("较次优 ").append(String.format("%+.0f", bestDelta));
+            first = false;
+        }
+        if (n > 0) {
+            if (!first) b.append(" · ");
+            b.append(n).append("次");
+            first = false;
+        }
+        if (ms > 0) {
+            if (!first) b.append(" · ");
+            if (ms >= 10000) b.append(String.format("%.1fs", ms / 1000.0));
+            else b.append(ms).append("ms");
+        }
+        // 全部无内容时去掉空括号
+        if (first) return "建议：" + action;
+        b.append('）');
+        return b.toString();
+    }
+
+    /** 选中动作相对次优候选的差值（candidate_scores 全 0 或不足 2 个有效值时返回 0） */
+    static double bestVsSecondDelta(JSONObject decision) {
+        if (decision == null) return 0.0;
+        JSONArray scores = decision.optJSONArray("candidate_scores");
+        if (scores == null) return 0.0;
+        int len = scores.length();
+        if (len < 2) return 0.0;
+
+        int best = decision.optInt("action_index", 0);
+        if (best < 0 || best >= len) best = 0;
+        double bestScore = scores.optDouble(best, 0.0);
+        if (bestScore == 0.0) return 0.0; // 全 0 = 无有效评分（手写兜底）
+
+        double second = 0.0;
+        boolean any = false;
+        for (int i = 0; i < len; i++) {
+            if (i == best) continue;
+            double v = scores.optDouble(i, 0.0);
+            if (v > 0.0 && (!any || v > second)) {
+                second = v;
+                any = true;
+            }
+        }
+        if (!any) return 0.0;
+        return bestScore - second;
     }
 
     /**
@@ -97,7 +173,7 @@ public final class RamenBoardText {
 
     /**
      * 训练明细行（PC 黑板「训练:」节）：每个可用训练一行。
-     * `速 速46 力14 27pt 体力-25 失败10% 头3光2`
+     * `速 速46 力14 27pt 体力-25 失败10% 人数3光2`
      */
     public static String trainingLines(JSONArray trainings) {
         if (trainings == null) return "";
@@ -124,7 +200,7 @@ public final class RamenBoardText {
             int heads = t.optInt("heads");
             int shining = t.optInt("shining");
             if (heads > 0 || shining > 0) {
-                line.append(" 头").append(Math.max(heads, 0));
+                line.append(" 人数").append(Math.max(heads, 0));
                 if (shining > 0) line.append("光").append(shining);
             }
             if (out.length() > 0) out.append('\n');
@@ -154,7 +230,7 @@ public final class RamenBoardText {
     /** Rust 动作名 → 中文（与 ActionRecommendation 相同的映射） */
     static String translate(String action) {
         if (action == null) return "?";
-        return action.replace("普通出行", "外出")
+        String out = action.replace("普通出行", "外出")
                 .replace("友人出行", "友人外出")
                 // 隐藏风味替换代码：A=面 B=汤 C=料（hlpatch sozai 顺序：麺/スープ/トッピング）
                 // "(替换Bx1+Cx1)" → "(替换汤1+料1)"
@@ -166,5 +242,12 @@ public final class RamenBoardText {
                 .replace("Power训练", "力量训练")
                 .replace("Guts训练", "根性训练")
                 .replace("Wisdom训练", "智力训练");
+        // 人头计数规范：「人N」→「人数N」（上游候选文本的缩写）。
+        // 只命中「人」紧跟数字的情况；「友人出行」「友人外出」无数字，不受影响，
+        // 友人本身也计入人数，无需特判。
+        for (char d = '0'; d <= '9'; d++) {
+            out = out.replace("人" + d, "人数" + d);
+        }
+        return out;
     }
 }
