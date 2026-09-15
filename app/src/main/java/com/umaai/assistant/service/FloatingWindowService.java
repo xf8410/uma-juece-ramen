@@ -28,7 +28,13 @@ import java.net.URL;
 import java.util.Locale;
 
 /**
- * 拉面杯浮窗服务（v0.3.5+）。
+ * 拉面杯浮窗服务（v0.3.6+）。
+ *
+ * v0.3.6 变更：
+ * - 窗口位置屏内 clamp：游戏横竖屏切换后系统保持 overlay 坐标，横屏拖到
+ *   靠右/靠下的窗口切回竖屏可能超出屏宽不可见且把手收不到触摸（表现为
+ *   "竖屏无法移动浮窗"）。现在 render 与 ACTION_DOWN 时兜底拉回屏内，
+ *   拖动过程实时 clamp 防拖出屏；多点触控只跟随按下主指防坐标跳变。
  *
  * 通信架构：
  * - hlpatch so 推送 JSON → HttpDataService(:18766) 或轮询(:18765/summary)
@@ -109,6 +115,8 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private WindowManager.LayoutParams toggleParams;
     private float handleDownRawX, handleDownRawY, handleStartX, handleStartY, panelStartY;
     private boolean handleMoved;
+    /** 拖动主指针 id：多点触控时只跟随按下那根手指，防止第二根手指造成坐标跳变 */
+    private int handlePointerId = -1;
 
     private WindowManager windowManager;
     private View panel;
@@ -264,6 +272,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     // ── 渲染 ──────────────────────────────────────────────────────────
 
     private void render(JSONObject s, String source) {
+        clampWindowsToScreen();
         // 判断是否拉面杯场景
         JSONObject chara = s.optJSONObject("chara");
         JSONObject stats = s.optJSONObject("stats");
@@ -610,6 +619,9 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         toggleBtn.setOnTouchListener((v, ev) -> {
             switch (ev.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
+                    // 旋转/历史漂移兜底：按下前先把窗口拉回屏内，起点用修正后坐标
+                    clampWindowsToScreen();
+                    handlePointerId = ev.getPointerId(0);
                     handleDownRawX = ev.getRawX();
                     handleDownRawY = ev.getRawY();
                     handleStartX = toggleParams.x;
@@ -618,6 +630,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                     handleMoved = false;
                     break;
                 case MotionEvent.ACTION_MOVE: {
+                    if (handlePointerId != -1 && ev.findPointerIndex(handlePointerId) < 0) break;
                     float dx = ev.getRawX() - handleDownRawX;
                     float dy = ev.getRawY() - handleDownRawY;
                     if (!handleMoved && Math.hypot(dx, dy) > dp(Math.round(HANDLE_DRAG_THRESHOLD_DP))) {
@@ -627,6 +640,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                         toggleParams.x = Math.round(handleStartX + dx);
                         toggleParams.y = Math.round(handleStartY + dy);
                         panelParams.y = Math.round(panelStartY + dy);
+                        clampWindowsToScreen();
                         windowManager.updateViewLayout(toggleBtn, toggleParams);
                         windowManager.updateViewLayout(panel, panelParams);
                     }
@@ -648,6 +662,42 @@ public final class FloatingWindowService extends Service implements HttpDataServ
             return true;
         });
         windowManager.addView(toggleBtn, p);
+    }
+
+    /**
+     * 把主面板与把手窗口位置 clamp 回屏幕内。
+     *
+     * 背景：游戏横竖屏切换时系统保持 overlay 窗口 x/y 原值——横屏下拖到
+     * 靠右/靠下的窗口，切回竖屏（或反之）后坐标可能超出新屏宽高，窗口
+     * 不可见且把手收不到触摸，表现为"浮窗无法移动"。此处在数据刷新
+     * （render）与触摸按下（ACTION_DOWN）时兜底拉回；拖动过程中调用
+     * 则防止把窗口拖出屏幕。
+     */
+    private void clampWindowsToScreen() {
+        try {
+            android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+            int sw = dm.widthPixels, sh = dm.heightPixels;
+            boolean changed = false;
+            if (panel != null && panel.getWidth() > 0) {
+                int nx = Math.max(0, Math.min(panelParams.x, sw - panel.getWidth()));
+                int ny = Math.max(0, Math.min(panelParams.y, sh - panel.getHeight()));
+                if (nx != panelParams.x || ny != panelParams.y) {
+                    panelParams.x = nx; panelParams.y = ny; changed = true;
+                }
+            }
+            if (toggleBtn != null && toggleBtn.getWidth() > 0) {
+                int nx = Math.max(0, Math.min(toggleParams.x, sw - toggleBtn.getWidth()));
+                int ny = Math.max(0, Math.min(toggleParams.y, sh - toggleBtn.getHeight()));
+                if (nx != toggleParams.x || ny != toggleParams.y) {
+                    toggleParams.x = nx; toggleParams.y = ny; changed = true;
+                }
+            }
+            if (changed) {
+                windowManager.updateViewLayout(panel, panelParams);
+                windowManager.updateViewLayout(toggleBtn, toggleParams);
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     private int dp(int v) {
