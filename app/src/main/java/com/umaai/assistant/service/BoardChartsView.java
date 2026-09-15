@@ -140,12 +140,13 @@ public final class BoardChartsView extends View {
 
         double best = (bestIndex >= 0 && bestIndex < n) ? scores[bestIndex] : 0.0;
 
-        // 差值列：选中项显示自身终局预估，其余显示相对选中的差（同口径差值有意义）
+        // 差值列：全部显示相对建议项的差值（用户反馈：不要五位数绝对分，
+        // 绝对预估分只保留在主建议行"终局预估 XXXX"一处）
         String[] deltas = new String[n];
         float deltaW = 0f;
         for (int i = 0; i < n; i++) {
             deltas[i] = (i == bestIndex)
-                    ? String.format("%.0f", scores[i])
+                    ? "+0"
                     : String.format("%+.0f", scores[i] - best);
             deltaW = Math.max(deltaW, deltaPaint.measureText(deltas[i]));
         }

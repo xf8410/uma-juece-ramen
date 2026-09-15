@@ -15,8 +15,8 @@ android {
         applicationId "com.umaai.assistant"
         minSdk 26
         targetSdk 34
-        versionCode 5
-        versionName "0.3.7-cloud"
+        versionCode 6
+        versionName "0.3.8-cloud"
         buildConfigField "String", "SCENARIO_ID", '"Ramen"'
         buildConfigField "String", "CLOUD_URL", '""'
 
