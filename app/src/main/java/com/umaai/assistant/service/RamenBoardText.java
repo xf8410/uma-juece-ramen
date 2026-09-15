@@ -8,7 +8,7 @@ import org.json.JSONObject;
  *
  * 目标显示效果（竖排平铺，每个候选一行）：
  * <pre>
- * 建议：吃面/函馆-耐（mean 66972 · 4096次/12.7s）
+ * 建议：吃面/函馆-耐（终局预估 66972 · 4096次/12.7s）
  * #0 不吃面 -999
  * #2 吃面/东京-智 -731
  * #3 吃面/中山-速力智 -42
@@ -23,7 +23,7 @@ import org.json.JSONObject;
 public final class RamenBoardText {
     private RamenBoardText() {}
 
-    /** 主建议行：`建议：吃面/函馆-耐（mean 66972 · 4096次/12.7s）` */
+    /** 主建议行：`建议：吃面/函馆-耐（终局预估 66972 · 4096次/12.7s）` */
     public static String decisionLine(JSONObject decision) {
         if (decision == null) return "";
         String action = translate(decision.optString("action_display", "?")).replace('\n', ' ');
@@ -35,7 +35,7 @@ public final class RamenBoardText {
             b.append("（");
             boolean first = true;
             if (score != 0.0) {
-                b.append("mean ").append((long) score);
+                b.append("终局预估 ").append((long) score);
                 first = false;
             }
             if (n > 0) {
@@ -54,7 +54,7 @@ public final class RamenBoardText {
     }
 
     /**
-     * 候选差值（PC 黑板「决策理由」）：其余候选相对选中动作的 mean 差值。
+     * 候选差值（PC 黑板「决策理由」）：其余候选相对选中动作的终局预估差值（MCTS 口径=结算分均值，非本回合训练分）。
      * 每个候选独占一行（竖排平铺）：
      * <pre>
      * #0 不吃面 -999

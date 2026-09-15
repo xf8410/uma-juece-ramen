@@ -13,6 +13,7 @@ import android.os.Looper;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.LayoutInflater;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.TextView;
@@ -38,10 +39,10 @@ import java.util.Locale;
  *   目标是喂 rust/src/optimize.rs 用真实对局校准 strategy_optimized.json
  *
  * 显示内容（对齐 PC 黑板，EtherealAO 版）：
- * - 主建议 + 搜索规模（建议：吃面/函馆-耐（mean 66972 · 4096次/12.7s））
+ * - 主建议 + 搜索规模（建议：吃面/函馆-耐（终局预估 66972 · 4096次/12.7s））
  * - 候选条形图（BoardChartsView：每候选一行 标签+比例条+相对差值，选中项绿色，
  *   喂 decision 的 candidate_displays/candidate_scores/action_index）
- * - 训练建议（训练建议：速度训练（mean X · 64次/…ms），来自 Rust Train 阶段补搜）
+ * - 训练建议（训练建议：速度训练（终局预估 X · 64次/…ms），来自 Rust Train 阶段补搜）
  * - 训练明细行（速: 速46 力14 27pt 体力-25 失败10% 头3光2）
  * - 运气行（v0.3.4：运:总±X 回±Y，见下）
  *
@@ -98,6 +99,17 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private static final int[] DEFAULT_CARDS = {302424, 302894, 303044, 302924, 303024, 303054};
 
     private final Handler main = new Handler(Looper.getMainLooper());
+    /** 面板竖条宽度（dp）：图表+训练详情在小字号下的可读下限 */
+    private static final int PANEL_WIDTH_DP = 172;
+    /** 把手拖动判定阈值（dp）：位移超过才算拖动，否则视为点击 */
+    private static final float HANDLE_DRAG_THRESHOLD_DP = 6f;
+
+    // 双窗口拖动：面板保持穿透不可摸，把手（简/详按钮）可摸可拖，拖动时面板跟随
+    private WindowManager.LayoutParams panelParams;
+    private WindowManager.LayoutParams toggleParams;
+    private float handleDownRawX, handleDownRawY, handleStartX, handleStartY, panelStartY;
+    private boolean handleMoved;
+
     private WindowManager windowManager;
     private View panel;
     private TextView turnView, recommendView, statusView, ramenView, trainingsView, sourceView;
@@ -469,13 +481,16 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         int flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
                     WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
+        // 竖条形态：贴屏幕左缘、宽 PANEL_WIDTH_DP，横屏游戏时可读不挡中心 UI。
+        // 面板保持 FLAG_NOT_TOUCHABLE（穿透不挡游戏），移动通过把手拖动实现。
         WindowManager.LayoutParams p = new WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
+            dp(PANEL_WIDTH_DP),
             WindowManager.LayoutParams.WRAP_CONTENT,
             type, flags, PixelFormat.TRANSLUCENT);
         p.gravity = Gravity.TOP | Gravity.START;
         p.x = 0;
-        p.y = 120;
+        p.y = dp(120);
+        panelParams = p;
         turnView = panel.findViewById(R.id.tv_turn);
         chartsView = panel.findViewById(R.id.chart_candidates);
         recommendView = panel.findViewById(R.id.tv_recommend);
@@ -503,24 +518,58 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         int type = Build.VERSION.SDK_INT >= 26 ?
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY :
             WindowManager.LayoutParams.TYPE_PHONE;
+        // 把手窗口：仅去 FLAG_NOT_TOUCHABLE（可摸），保持 FLAG_NOT_FOCUSABLE；
+        // 面板自身永远穿透（FLAG_NOT_TOUCHABLE 不取消），移动只通过拖动把手完成。
         WindowManager.LayoutParams p = new WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT);
-        p.gravity = Gravity.TOP | Gravity.END;
-        p.x = dp(6);
+        p.gravity = Gravity.TOP | Gravity.START;
+        p.x = dp(PANEL_WIDTH_DP + 8);  // 竖条右侧空隙，把手贴面板边上
         p.y = dp(122);
-        toggleBtn.setOnClickListener(v -> {
-            compactMode = !compactMode;
-            getSharedPreferences(PREFS, MODE_PRIVATE)
-                    .edit().putBoolean(PREF_COMPACT, compactMode).apply();
-            toggleBtn.setText(compactMode ? "详" : "简");
-            JSONObject snap = lastSummary;
-            if (snap != null) {
-                main.post(() -> render(snap, "视图切换"));
+        toggleParams = p;
+        // 拖动=移动面板+把手；轻点（未超阈值）=简/详切换
+        toggleBtn.setOnTouchListener((v, ev) -> {
+            switch (ev.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    handleDownRawX = ev.getRawX();
+                    handleDownRawY = ev.getRawY();
+                    handleStartX = toggleParams.x;
+                    handleStartY = toggleParams.y;
+                    panelStartY = panelParams.y;
+                    handleMoved = false;
+                    break;
+                case MotionEvent.ACTION_MOVE: {
+                    float dx = ev.getRawX() - handleDownRawX;
+                    float dy = ev.getRawY() - handleDownRawY;
+                    if (!handleMoved && Math.hypot(dx, dy) > dp(Math.round(HANDLE_DRAG_THRESHOLD_DP))) {
+                        handleMoved = true;
+                    }
+                    if (handleMoved) {
+                        toggleParams.x = Math.round(handleStartX + dx);
+                        toggleParams.y = Math.round(handleStartY + dy);
+                        panelParams.y = Math.round(panelStartY + dy);
+                        windowManager.updateViewLayout(toggleBtn, toggleParams);
+                        windowManager.updateViewLayout(panel, panelParams);
+                    }
+                    break;
+                }
+                case MotionEvent.ACTION_UP:
+                    if (!handleMoved) {
+                        compactMode = !compactMode;
+                        getSharedPreferences(PREFS, MODE_PRIVATE)
+                                .edit().putBoolean(PREF_COMPACT, compactMode).apply();
+                        toggleBtn.setText(compactMode ? "详" : "简");
+                        JSONObject snap = lastSummary;
+                        if (snap != null) {
+                            main.post(() -> render(snap, "视图切换"));
+                        }
+                    }
+                    break;
             }
+            return true;
         });
         windowManager.addView(toggleBtn, p);
     }

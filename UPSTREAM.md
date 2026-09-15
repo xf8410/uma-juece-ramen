@@ -2,11 +2,23 @@
 
 ## Pinned revision
 
-- Repository: https://github.com/xulai1001/umaai-rs
+- Repository: https://github.com/xf8410/umaai-rs（fork，含 GA 注入通道修复；上游同步 f363386 + 修复 acb7735/3b4e940）
 - Branch observed: `master`
-- Commit: `eeae510b57ee9d29a475645a05c191e6ef5a6e72`（2026-08-28）
-- Scenario data blob: `gamedata/scenario_ramen.json@cbd96ce172fa7c9578cb6f79859aab907a51c7c9`
-- State model blob: `crates/umasim/src/game/ramen/state.rs@f64a2187209b011d8addc0ed314ba6dcaba52057`
+- Commit: `3b4e94038c1d6d5b1ecb27d9684e1893e6dbbda0`（2026-09-16，对应上游 master f363386@2026-09-15）
+- Scenario data blob: 以 fork 仓库 `gamedata/scenario_ramen.json` 当前版本为准
+- State model blob: 以 fork 仓库 `crates/umasim/src/game/ramen/state.rs` 当前版本为准
+
+### 2026-09-16 sync notes（eeae510b → 3b4e940）
+
+- 依赖源从上游切换到 fork（xf8410/umaai-rs）：fork = 上游 9-15 master 同步 + ParamOverride GA
+  注入通道回植 + region_pt_weight 基因删除，CI 编译绿、四档 bench 5升2降（power_wisdom +1754）。
+- jueceramen 侧 **API 零破坏**：Trainer trait / RamenMctsTrainer / RecommendedRamenTrainer /
+  RamenSearchStages / GameView / rules 常量全部健在，cargo check 无 error。
+- 行为对拍（同 RamenStrategy 同卡组各 300 局）：均分 57389→57431（+42，噪声内）、
+  RMJ 全通 100%→100%、最高分 63474→66475（上游规则修正抬升上限）。
+- 上游新增 policy_schema 参数包体系：后续可让浮窗直接加载 GA 最优基因（batch_v5/best_genome.toml）。
+- 上游新增 NN 管线（convert754 / ramen_nn / onnx feature，规格 754 in / 234 out）：
+  浮窗接 NN 推理待 NN 权重定稿后另起 PR。
 
 All Android constants in `RamenUpstreamData` must cite this revision. Updating this file and the constants/tests belongs in one PR.
 

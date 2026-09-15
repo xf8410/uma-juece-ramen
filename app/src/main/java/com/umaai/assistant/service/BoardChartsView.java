@@ -19,7 +19,7 @@ import org.json.JSONArray;
  * </pre>
  *
  * - 标签：候选名经 RamenBoardText.translate 中文化
- * - 比例条：候选 mean 分 / 最高候选 mean 分（选中绿 #55FF99，其余灰蓝）
+ * - 比例条：候选终局预估分（MCTS 结算口径，非本回合训练分）/ 最高候选（选中绿 #55FF99，其余灰蓝）
  * - 差值：选中项显示自身 mean，其余显示相对选中的差（与原文字版口径一致）
  *
  * 数据源：Rust DecisionOutput 的 candidate_displays / candidate_scores / action_index
@@ -140,7 +140,7 @@ public final class BoardChartsView extends View {
 
         double best = (bestIndex >= 0 && bestIndex < n) ? scores[bestIndex] : 0.0;
 
-        // 差值列：选中项显示自身 mean，其余显示相对选中的差
+        // 差值列：选中项显示自身终局预估，其余显示相对选中的差（同口径差值有意义）
         String[] deltas = new String[n];
         float deltaW = 0f;
         for (int i = 0; i < n; i++) {
