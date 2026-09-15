@@ -28,7 +28,12 @@ import java.net.URL;
 import java.util.Locale;
 
 /**
- * 拉面杯浮窗服务（v0.3.6+）。
+ * 拉面杯浮窗服务（v0.3.7）。
+ *
+ * v0.3.7 变更：
+ * - 竖屏浮窗拉高：compact 模式下竖屏也显示状态行+训练明细
+ * - 候选评分口径统一：采用 wm=（PT 加权分，与选择口径一致），消除"建议非最高分"困惑
+ * - 搜索 panic 透出具体信息（不再只报 panic during search）
  *
  * v0.3.6 变更：
  * - 窗口位置屏内 clamp：游戏横竖屏切换后系统保持 overlay 坐标，横屏拖到
@@ -382,8 +387,11 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         skillView.setVisibility(skillText.isEmpty() ? View.GONE : View.VISIBLE);
 
         // 紧凑模式（v0.3.5）：状态行/训练明细收起，只留回合行+主建议行+来源行
-        statusView.setVisibility(compactMode ? View.GONE : View.VISIBLE);
-        trainingsView.setVisibility(compactMode ? View.GONE : View.VISIBLE);
+        // v0.3.7: 竖屏时即使 compact 模式也显示状态+训练明细（用户反馈竖屏浮窗太小需拉高）
+        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        boolean portrait = dm.heightPixels >= dm.widthPixels;
+        statusView.setVisibility((compactMode && !portrait) ? View.GONE : View.VISIBLE);
+        trainingsView.setVisibility((compactMode && !portrait) ? View.GONE : View.VISIBLE);
 
         // 来源 + AI 状态
         String aiStatus = UmaNativeBridge.isAvailable() ? "AI就绪" : "安全兜底";

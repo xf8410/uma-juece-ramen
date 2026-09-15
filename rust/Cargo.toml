@@ -28,7 +28,7 @@ path = "src/card_benchmark.rs"
 # - 新增 policy_schema 参数包体系（可加载 GA 最优基因）、NN 管线（convert754/ramen_nn/onnx feature）
 # - 兼容性验证：jueceramen 全部 API 零破坏（cargo check 绿）；行为对拍 300 局均分 +42（噪声内），
 #   RMJ 全通 100%，最高分 63474→66475（上限抬升）
-umasim = { git = "https://github.com/xf8410/umaai-rs", rev = "3b4e94038c1d6d5b1ecb27d9684e1893e6dbbda0", default-features = false, features = ["diag", "no-color"] }
+umasim = { git = "https://github.com/xf8410/umaai-rs", rev = "f11fdf400f5bc8ca00c32368257406ca6165f88c", default-features = false, features = ["diag", "no-color"] }
 jni = { version = "0.21", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

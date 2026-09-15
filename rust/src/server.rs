@@ -74,11 +74,19 @@ fn handle_search(body: &str, strategy: &RamenStrategy) -> String {
             score_mean: 0.0, search_n: 0, elapsed_ms: 0, all_actions: vec![],
             error: Some(e.to_string()),
         },
-        Err(_) => SearchResult {
-            ok: false, action: String::new(), action_display: String::new(),
-            score_mean: 0.0, search_n: 0, elapsed_ms: 0, all_actions: vec![],
-            error: Some("panic during search".to_string()),
-        },
+        Err(e) => {
+            let msg = e
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            eprintln!("search panic: {msg}");
+            SearchResult {
+                ok: false, action: String::new(), action_display: String::new(),
+                score_mean: 0.0, search_n: 0, elapsed_ms: 0, all_actions: vec![],
+                error: Some(format!("panic: {msg}")),
+            }
+        }
     };
 
     serde_json::to_string(&search_result).unwrap_or_else(|_| r#"{"ok":false}"#.to_string())

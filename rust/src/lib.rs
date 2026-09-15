@@ -733,7 +733,7 @@ fn run_mcts_search(game: &mut RamenGame, search_n: usize) -> Result<DecisionOutp
 /// 从 `RamenMctsTrainer::last_breakdown()` 文本解析每个候选的 mean 分。
 ///
 /// 搜索决策行格式（" | " 分隔）：
-/// `#0 不吃面 n=4096 mean=65973 sd=1234 pt=5678`
+/// `#0 不吃面 n=4096 mean=65973 sd=1234 pt=5678 wm=65950`（wm=PT 加权分，与 best_action_pt 选择口径一致，优先采用）
 ///
 /// 转发（手写策略）决策行格式（v0.3.2 兜底路径）：
 /// `#2 8125[速训练 理由...]`
@@ -758,8 +758,13 @@ fn parse_breakdown_means(breakdown: Option<&str>, expected_len: usize) -> Vec<f6
         if idx >= expected_len {
             continue;
         }
+        // wm=（PT 加权分，与 best_action_pt 同口径）优先；mean= 兜底，wm 后写覆盖
         for seg in tail.split_whitespace() {
             if let Some(v) = seg.strip_prefix("mean=") {
+                if let Ok(m) = v.parse::<f64>() {
+                    scores[idx] = m;
+                }
+            } else if let Some(v) = seg.strip_prefix("wm=") {
                 if let Ok(m) = v.parse::<f64>() {
                     scores[idx] = m;
                 }
@@ -913,13 +918,21 @@ mod jni_exports {
         let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_search(&state_str, &config)
         }))
-        .map_err(|_| SearchResponse {
-            ok: false,
-            view: None,
-            decision: None,
-            training_decision: None,
-            reconcile: None,
-            error: Some("panic during search".into()),
+        .map_err(|e| {
+            let msg = e
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            log::error!("nativeSearch panic: {msg}");
+            SearchResponse {
+                ok: false,
+                view: None,
+                decision: None,
+                training_decision: None,
+                reconcile: None,
+                error: Some(format!("panic: {msg}")),
+            }
         })
         .unwrap_or_else(|err| err);
 
