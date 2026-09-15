@@ -40,6 +40,15 @@
         android:textColor="#FFFFFF"
         android:textSize="9sp" />
 
+    <!-- 技能评分评估（v0.4.0）：SkillScoreEngine 输出，无数据时 GONE -->
+    <TextView
+        android:id="@+id/tv_skill"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:visibility="gone"
+        android:textColor="#66CCFF"
+        android:textSize="8sp" />
+
     <TextView
         android:id="@+id/tv_ramen"
         android:layout_width="match_parent"

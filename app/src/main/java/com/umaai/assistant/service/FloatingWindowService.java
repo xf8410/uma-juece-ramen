@@ -112,7 +112,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
 
     private WindowManager windowManager;
     private View panel;
-    private TextView turnView, recommendView, statusView, ramenView, trainingsView, sourceView;
+    private TextView turnView, recommendView, statusView, skillView, ramenView, trainingsView, sourceView;
     private BoardChartsView chartsView;
     private HttpDataService server;
     private volatile boolean polling, searchRunning;
@@ -124,6 +124,12 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     // 紧凑模式（v0.3.5）：true = 只显示回合行+主建议行
     private volatile boolean compactMode;
     private TextView toggleBtn;
+
+    // 技能评分评估（v0.4.0）：SkillScoreEngine 移植 URA 小黑板技能评估。
+    // consume 里按 (turn, skill_point) 去重后台计算，render 里读取展示。
+    private volatile JSONObject lastSkillEval;
+    private volatile String lastSkillKey = "";
+    private volatile boolean skillComputing;
 
     // 运气追踪（v0.3.4）：
     // - firstMean：第一回合（或新一局最早观测）的 mean，= 总运气基准
@@ -188,8 +194,71 @@ public final class FloatingWindowService extends Service implements HttpDataServ
             if (!s.has("chara") && !s.has("stats")) return;
             lastDataAt = System.currentTimeMillis();
             lastSummary = s;
+            computeSkillScore(s);
             main.post(() -> render(s, source));
         } catch (Exception ignored) { }
+    }
+
+    // ── 技能评分评估（v0.4.0）────────────────────────────────────────
+    // 同回合同技能点只算一次；后台线程跑 DP，算完 post 重渲染。
+    private void computeSkillScore(JSONObject s) {
+        if (skillComputing) return;
+        if (!SkillScoreEngine.isLoaded()) SkillScoreEngine.ensureLoaded(this);
+        if (!SkillScoreEngine.isLoaded()) return;
+        JSONObject chara = s.optJSONObject("chara");
+        if (chara == null || !s.has("skill_tips")) return;
+        int turn = s.optInt("turn", -1);
+        int sp = chara.optInt("skill_point", -1);
+        String key = turn + ":" + sp;
+        if (key.equals(lastSkillKey)) return;
+        skillComputing = true;
+        lastSkillKey = key;
+        new Thread(() -> {
+            JSONObject ev = null;
+            try {
+                ev = SkillScoreEngine.evaluate(s);
+            } catch (Exception e) {
+                android.util.Log.e(TAG, "skill eval failed", e);
+            } finally {
+                final JSONObject fev = ev;
+                if (fev != null && fev.optBoolean("ok", false)) lastSkillEval = fev;
+                skillComputing = false;
+                JSONObject snap = lastSummary;
+                if (snap != null) main.post(() -> render(snap, "技能刷新"));
+            }
+        }, "RamenSkill").start();
+    }
+
+    /** 技能行文案：竖条窄屏友好，简/详两档 */
+    private String skillLine() {
+        JSONObject ev = lastSkillEval;
+        if (ev == null || !ev.optBoolean("ok", false)) return "";
+        StringBuilder b = new StringBuilder();
+        b.append("\u8bc4").append(ev.optInt("total_point", 0));
+        String rank = ev.optString("rank", "");
+        if (!rank.isEmpty()) b.append(" ").append(rank);
+        int toNext = ev.optInt("points_to_next", -1);
+        if (toNext > 0) b.append(" +").append(toNext).append("\u2192").append(ev.optString("next_rank", ""));
+        if (compactMode) return b.toString();
+        JSONArray learn = ev.optJSONArray("learn");
+        if (learn != null && learn.length() > 0) {
+            b.append("\n\u8350:");
+            int n = Math.min(learn.length(), 3);
+            for (int i = 0; i < n; i++) {
+                JSONObject l = learn.optJSONObject(i);
+                if (l == null) continue;
+                String name = l.optString("name", "?");
+                if (name.length() > 8) name = name.substring(0, 8);
+                b.append(i > 0 ? " " : "").append(name)
+                 .append("(").append(l.optInt("cost", 0)).append(")");
+            }
+            if (learn.length() > 3) b.append("+").append(Math.max(0, ev.optInt("learn_total", learn.length()) - 3));
+        }
+        String avg = ev.optString("avg_eff", "");
+        if (!avg.isEmpty()) b.append(" \u5747").append(avg);
+        String marg = ev.optString("marginal_eff", "");
+        if (!marg.isEmpty()) b.append(" \u8fb9").append(marg);
+        return b.toString();
     }
 
     // ── 渲染 ──────────────────────────────────────────────────────────
@@ -211,6 +280,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
             turnView.setText("非拉面杯");
             recommendView.setText("此版本仅支持拉面杯");
             statusView.setText("");
+            skillView.setVisibility(View.GONE);
             ramenView.setText("");
             trainingsView.setText("");
             chartsView.clear();
@@ -296,6 +366,11 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         JSONArray trainings = s.optJSONArray("trainings");
         String detail = RamenBoardText.trainingLines(trainings);
         trainingsView.setText(detail.isEmpty() ? "训练数据：无" : detail);
+
+        // 技能评分行（v0.4.0）：紧凑模式也保留（技能购买是关键决策）
+        String skillText = skillLine();
+        skillView.setText(skillText);
+        skillView.setVisibility(skillText.isEmpty() ? View.GONE : View.VISIBLE);
 
         // 紧凑模式（v0.3.5）：状态行/训练明细收起，只留回合行+主建议行+来源行
         statusView.setVisibility(compactMode ? View.GONE : View.VISIBLE);
@@ -495,6 +570,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         chartsView = panel.findViewById(R.id.chart_candidates);
         recommendView = panel.findViewById(R.id.tv_recommend);
         statusView = panel.findViewById(R.id.tv_status);
+        skillView = panel.findViewById(R.id.tv_skill);
         ramenView = panel.findViewById(R.id.tv_ramen);
         trainingsView = panel.findViewById(R.id.tv_trainings);
         sourceView = panel.findViewById(R.id.tv_source);
