@@ -4,10 +4,18 @@
 
 - Repository: https://github.com/xf8410/umaai-rs（fork，含 GA 注入通道修复；上游同步 f363386 + 修复 acb7735/3b4e940）
 - Branch observed: `master`
-- Commit: `3b4e94038c1d6d5b1ecb27d9684e1893e6dbbda0`（2026-09-16，对应上游 master f363386@2026-09-15）
+- Commit: `53227d4b2c2c45fe441491a9df9c13949d773a7e`（2026-09-17，fork master = 上游 8 commit 合并 875dd2c + bench_base 冲突修复）
 - Scenario data blob: 以 fork 仓库 `gamedata/scenario_ramen.json` 当前版本为准
 - State model blob: 以 fork 仓库 `crates/umasim/src/game/ramen/state.rs` 当前版本为准
 
+### 2026-09-17 sync notes（f11fdf4 → 53227d4）
+- fork master 合并上游 8 commit（8e9f7a5..04c739c）+ 合并冲突修复：
+  - 6376dd7 ga_lab 最优策略合并：通解卡组 + 9 旋钮参数组合档 + bench_base --deck + 基线重抓
+  - 70550cd 智力豁免白名单 + 已满位 PT 定价实验 token（trd/trdsh/trds）
+  - d9374e8 合宿训练诀窍全 MAX 填充修复（模拟器行为变化，历史基准失效）
+  - 968489f MCTS pt_favor_rate 定档 2.0 + 运气分改真实评分
+  - 合并遗留修复 53227d4：bench_base 重复 deck 字段/parse_deck_override 删除
+- API 兼容性：Trainer trait / RamenMctsTrainer / RecommendedRamenTrainer / RamenSearchStages 预期零破坏，cargo check 与 CI Build Ramen Android 双重验证。
 ### 2026-09-16 sync notes（eeae510b → 3b4e940）
 
 - 依赖源从上游切换到 fork（xf8410/umaai-rs）：fork = 上游 9-15 master 同步 + ParamOverride GA
