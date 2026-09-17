@@ -30,8 +30,8 @@ import java.net.URL;
 public final class UmaNativeBridge {
     private static final String TAG = "UmaNativeBridge";
 
-    /** 搜索次数：用户指定 4096（PC 端基准：进门分 61000，结算 US5 69173） */
-    public static final int DEFAULT_SEARCH_N = 4096;
+    /** 搜索次数：对齐上游 SearchConfig::default()（search_n=1024，UCB 动态分配，2026-09-17 同步） */
+    public static final int DEFAULT_SEARCH_N = 1024;
 
     private static boolean loaded = false;
     private static boolean initialized = false;
