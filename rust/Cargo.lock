@@ -1014,7 +1014,7 @@ dependencies = [
 [[package]]
 name = "umasim"
 version = "0.14.0"
-source = "git+https://github.com/xf8410/umaai-rs?rev=f11fdf400f5bc8ca00c32368257406ca6165f88c#f11fdf400f5bc8ca00c32368257406ca6165f88c"
+source = "git+https://github.com/xf8410/umaai-rs?rev=53227d4b2c2c45fe441491a9df9c13949d773a7e#53227d4b2c2c45fe441491a9df9c13949d773a7e"
 dependencies = [
  "anyhow",
  "bincode",

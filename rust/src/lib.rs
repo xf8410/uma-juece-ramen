@@ -139,14 +139,31 @@ pub struct DecisionOutput {
 ///
 /// 返回实际执行的阶段数（诊断用）。
 fn fast_forward(game: &mut RamenGame, target_internal_turn: i32) -> usize {
-    if target_internal_turn <= 0 {
-        return 0;
-    }
     // v0.3.2: 重放策略从旧 RamenHandwrittenTrainer 换成正式推荐策略——
     // 旧手写缺平衡/联动机制，重放出的羁绊/心情偏差更大。for_rollout()
     // 关闭分解采集（重放路径无消费者），决策与 new() 逐位一致（上游守门）。
     let trainer = RecommendedRamenTrainer::for_rollout();
     let mut rng = StdRng::seed_from_u64(0x5EED_2026);
+    if target_internal_turn <= 0 {
+        // ★ v0.3.9 根因修复（2026-09-17）：第1回合（出道前）不再直接跳过。
+        // 根因：BaseGame::new 初始 distribution 为空 Vec（0 行），正常路径
+        // 第一步 run_distribute→reset_distribution 会补 5 行训练位；本函数
+        // 旧版 target<=0 直接 return，分布保持空——rollout 第一帧训练动作
+        // handle_post_train 里 `game.distribution[train]` 对空 Vec 索引，
+        // 浮窗第1回合必现 panic: "index out of bounds: the len is 0 but the
+        // index is 0"（v0.3.7 仅透传文案未修根因）。
+        // 修法：不推进回合（不调 next() 到 NextTurn），只把回合内阶段
+        // Begin→Distribute 跑完建出分布+hint，停在 Train 等注入覆盖。
+        let mut steps = 0usize;
+        while game.turn() <= 0 && game.stage != RamenStage::Train && steps < 8 {
+            let _ = game.run_stage(&trainer, &mut rng);
+            steps += 1;
+            if !game.next() {
+                break; // 游戏结束（防御，正常不会发生）
+            }
+        }
+        return steps;
+    }
     let mut steps = 0usize;
     // 防御上限：每回合最多 8 个阶段再留余量，避免异常状态死循环
     let guard_max = (target_internal_turn as usize + 2) * 8 + 64;
@@ -947,9 +964,9 @@ mod jni_exports {
         _class: JClass,
     ) -> jstring {
         let v = serde_json::json!({
-            "version": "0.3.2",
+            "version": "0.3.9",
             "upstream": "xulai1001/umaai-rs",
-            "upstream_commit": "eeae510b57ee9d29a475645a05c191e6ef5a6e72",
+            "upstream_commit": "53227d4b2c2c45fe441491a9df9c13949d773a7e",
             "search": "ramen_mcts_trainer",
             "rollout": "recommended_ramen_trainer",
             "stages": ["train", "ramen_select"],
@@ -1162,6 +1179,31 @@ mod tests {
                 "人头注入应留摘要 warning: {:?}",
                 reconciled.warnings
             );
+        }
+    }
+
+    /// ★ 复现+回归测试 2026-09-17：第1回合 MCTS panic（index out of bounds: len 0）
+    /// 根因：newgame 初始 distribution 为空 Vec，第1回合 fast_forward 不重放，
+    /// rollout 第一帧 handle_post_train 的 distribution[train] 越界。
+    /// 修复后：第1回合 Begin→Distribute 建分布，多回合快验全绿。
+    #[test]
+    fn test_turn1_mcts_panic_repro() {
+        if !setup_gamedata() {
+            return;
+        }
+        // 第1回合 hlpatch summary（截图实测值：五维 135/81/109/109/117 Pt230）
+        let summary = |pt: i32| format!(r#"{{"turn": {pt}, "year": 1, "month": 7, "half": 1, "scenario": "Ramen",
+            "chara": {{"speed":135,"stamina":81,"power":109,"guts":109,"wiz":117,
+                      "vital":100,"max_vital":100,"motivation":3,"skill_point":230}},
+            "ramen": {{"checkpoint_pt":0,"special_feeling_num":0,"sozai":[0,0,0]}},
+            "trainings": []}}"#);
+        // 第1回合 + 若干代表回合（重放路径回归）：全部必须成功
+        for turn in [1, 2, 3, 8, 31, 50, 71] {
+            let resp = run_search(&summary(turn), &test_config(64));
+            assert!(resp.ok, "turn={turn} 搜索失败: {:?}", resp.error);
+            let d = resp.decision.expect("应返回决策");
+            eprintln!("turn={turn}: {} score={:.0} source={}", d.action_display, d.score, d.source);
+            assert!(!d.action_display.is_empty(), "turn={turn} 决策描述为空");
         }
     }
 }

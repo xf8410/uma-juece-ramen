@@ -7,3 +7,6 @@
 /app/src/main/jniLibs
 /app/src/main/assets/gamedata
 /rust/target
+
+# 本地复现用 gamedata（CI 由 build.yml 从上游下载），不入库 2026-09-17
+gamedata/

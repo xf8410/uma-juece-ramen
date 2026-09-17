@@ -1,3 +1,7 @@
+# 独立 workspace：云盘工作区根目录有无关的 hachimi_ura Cargo.toml，会劫持
+# cargo 的 workspace 向上解析；此空表把本 crate 钉成独立 workspace（2026-09-17）
+[workspace]
+
 [package]
 name = "uma-jni"
 version = "0.1.0"

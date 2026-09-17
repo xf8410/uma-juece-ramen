@@ -28,7 +28,11 @@ import java.net.URL;
 import java.util.Locale;
 
 /**
- * 拉面杯浮窗服务（v0.3.8）。
+ * 拉面杯浮窗服务（v0.3.9）。
+ *
+ * v0.3.9 变更：
+ * - 修复第1回合搜索 panic（index out of bounds: len 0）：根因是 fast_forward
+ *   跳过回合内阶段导致分布未初始化，现已把 Begin→Distribute 纳入重放建分布
  *
  * v0.3.8 变更：
  * - 候选条形图差值列全部显示相对差值（best 显示 +0），不再出现五位数绝对分
