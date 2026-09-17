@@ -11,7 +11,7 @@ on:
         default: '100'
         type: string
       strategy_json:
-        description: '策略参数 JSON（留空用默认）'
+        description: '策略参数 JSON（留空用仓库内置优化参数）'
         default: ''
         type: string
       opt_mode:
@@ -87,8 +87,21 @@ jobs:
         run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_batch
       - name: Run simulation
         env:
-          RAMEN_STRATEGY: ${{ github.event.inputs.strategy_json }}
+          STRATEGY_JSON_INPUT: ${{ github.event.inputs.strategy_json }}
         run: |
+          # 策略来源优先级：dispatch strategy_json > rust/strategy_optimized.json（仓库内置优化参数）。
+          # 2026-09-17 修复：此前 push 触发时 RAMEN_STRATEGY 恒为空，simulate 一直跑出厂默认
+          # 参数（均分 57215 / 最高 63101），优化产物从未上过 CI 卷面。
+          # batch.rs 现已把 strategy_optimized.json 编译进二进制作基线（双保险），
+          # 这里显式导出是为了让「用了哪套参数」在日志可见、且可被 dispatch 覆盖。
+          STRATEGY_JSON="$STRATEGY_JSON_INPUT"
+          if [ -z "$STRATEGY_JSON" ] && [ -f "${{ github.workspace }}/rust/strategy_optimized.json" ]; then
+            STRATEGY_JSON="$(cat ${{ github.workspace }}/rust/strategy_optimized.json)"
+            echo "策略来源: rust/strategy_optimized.json（仓库内置优化参数）"
+          else
+            echo "策略来源: dispatch strategy_json / 二进制内置基线"
+          fi
+          export RAMEN_STRATEGY="$STRATEGY_JSON"
           cd /tmp
           cp -r ${{ github.workspace }}/gamedata .
           cp -r ${{ github.workspace }}/rust .
