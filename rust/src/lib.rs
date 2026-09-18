@@ -36,7 +36,15 @@
 //!   假盘面评估。现在 `apply_observed_distribution` 按观测人头把可动人员
 //!   （卡/友人/NPC）在训练之间搬移，使模拟分布与实况一致
 //! - 友人加入门槛从内部回合 2 降到 1（实况确认：游戏 UI 第2回合友人已在场）
+//!
+//! v0.3.10（GA 基因组通道，Phase 1）：
+//! - 新增 `genome` 模块：装载 GA lab 最优基因组覆盖层（ga_freeze），MCTS 的
+//!   fallback（未搜阶段/事件/隐藏风味/单候选）与手写兜底换用覆盖层策略——
+//!   `RamenMctsTrainer.fallback` 是 pub 字段，零上游改动
+//! - rollout 仍走 FlatSearchGame 默认 rollout 策略（Phase 2 注入点）
+//! - nativeVersion 暴露 genome_fallback / genome_source 供浮窗观测
 
+pub mod genome;
 pub mod ramen_strategy;
 pub mod reconcile;
 
@@ -127,7 +135,7 @@ pub struct DecisionOutput {
 ///
 /// `inject_state` 只覆盖观测字段（五维/体力/拉面/回合），但训练分布、
 /// 羁绊、训练等级无法从 hlpatch 数据恢复——旧版直接跳回合，导致这些
-/// 字段停留在 newgame 初始值，搜索没有依据。这里用策略从第 0 回合
+/// 字段停留在 newgame 初始值——搜索没有依据。这里用策略从第 0 回合
 /// 快速重放（不做 MCTS，毫秒级），把 distribution / friendship /
 /// train_level_count 重建到接近真实 run 的状态。
 ///
@@ -150,8 +158,7 @@ fn fast_forward(game: &mut RamenGame, target_internal_turn: i32) -> usize {
         // 第一步 run_distribute→reset_distribution 会补 5 行训练位；本函数
         // 旧版 target<=0 直接 return，分布保持空——rollout 第一帧训练动作
         // handle_post_train 里 `game.distribution[train]` 对空 Vec 索引，
-        // 浮窗第1回合必现 panic: "index out of bounds: the len is 0 but the
-        // index is 0"（v0.3.7 仅透传文案未修根因）。
+        // 必现 panic: "index out of bounds: the len is 0 but the index is 0"。
         // 修法：不推进回合（不调 next() 到 NextTurn），只把回合内阶段
         // Begin→Distribute 跑完建出分布+hint，停在 Train 等注入覆盖。
         let mut steps = 0usize;
@@ -695,13 +702,20 @@ pub fn run_search(
 /// 且两次随机流不同，展示的 mean 和实际选中动作对不上。
 fn run_mcts_search(game: &mut RamenGame, search_n: usize) -> Result<DecisionOutput> {
     let config = SearchConfig::default().with_search_n(search_n);
-    let trainer = RamenMctsTrainer::new(config).with_stages(RamenSearchStages {
+    let mut trainer = RamenMctsTrainer::new(config).with_stages(RamenSearchStages {
         train: true,
         ramen_select: true,
         special_select: false,
         region_select: false,
         super_ramen_select: false,
     });
+
+    // ★ v0.3.10 GA 基因组通道（Phase 1）：未搜阶段/事件/隐藏风味/单候选的
+    //   fallback 换用覆盖层策略（ga_freeze）。fallback 是 pub 字段，零上游改动。
+    //   rollout 仍走 FlatSearchGame 默认 rollout 策略（Phase 2 注入点）。
+    if genome::enabled() {
+        trainer.fallback = genome::recommended_trainer();
+    }
 
     let mut rng = StdRng::from_os_rng();
 
@@ -738,7 +752,6 @@ fn run_mcts_search(game: &mut RamenGame, search_n: usize) -> Result<DecisionOutp
     Ok(DecisionOutput {
         action_index,
         action_display,
-        score,
         candidate_displays,
         candidate_scores,
         search_n,
@@ -804,8 +817,9 @@ fn parse_breakdown_means(breakdown: Option<&str>, expected_len: usize) -> Vec<f6
 ///
 /// v0.3.2: 与上游同步切换为 `RecommendedRamenTrainer`（正式推荐策略）——
 /// 旧 `RamenHandwrittenTrainer` 缺平衡/联动机制，已非上游生产路径。
+/// v0.3.10: 覆盖层生效时走 genome::recommended_trainer()（ga_freeze）。
 fn run_handwritten_fallback(game: &mut RamenGame) -> Result<DecisionOutput> {
-    let trainer = RecommendedRamenTrainer::new();
+    let trainer = genome::recommended_trainer();
     let mut rng = StdRng::from_os_rng();
 
     let actions: Vec<_> = if game.stage == RamenStage::RamenSelect {
@@ -964,7 +978,7 @@ mod jni_exports {
         _class: JClass,
     ) -> jstring {
         let v = serde_json::json!({
-            "version": "0.3.9",
+            "version": "0.3.10",
             "upstream": "xulai1001/umaai-rs",
             "upstream_commit": "53227d4b2c2c45fe441491a9df9c13949d773a7e",
             "search": "ramen_mcts_trainer",
@@ -976,7 +990,9 @@ mod jni_exports {
             "observed_heads_injection": true,
             "training_decision": "computed_only_when_hlpatch_trainings_empty",
             "turn_convention": "hlpatch UI 1-based -> AI internal 0-based (turn-1)",
-            "candidate_scores": "last_breakdown_reuse"
+            "candidate_scores": "last_breakdown_reuse",
+            "genome_fallback": genome::enabled(),
+            "genome_source": genome::SOURCE_NAME
         })
         .to_string();
         jstring_from_str(&mut env, &v)
@@ -1014,7 +1030,7 @@ mod tests {
         let text = "#0 8125[速训练 基础] | #1 6500[休息]";
         let scores = parse_breakdown_means(Some(text), 2);
         assert!((scores[0] - 8125.0).abs() < 0.5, "scores[0]={}", scores[0]);
-        assert!((scores[1] - 6500.0).abs() < 0.5, "scores[1]={}", scores[1]);
+        assert!((scores[1] - 6500.0).abs() < 0.5);
     }
 
     /// gamedata 工作目录初始化（测试公共前置）
