@@ -310,18 +310,38 @@ pub fn reconcile(raw: &HlpatchSummary) -> Result<ReconciledState, String> {
 
 // ── 直读训练观测解析 ────────────────────────────────────────────────
 
+/// 游戏训练 CommandId → 训练下标（0=速 1=耐 2=力 3=根 4=智）。
+///
+/// 2026-09-19 修正错位 bug：内存真值语义为 **101=速 102=力 103=根 105=耐 106=智**
+/// （uma-so-reforge lib.rs CMD_* 常量；证据=名卡 support_card_data.command_id：
+/// 小海湾SSR 30016=105耐、麦昆SSR=105、小栗帽SSR 30024=102力、北黑SSR=101速、诗歌剧SSR=103根）。
+/// 旧版按「101..=105 顺序 = 速耐力根智」解析，103 根性被错读成力——
+/// 实测症状：根性训练 3 人头被注入成「力量 3」，MCTS 推荐错训练。
+/// 601..=605 为剧本指令别名（MDB single_mode_training.base_command_id 实证：
+/// 601→101速 602→105耐 603→102力 604→103根 605→106智）。
+fn command_id_to_train_index(id: i64) -> Option<usize> {
+    match id {
+        101 | 601 => Some(0), // Speed
+        105 | 602 => Some(1), // Stamina
+        102 | 603 => Some(2), // Power
+        103 | 604 => Some(3), // Guts
+        106 | 605 => Some(4), // Wisdom
+        _ => None,
+    }
+}
+
 /// 从 hlpatch `trainings[]` 原始 JSON 提取观测人头。
 ///
-/// 训练下标优先用 `command_id`（101..=105 → 0..4），否则按 `name` 匹配
-/// （Speed/Stamina/Power/Guts/Wiz，兼容中文单字）。无法定位训练的条目跳过。
+/// 训练下标优先用 `command_id`（真值语义见 [`command_id_to_train_index`]），
+/// 否则按 `name` 匹配（Speed/Stamina/Power/Guts/Wiz，兼容中文单字）。
+/// 无法定位训练的条目跳过。
 fn parse_observed_trainings(raw: &[serde_json::Value]) -> Vec<ObservedTraining> {
     let mut out = Vec::new();
     for item in raw {
         let train_index = item
             .get("command_id")
             .and_then(|v| v.as_i64())
-            .filter(|id| (101..=105).contains(id))
-            .map(|id| (id - 101) as usize)
+            .and_then(command_id_to_train_index)
             .or_else(|| {
                 item.get("name")
                     .and_then(|v| v.as_str())
@@ -788,6 +808,10 @@ mod tests {
     }
 
     /// v0.3.2：trainings 解析为观测人头（command_id 与 name 两条路径）
+    ///
+    /// 2026-09-19：测试数据改为内存真值语义（103=Guts 根、106=Wiz 智），
+    /// 与 uma-so-reforge CMD_* 常量一致；旧测试按「103=Power」造数据，
+    /// 掩盖了根性→力量错位 bug。
     #[test]
     fn test_observed_trainings_parsed() {
         let json = r#"{
@@ -796,17 +820,34 @@ mod tests {
             "chara": {"scenario_id": 14, "speed": 100, "vital": 50, "max_vital": 100},
             "trainings": [
                 {"name": "Speed", "command_id": 101, "heads": 2, "shining": 1},
-                {"name": "Power", "command_id": 103, "heads": 3, "shining": 0},
-                {"name": "Wiz", "command_id": 105, "heads": 1, "shining": 2}
+                {"name": "Guts", "command_id": 103, "heads": 3, "shining": 0},
+                {"name": "Stamina", "command_id": 105, "heads": 1, "shining": 2},
+                {"name": "Wiz", "command_id": 106, "heads": 4, "shining": 2}
             ]
         }"#;
         let raw: HlpatchSummary = serde_json::from_str(json).unwrap();
         let state = reconcile(&raw).unwrap();
-        assert_eq!(state.observed_trainings.len(), 3, "三条观测全部解析");
+        assert_eq!(state.observed_trainings.len(), 4, "四条观测全部解析");
         assert_eq!(state.observed_trainings[0].train_index, 0);
         assert_eq!(state.observed_trainings[0].heads, 2);
-        assert_eq!(state.observed_trainings[2].train_index, 4);
+        // ★ 错位 bug 回归锚：103=Guts 必须映射到根性(3)，绝不能落到力(2)
+        assert_eq!(state.observed_trainings[1].train_index, 3, "command_id 103 = Guts 根性");
+        assert_eq!(state.observed_trainings[1].heads, 3);
+        assert_eq!(state.observed_trainings[2].train_index, 1, "command_id 105 = Stamina 耐力");
         assert_eq!(state.observed_trainings[2].shining, 2);
+        assert_eq!(state.observed_trainings[3].train_index, 4, "command_id 106 = Wiz 智力");
+        // name fallback（无 command_id 字段时）
+        let json2 = r#"{
+            "scenario": "Ramen",
+            "turn": 10,
+            "chara": {"scenario_id": 14, "speed": 100, "vital": 50, "max_vital": 100},
+            "trainings": [
+                {"name": "根", "heads": 3, "shining": 0}
+            ]
+        }"#;
+        let raw2: HlpatchSummary = serde_json::from_str(json2).unwrap();
+        let state2 = reconcile(&raw2).unwrap();
+        assert_eq!(state2.observed_trainings[0].train_index, 3, "中文单字「根」→ 根性(3)");
     }
 
     /// turn=0 按第1回合处理（内部回合 0，两种口径一致）；
