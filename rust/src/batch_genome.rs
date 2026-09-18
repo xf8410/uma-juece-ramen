@@ -91,7 +91,7 @@ fn main() {
             .filter_map(|i| run_one(trainer, seed_of(i)))
             .collect();
         println!("臂 {name}: 成功 {}/{} 局", results.len(), n);
-        all.push((name, results));
+        all.push((*name, results));
     }
 
     println!("\n════════════════════════════════════════");
