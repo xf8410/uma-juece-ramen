@@ -752,6 +752,7 @@ fn run_mcts_search(game: &mut RamenGame, search_n: usize) -> Result<DecisionOutp
     Ok(DecisionOutput {
         action_index,
         action_display,
+        score,
         candidate_displays,
         candidate_scores,
         search_n,
