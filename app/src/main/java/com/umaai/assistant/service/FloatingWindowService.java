@@ -112,6 +112,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private WindowManager windowManager;
     private View panel;
     private TextView turnView, recommendView, statusView, ramenView, trainingsView, sourceView;
+    private TextView tvWarning;
     private BoardChartsView chartsView;
     private HttpDataService server;
     private volatile boolean polling, searchRunning;
@@ -200,6 +201,8 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     // ── 渲染 ──────────────────────────────────────────────────────────
 
     private void render(JSONObject s, String source) {
+        // v0.3.7：每帧先收起警告条，命中再点亮（防早退路径残留上一帧警告）
+        if (tvWarning != null) tvWarning.setVisibility(View.GONE);
         // 判断是否拉面杯场景
         JSONObject chara = s.optJSONObject("chara");
         JSONObject stats = s.optJSONObject("stats");
@@ -425,25 +428,30 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                     }
                 }
 
-                // 校正警告（v0.3.4）：显示原文而不是干巴巴的条数。
+                // 校正警告（v0.3.7）：独立警示条（淡橙底圆角），不再混进建议行。
                 // 紧凑模式收起。
                 if (!compactMode) {
                     JSONObject reconcile = result.optJSONObject("reconcile");
                     JSONArray warnings = reconcile == null ? null : reconcile.optJSONArray("warnings");
                     if (warnings != null && warnings.length() > 0) {
-                        StringBuilder wb = new StringBuilder("\n⚠");
+                        StringBuilder wb = new StringBuilder("⚠ ");
                         int show = Math.min(warnings.length(), 2);
                         for (int i = 0; i < show; i++) {
-                            if (i > 0) wb.append("；");
+                            if (i > 0) wb.append("\n⚠ ");
                             String w = warnings.optString(i);
                             if (w.length() > 40) w = w.substring(0, 40) + "…";
                             wb.append(w);
                         }
                         if (warnings.length() > 2) {
-                            wb.append(" 等").append(warnings.length()).append("条");
+                            wb.append("　等").append(warnings.length()).append("条");
                         }
-                        b.append(wb);
+                        tvWarning.setText(wb.toString());
+                        tvWarning.setVisibility(View.VISIBLE);
+                    } else {
+                        tvWarning.setVisibility(View.GONE);
                     }
+                } else {
+                    tvWarning.setVisibility(View.GONE);
                 }
 
                 recommendView.setText(b.toString());
@@ -556,6 +564,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         ramenView = panel.findViewById(R.id.tv_ramen);
         trainingsView = panel.findViewById(R.id.tv_trainings);
         sourceView = panel.findViewById(R.id.tv_source);
+        tvWarning = panel.findViewById(R.id.tv_warning);
         windowManager.addView(panel, p);
     }
 
