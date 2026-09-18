@@ -15,6 +15,10 @@ name = "ramen_batch"
 path = "src/batch.rs"
 
 [[bin]]
+name = "ramen_batch_genome"
+path = "src/batch_genome.rs"
+
+[[bin]]
 name = "ramen_optimize"
 path = "src/optimize.rs"
 

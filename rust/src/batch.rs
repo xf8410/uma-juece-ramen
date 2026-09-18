@@ -6,7 +6,8 @@
 //!
 //! 或设置 UMAI_DATA_DIR 环境变量指向 gamedata/ 目录。
 //!
-//! 可通过环境变量传 JSON 覆盖策略参数：
+//! 基线策略 = rust/strategy_optimized.json（编译期烧入，CMA-ES 优化参数）。
+//! 可通过环境变量传 JSON 整体覆盖策略参数：
 //!   RAMEN_STRATEGY='{"vital_rest_threshold":35,"head_weight":20.0}' cargo run --release --bin ramen_batch -- 1000
 
 use std::env;
@@ -25,6 +26,14 @@ const TEST_INHERIT: InheritInfo = InheritInfo {
     blue_count: [15, 3, 0, 0, 0],
     extra_count: [0, 30, 0, 0, 30, 30],
 };
+
+/// 基线策略：编译期烧入 rust/strategy_optimized.json（CMA-ES 优化参数）。
+///
+/// 2026-09-17 修复：此前 simulate 一直跑出厂默认参数——CI push 触发时
+/// RAMEN_STRATEGY 环境变量为空，而本文件也从不主动读 strategy_optimized.json，
+/// 导致 CI 均分停留在 ~57k（最高 ~63k），与优化账目完全脱节。
+/// 现在优化参数直接烧入二进制作基线；RAMEN_STRATEGY 仍可整体覆盖（优先级最高）。
+const OPTIMIZED_STRATEGY_JSON: &str = include_str!("../strategy_optimized.json");
 
 struct SimResult {
     score: i32,
@@ -70,12 +79,22 @@ fn main() {
         std::process::exit(1);
     }
 
-    // 从环境变量加载策略覆盖
+    // 基线策略：strategy_optimized.json（编译期烧入）
     let mut strategy = RamenStrategy::default();
+    match serde_json::from_str::<RamenStrategy>(OPTIMIZED_STRATEGY_JSON) {
+        Ok(base) => strategy = base,
+        Err(e) => eprintln!("strategy_optimized.json 解析失败，回退代码默认参数: {e}"),
+    }
+    // 环境变量覆盖（优先级最高）
     if let Ok(json) = env::var("RAMEN_STRATEGY") {
-        if let Ok(override_strategy) = serde_json::from_str::<RamenStrategy>(&json) {
-            strategy = override_strategy;
-            println!("策略覆盖: {strategy:?}");
+        if !json.trim().is_empty() {
+            match serde_json::from_str::<RamenStrategy>(&json) {
+                Ok(override_strategy) => {
+                    strategy = override_strategy;
+                    println!("策略覆盖 (RAMEN_STRATEGY): {strategy:?}");
+                }
+                Err(e) => eprintln!("RAMEN_STRATEGY 解析失败，忽略该覆盖: {e}"),
+            }
         }
     }
     println!("策略参数: {strategy:#?}");
