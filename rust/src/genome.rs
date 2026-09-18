@@ -31,8 +31,11 @@ pub const SOURCE_NAME: &str = "ga_freeze_v5";
 static OVERRIDE: OnceLock<Option<ParamOverride>> = OnceLock::new();
 
 /// 解析覆盖层 TOML（公开给 batch_genome 做 A/B/C 对照）。
+///
+/// 错误统一 `to_string()` 成 String：对上游签名的错误类型（String / anyhow）
+/// 双兼容，本仓侧不再关心具体错误类型。
 pub fn parse(toml: &str) -> Result<ParamOverride, String> {
-    parse_override_toml(toml)
+    parse_override_toml(toml).map_err(|e| e.to_string())
 }
 
 /// 当前启用的覆盖层（解析失败 → None → 一切回退当前 preset）。
