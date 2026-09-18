@@ -108,6 +108,15 @@ jobs:
           N="${{ github.event.inputs.sim_count || '100' }}"
           cargo run --release --manifest-path rust/Cargo.toml --bin ramen_batch -- "$N" 2>&1 | tee /tmp/sim_output.txt || echo "SIM_FAILED" >> /tmp/sim_output.txt
           cat /tmp/sim_output.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Run genome A/B
+        run: |
+          # GA 基因组三臂配对基准（同卷面同种子）：A=preset(9旋钮定稿) /
+          # B=best_genome 覆盖层 / C=ga_freeze（浮窗 fallback 实际启用的通道）。
+          # 配对均差 = 配置净效应，直接进 Step Summary 供决策。
+          cd /tmp
+          N="${{ github.event.inputs.sim_count || '100' }}"
+          cargo run --release --manifest-path rust/Cargo.toml --bin ramen_batch_genome -- "$N" 2>&1 | tee /tmp/genome_output.txt || echo "GENOME_AB_FAILED" >> /tmp/genome_output.txt
+          cat /tmp/genome_output.txt >> "$GITHUB_STEP_SUMMARY"
 
   optimize:
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.opt_mode != '' && github.event.inputs.opt_mode != '0'
