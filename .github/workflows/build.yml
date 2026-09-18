@@ -7,16 +7,16 @@ on:
   workflow_dispatch:
     inputs:
       sim_count:
-        description: '模拟局数（0=不跑模拟）'
-        default: '100'
+        description: '模拟局数（0=不跑模拟；基因组 A/B 随 simulate 同跑）'
+        default: '1000'
         type: string
       strategy_json:
         description: '策略参数 JSON（留空用仓库内置优化参数）'
         default: ''
         type: string
       opt_mode:
-        description: '优化模式（cmaes / bayes / 留空=不跑）'
-        default: 'cmaes'
+        description: '优化模式（cmaes / bayes / 0=不跑；跑完会自动提交策略文件）'
+        default: '0'
         type: string
       opt_arg1:
         description: 'CMA-ES=代数 / Bayes=初始采样数'
@@ -105,7 +105,7 @@ jobs:
           cd /tmp
           cp -r ${{ github.workspace }}/gamedata .
           cp -r ${{ github.workspace }}/rust .
-          N="${{ github.event.inputs.sim_count || '100' }}"
+          N="${{ github.event.inputs.sim_count || '1000' }}"
           cargo run --release --manifest-path rust/Cargo.toml --bin ramen_batch -- "$N" 2>&1 | tee /tmp/sim_output.txt || echo "SIM_FAILED" >> /tmp/sim_output.txt
           cat /tmp/sim_output.txt >> "$GITHUB_STEP_SUMMARY"
       - name: Run genome A/B
@@ -114,7 +114,7 @@ jobs:
           # B=best_genome 覆盖层 / C=ga_freeze（浮窗 fallback 实际启用的通道）。
           # 配对均差 = 配置净效应，直接进 Step Summary 供决策。
           cd /tmp
-          N="${{ github.event.inputs.sim_count || '100' }}"
+          N="${{ github.event.inputs.sim_count || '1000' }}"
           cargo run --release --manifest-path rust/Cargo.toml --bin ramen_batch_genome -- "$N" 2>&1 | tee /tmp/genome_output.txt || echo "GENOME_AB_FAILED" >> /tmp/genome_output.txt
           cat /tmp/genome_output.txt >> "$GITHUB_STEP_SUMMARY"
 
@@ -235,7 +235,7 @@ jobs:
         run: |
           if [ -f rust/strategy_optimized.json ]; then
             cp rust/strategy_optimized.json app/src/main/assets/strategy_optimized.json
-            echo "优化策略已打包进 APK"
+            echo "优化策略已打包进 APK（注意：当前无运行时消费者，仅存档）"
           else
             echo "无优化策略文件，APK 用默认参数"
           fi
