@@ -1,0 +1,58 @@
+# GA 最优基因组覆盖层（Some 子集 preset 快照，自动生成）
+# 来源：xf8410/umaai-rs batch_v5/best_genome.toml（GA lab 最优，77 基因通道）
+# None 字段未列出 = 保留 RecommendedRamenTrainer::new() 当前正式 preset
+# 适应度口径见 fork 仓 ga_generations.csv；本文件供 A/B 对照与浮窗 fallback 接线
+
+[policy]
+vital_rest_eating = [38, null, 40]
+wisdom_vital_floor = 39
+motivation_outing = 3
+pt_rate = [null, 68.11398, 82.534676]
+pt_tradeoff = 16.590359
+cap_discount_weight = 0.65676033
+failure_penalty = 163.94298
+effective_ramen_failure = true
+shining_bonus = 60
+rest_base = 24.023556
+rest_vital_value = 1.2538702
+race_panel_discount = 0.3
+race_free_urgency_weight = 3219.5012
+race_gate_slack = 1
+outing_base = 12.036555
+ramen_pt_weight = 6.847837
+ramen_special_cost = 1.4305902
+ramen_stock_cost = 0.7818746
+region_hint_weight = 20.63594
+region_youqing_weight = 6.0389924
+region_weak_cover_weight = 23.78819
+event_vital_weight = 4.5543146
+event_bad_flag_penalty = 300
+
+[local]
+hint_bonus = 1.8243724
+first_friend_click_value = 138.734
+low_friend_bond_value = 48.22957
+active_friend_value = 12.35542
+feeling_overflow_threshold = 6
+overflow_value = 0.6875968
+max_base_score_sacrifice = 126.222916
+status_reserve_max = 35.491478
+dynamic_status_balance = true
+status_gap_strength = 0.81983805
+status_overflow_strength = 1.2985637
+dynamic_vital = true
+expected_fail = true
+rmj_cross_bonus = 0
+ramen_window_weight = 0.31270346
+ramen_train_coupling_weight = 1.4149249
+ramen_weak_train_boost = 0
+friend_future_hidden_weight = 0.008991056
+eat_guarantee_weight = 2.983336
+eat_requires_training = true
+eat_requires_covered_train = true
+y3_post_train_vital_target = 3
+y3_vital_shortfall_weight = 0.08309984
+y3_post_train_hard_floor = 10
+y3_recovery_horizon = true
+friend_outing3_recovery_vital = 76
+friend_outing_cumulative_caps = [0, null, 5]

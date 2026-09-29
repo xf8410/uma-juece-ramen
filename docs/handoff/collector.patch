@@ -1,0 +1,586 @@
+diff --git a/.github/workflows/ramen-observation.yml b/.github/workflows/ramen-observation.yml
+new file mode 100644
+index 0000000..cd7bf3b
+--- /dev/null
++++ b/.github/workflows/ramen-observation.yml
+@@ -0,0 +1,16 @@
++name: Ramen observation contract
++on:
++  push:
++    paths: ['ramen_observation/**', 'hachimi_ura_plugin/src/lib.rs', '.github/workflows/ramen-observation.yml']
++  pull_request:
++    paths: ['ramen_observation/**', 'hachimi_ura_plugin/src/lib.rs', '.github/workflows/ramen-observation.yml']
++  workflow_dispatch:
++permissions:
++  contents: read
++jobs:
++  contract:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - uses: dtolnay/rust-toolchain@1.97.1
++      - run: cargo test --release --locked --manifest-path ramen_observation/Cargo.toml
+diff --git a/docs/RAMEN_RUNTIME_SNAPSHOT_V1.md b/docs/RAMEN_RUNTIME_SNAPSHOT_V1.md
+new file mode 100644
+index 0000000..4183d9e
+--- /dev/null
++++ b/docs/RAMEN_RUNTIME_SNAPSHOT_V1.md
+@@ -0,0 +1,34 @@
++# 拉面运行时快照 V1
++
++`GET /api/ai/ramen/v1/snapshot` 与发送到 Android `POST /data` 的内容来自同一个不可变缓存。相同观测不会增加 `snapshot_id` 或刷新 `captured_at_ms`。仅采集到不同内容后产生新序号。
++
++## 当前实现与硬性限制
++
++`ramen_observation` 是可在桌面测试的转换及发布库。已经映射现有摘要中含义明确的属性、体力、干劲、角色、支援卡及突破编码、剧本 Pt 和隐藏风味。没有推断回合、人员身份、库存顺序或阶段；没有固定卡组或模拟重放。
++
++当前旧采集器不能证明完整快照的原子性，也未提供可信局标识、明确阶段和全部继承/友人/比赛数据。新端点因此返回 `ready:false`、`missing_fields` 和 `display_summary`。这属于明确的生产阻塞，不能称为已经能驱动真实对局搜索。
++
++后续必须在目标游戏版本完成同一状态版本内的完整捕获，再调用 `Publisher::publish`。禁止删除缺失检查、把零填充当作已观测值，或从旧摘要的推测字段构造“完整”输入。`ready` 由字段检查计算，调用方传入 `ready:true` 无效；公共运行层还会执行类型、范围与动作校验。
++
++## 输入协议
++
++顶层：`schema_version=1`、`run_id`、`snapshot_id`、`captured_at_ms`、`collector_version`、`game_version`、`capture_coherence`、`stage`、`state`、`continuation`、`event`、`missing_fields`、`provenance`。
++
++- `run_id` 对应真实育成局标识，不使用马娘 ID 或随机模拟局号。
++- `state.baseGame` / `state.ramen` 使用公共运行层的 PC 字段契约。
++- `continuation` 含 `eat_count`、`rmj_results`、`train_level_bonus`、`pending_ramen`、`pending_special_targets`、`inherit_extra_count`。
++- `stage` 为 `train/ramen_select/special_select/region_select/super_ramen_select/event/settlement`；缺证据时为 `unknown`，禁止搜索。
++- `capture_coherence=verified` 必须由经过真机验证的完整捕获链提供，HTTP 多次读取相同内容不等于原子捕获。
++- `event` 仅在真实事件界面携带完整选项及效果；未知效果必须报告缺失。
++
++字段存在性清单位于 `ramen_observation/src/lib.rs`，与 `umaai_runtime` 的严格校验一起更新。
++
++## 验证
++
++```powershell
++cargo test --release --manifest-path ramen_observation/Cargo.toml
++```
++
++覆盖去重/序号、错误输入、缺失信息拒绝、卡片突破未知值和禁用旧回合推断。此测试不证明 IL2CPP 内存读取安全或目标游戏字段语义正确。
++
++基线 `721c086` 的 `hachimi_ura_plugin/src/lib.rs` 与 `so-history-backup-main` 快照逐字节一致，SHA256 为 `c7fbf94b308cf20268e6f1530b5ca48abc1074f9a32e6a7109624656f9c13c02`。尚未核对用户设备上实际部署的 SO。
+diff --git a/hachimi_ura_plugin/Cargo.lock b/hachimi_ura_plugin/Cargo.lock
+index 6339b8f..b7638bf 100644
+--- a/hachimi_ura_plugin/Cargo.lock
++++ b/hachimi_ura_plugin/Cargo.lock
+@@ -118,9 +118,10 @@ dependencies = [
+ 
+ [[package]]
+ name = "hachimi_ura"
+-version = "3.27.4"
++version = "3.27.9"
+ dependencies = [
+  "libc",
++ "ramen_observation",
+  "rusqlite",
+  "ureq",
+ ]
+@@ -246,6 +247,12 @@ dependencies = [
+  "icu_properties",
+ ]
+ 
++[[package]]
++name = "itoa"
++version = "1.0.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
++
+ [[package]]
+ name = "libc"
+ version = "0.2.189"
+@@ -275,6 +282,12 @@ version = "0.4.33"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+ 
++[[package]]
++name = "memchr"
++version = "2.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
++
+ [[package]]
+ name = "miniz_oxide"
+ version = "0.8.9"
+@@ -330,6 +343,14 @@ dependencies = [
+  "proc-macro2",
+ ]
+ 
++[[package]]
++name = "ramen_observation"
++version = "0.1.0"
++dependencies = [
++ "serde",
++ "serde_json",
++]
++
+ [[package]]
+ name = "ring"
+ version = "0.17.14"
+@@ -400,6 +421,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
+ dependencies = [
+  "serde_core",
++ "serde_derive",
+ ]
+ 
+ [[package]]
+@@ -422,6 +444,19 @@ dependencies = [
+  "syn 3.0.3",
+ ]
+ 
++[[package]]
++name = "serde_json"
++version = "1.0.151"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
++dependencies = [
++ "itoa",
++ "memchr",
++ "serde",
++ "serde_core",
++ "zmij",
++]
++
+ [[package]]
+ name = "shlex"
+ version = "2.0.1"
+@@ -758,3 +793,9 @@ dependencies = [
+  "quote",
+  "syn 2.0.119",
+ ]
++
++[[package]]
++name = "zmij"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+diff --git a/hachimi_ura_plugin/Cargo.toml b/hachimi_ura_plugin/Cargo.toml
+index c23cf2e..1e207c8 100644
+--- a/hachimi_ura_plugin/Cargo.toml
++++ b/hachimi_ura_plugin/Cargo.toml
+@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
+ rusqlite = { version = "0.31", default-features = false, features = ["bundled"] }
+ ureq = { version = "2", features = ["tls"] }
+ libc = "0.2"
++ramen_observation = { version = "0.1.0", path = "../ramen_observation" }
+ 
+ [profile.release]
+ opt-level = 3
+diff --git a/hachimi_ura_plugin/src/lib.rs b/hachimi_ura_plugin/src/lib.rs
+index 3d7bf13..9647279 100644
+--- a/hachimi_ura_plugin/src/lib.rs
++++ b/hachimi_ura_plugin/src/lib.rs
+@@ -28,6 +28,34 @@ use std::ptr;
+ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+ use std::sync::Mutex;
+ 
++// One immutable publication is shared by polling and push. Only the fresh
++// summary capture path updates it; HTTP readers cannot mint new snapshot IDs.
++static RAMEN_AI_OBSERVATIONS: std::sync::OnceLock<Mutex<ramen_observation::Publisher>> =
++    std::sync::OnceLock::new();
++
++/// Publish verified legacy measurements with explicit gaps. This does not mark
++/// an incomplete summary as a decision-ready runtime snapshot.
++fn observe_ai_snapshot(summary: &str) {
++    let captured_at_ms = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|v| v.as_millis() as u64).unwrap_or(0);
++    if let Ok(mut publisher) = RAMEN_AI_OBSERVATIONS
++        .get_or_init(|| Mutex::new(ramen_observation::Publisher::default())).lock() {
++        let _ = publisher.observe_summary(summary, PLUGIN_VERSION, captured_at_ms);
++    }
++}
++
++/// Return the same versioned observation to polling and push consumers.
++fn read_ai_snapshot() -> String {
++    let summary = read_summary();
++    observe_ai_snapshot(&summary);
++    if let Ok(publisher) = RAMEN_AI_OBSERVATIONS
++        .get_or_init(|| Mutex::new(ramen_observation::Publisher::default())).lock() {
++        if let Some(snapshot) = publisher.current() { return snapshot.to_string(); }
++    }
++    r#"{"schema_version":1,"ready":false,"missing_fields":["capture"],"error":"no_snapshot"}"#.into()
++}
++
+ #[repr(i32)]
+ #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+ pub enum InitResult {
+@@ -4584,6 +4612,7 @@ fn read_summary() -> String {
+     SIGSEGV_RECOVERY.store(false, std::sync::atomic::Ordering::Relaxed);
+     // v3.24.71: compare only fresh runtime reads (never cache hits).
+     observe_ramen_transition(&summary, now);
++    observe_ai_snapshot(&summary);
+     // ★ v3.22.51: Update cache
+     if let Ok(mut guard) = CACHED_SUMMARY.lock() {
+         *guard = Some((summary.clone(), now));
+@@ -6702,7 +6731,7 @@ fn push_loop() {
+         unsafe {
+             LAST_PUSH_HASH = simple_hash(&init_summary);
+         }
+-        push_to_app(&init_summary);
++        push_to_app(&read_ai_snapshot());
+         unsafe {
+             ura_log(3, "Push: initial data pushed");
+         }
+@@ -6762,7 +6791,7 @@ fn push_loop() {
+             unsafe {
+                 ura_log(3, "Push: data changed, pushing to app");
+             }
+-            push_to_app(&summary);
++            push_to_app(&read_ai_snapshot());
+         }
+     }
+ }
+@@ -7606,6 +7635,8 @@ fn handle_http(mut stream: std::net::TcpStream) {
+                 }
+             }
+         }
++    } else if path == "/api/ai/ramen/v1/snapshot" {
++        read_ai_snapshot()
+     } else if path == "/summary" {
+         read_summary()
+     } else if path == "/debug/turn_probe" {
+diff --git a/ramen_observation/.gitignore b/ramen_observation/.gitignore
+new file mode 100644
+index 0000000..b83d222
+--- /dev/null
++++ b/ramen_observation/.gitignore
+@@ -0,0 +1 @@
++/target/
+diff --git a/ramen_observation/Cargo.lock b/ramen_observation/Cargo.lock
+new file mode 100644
+index 0000000..adc7301
+--- /dev/null
++++ b/ramen_observation/Cargo.lock
+@@ -0,0 +1,107 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "itoa"
++version = "1.0.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
++
++[[package]]
++name = "memchr"
++version = "2.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
++
++[[package]]
++name = "proc-macro2"
++version = "1.0.107"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "quote"
++version = "1.0.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
++dependencies = [
++ "proc-macro2",
++]
++
++[[package]]
++name = "ramen_observation"
++version = "0.1.0"
++dependencies = [
++ "serde",
++ "serde_json",
++]
++
++[[package]]
++name = "serde"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
++dependencies = [
++ "serde_core",
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_core"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
++dependencies = [
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_derive"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "serde_json"
++version = "1.0.151"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
++dependencies = [
++ "itoa",
++ "memchr",
++ "serde",
++ "serde_core",
++ "zmij",
++]
++
++[[package]]
++name = "syn"
++version = "3.0.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "unicode-ident"
++version = "1.0.26"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
++
++[[package]]
++name = "zmij"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+diff --git a/ramen_observation/Cargo.toml b/ramen_observation/Cargo.toml
+new file mode 100644
+index 0000000..0f20f2e
+--- /dev/null
++++ b/ramen_observation/Cargo.toml
+@@ -0,0 +1,8 @@
++[package]
++name = "ramen_observation"
++version = "0.1.0"
++edition = "2024"
++
++[dependencies]
++serde = { version = "1.0.229", features = ["derive"] }
++serde_json = "1.0.151"
+diff --git a/ramen_observation/src/lib.rs b/ramen_observation/src/lib.rs
+new file mode 100644
+index 0000000..cf5d60f
+--- /dev/null
++++ b/ramen_observation/src/lib.rs
+@@ -0,0 +1,193 @@
++//! Immutable versioned observations. Unknown state is never simulated or defaulted.
++use serde_json::{Map, Value, json};
++
++/// Required PC base-state fields, including explicitly nullable story.
++pub const BASE_FIELDS: &[&str] = &[
++    "scenarioId", "umaId", "umaStar", "turn", "vital", "maxVital", "motivation",
++    "fiveStatus", "fiveStatusLimit", "skillPt", "skillScore", "totalHints",
++    "trainLevelCount", "ptScoreRate", "failureRateBias", "isIll", "isQieZhe",
++    "isAiJiao", "isPositiveThinking", "isRefreshMind", "isLucky", "zhongMaBlueCount",
++    "isRacing", "cardId", "persons", "personDistribution", "lockedTrainingId",
++    "friendship_noncard_yayoi", "friendship_noncard_reporter", "friend_stage",
++    "friend_outgoingUsed", "playing_state", "raceHistory", "story", "source",
++    "single_mode_chara_id",
++];
++/// Required ramen state, using the PC wire names.
++pub const RAMEN_FIELDS: &[&str] = &[
++    "feeling_gauge_gains", "feeling_gauge", "feeling_stock", "special_feeling",
++    "train_feeling_type", "active_effect_array", "super_ramen", "selected_regions",
++    "feeling_gauge_gain_base", "last_ramen", "scenario_pt", "next_scenario_pt",
++];
++/// State needed to continue simulation without inventing earlier actions.
++pub const CONTINUATION_FIELDS: &[&str] = &[
++    "eat_count", "rmj_results", "train_level_bonus", "pending_ramen",
++    "pending_special_targets", "inherit_extra_count",
++];
++
++/// One publication cache, externally protected by the host's mutex.
++#[derive(Default)]
++pub struct Publisher { serial: u64, material: Option<Value>, current: Option<Value> }
++
++impl Publisher {
++    /// Assign a sequence only when material changes; HTTP and push share this value.
++    pub fn publish(&mut self, mut observation: Value, at: u64) -> Result<&Value, String> {
++        let object = observation.as_object_mut().ok_or("observation must be an object")?;
++        for key in ["snapshot_id", "captured_at_ms"] { object.remove(key); }
++        if self.material.as_ref() == Some(&observation) {
++            return self.current.as_ref().ok_or_else(|| "publication invariant".into());
++        }
++        self.serial = self.serial.checked_add(1).ok_or("sequence exhausted")?;
++        self.material = Some(observation.clone());
++        observation["snapshot_id"] = json!(self.serial);
++        observation["captured_at_ms"] = json!(at);
++        let missing = missing_fields(&observation);
++        observation["ready"] = json!(missing.is_empty());
++        observation["missing_fields"] = json!(missing);
++        self.current = Some(observation);
++        self.current.as_ref().ok_or_else(|| "publication invariant".into())
++    }
++    /// Read the cached immutable observation.
++    pub fn current(&self) -> Option<&Value> { self.current.as_ref() }
++    /// Convert only known legacy measurements. Never elevate inferred fields.
++    pub fn observe_summary(&mut self, summary: &str, version: &str, at: u64) -> Result<&Value, String> {
++        let raw: Value = serde_json::from_str(summary).map_err(|e| e.to_string())?;
++        self.publish(from_legacy_summary(&raw, version), at)
++    }
++}
++
++/// Presence and producer validation. Runtime performs full semantic validation too.
++pub fn missing_fields(value: &Value) -> Vec<String> {
++    let mut missing = Vec::new();
++    // Producer vetoes carry semantic information that field presence cannot prove.
++    if value.get("ready").and_then(Value::as_bool) == Some(false) { missing.push("producer_not_ready".into()); }
++    if let Some(declared) = value.get("missing_fields") {
++        match declared.as_array() {
++            Some(fields) => for field in fields {
++                missing.push(field.as_str().unwrap_or("invalid_missing_fields_entry").into());
++            },
++            None => missing.push("invalid_missing_fields".into()),
++        }
++    }
++    if value["schema_version"].as_u64() != Some(1) { missing.push("schema_version".into()); }
++    if value["run_id"].as_u64().filter(|n| *n > 0).is_none() { missing.push("run_id".into()); }
++    for field in ["collector_version", "game_version"] {
++        if value[field].as_str().filter(|s| !s.is_empty()).is_none() { missing.push(field.into()); }
++    }
++    if value["capture_coherence"].as_str() != Some("verified") { missing.push("capture_coherence".into()); }
++    if !matches!(value["stage"].as_str(), Some("train" | "ramen_select" | "special_select" | "region_select" | "super_ramen_select" | "event" | "settlement")) { missing.push("stage".into()); }
++    for (path, object, fields) in [
++        ("state.baseGame", &value["state"]["baseGame"], BASE_FIELDS),
++        ("state.ramen", &value["state"]["ramen"], RAMEN_FIELDS),
++        ("continuation", &value["continuation"], CONTINUATION_FIELDS),
++    ] {
++        for field in fields {
++            if !object.get(*field).is_some_and(|v| !v.is_null() || matches!(*field, "story" | "pending_ramen")) {
++                missing.push(format!("{path}.{field}"));
++            }
++        }
++    }
++    if value.get("event").is_none() || (value["stage"] == "event" && !value["event"].is_object()) { missing.push("event".into()); }
++    if value["state"]["baseGame"]["scenarioId"].as_u64() != Some(14) { missing.push("scenarioId=14".into()); }
++    missing.sort(); missing.dedup(); missing
++}
++
++/// Explicitly partial conversion. Legacy turn numbering, partner identities,
++/// gauge remaining/value semantics, and capture coherence are unverified.
++pub fn from_legacy_summary(raw: &Value, version: &str) -> Value {
++    let mut base = Map::new(); let mut ramen = Map::new(); let mut provenance = Map::new();
++    if raw["scenario"].as_str() == Some("Ramen") { base.insert("scenarioId".into(), json!(14)); }
++    copy_nonnegative(raw.get("chara_id"), "umaId", &mut base);
++    for (source, target) in [("vital", "vital"), ("max_vital", "maxVital"), ("skill_point", "skillPt")] {
++        copy_nonnegative(raw["stats"].get(source), target, &mut base);
++    }
++    let motivation = raw["stats"]["motivation"].as_i64().filter(|v| (1..=5).contains(v)).or_else(|| match raw["stats"]["motivation"].as_str() {
++        Some("Best") => Some(5), Some("Good") => Some(4), Some("Normal") => Some(3),
++        Some("Bad") => Some(2), Some("Worst") => Some(1), _ => None,
++    });
++    if let Some(v) = motivation { base.insert("motivation".into(), json!(v)); }
++    for (source, target) in [("stats", "fiveStatus"), ("max_stats", "fiveStatusLimit")] {
++        let values: Option<Vec<i64>> = ["speed", "stamina", "power", "guts", "wiz"].iter()
++            .map(|key| raw[source][*key].as_i64().filter(|v| *v >= 0)).collect();
++        if let Some(v) = values { base.insert(target.into(), json!(v)); }
++    }
++    if let Some(cards) = raw["support_cards"].as_array().filter(|v| v.len() == 6) {
++        let mut ordered = cards.iter().collect::<Vec<_>>(); ordered.sort_by_key(|v| v["position"].as_u64());
++        let ids: Option<Vec<u64>> = ordered.iter().enumerate().map(|(i, v)| {
++            if v["position"].as_u64() != Some(i as u64 + 1) { return None; }
++            let id = v["support_card_id"].as_u64().filter(|id| *id > 0)?;
++            let rank = v["limit_break_count"].as_u64().filter(|r| *r <= 4)?;
++            id.checked_mul(10)?.checked_add(rank)
++        }).collect();
++        if let Some(ids) = ids { base.insert("cardId".into(), json!(ids)); }
++    }
++    copy_nonnegative(raw["ramen"].get("checkpoint_pt"), "scenario_pt", &mut ramen);
++    copy_nonnegative(raw["ramen"].get("special_feeling_num"), "special_feeling", &mut ramen);
++    for field in base.keys() { provenance.insert(format!("state.baseGame.{field}"), json!("legacy_runtime_observation")); }
++    for field in ramen.keys() { provenance.insert(format!("state.ramen.{field}"), json!("legacy_runtime_observation")); }
++    json!({"schema_version":1,"run_id":null,"stage":"unknown","collector_version":version,
++        "game_version":null,"capture_coherence":"unverified","state":{"baseGame":base,"ramen":ramen},
++        "continuation":{},"event":null,"provenance":provenance,"capture_error":raw.get("error"),
++        "display_summary":{"scenario":raw.get("scenario"),"stats":raw.get("stats"),
++            "max_stats":raw.get("max_stats"),"trainings":raw.get("trainings"),"ramen":raw.get("ramen"),
++            "support_cards":raw.get("support_cards"),"last_action":raw.get("last_action")},
++        "limitations":["Legacy summary lacks verified run identity and atomic stage snapshot; decision disabled."]})
++}
++
++fn copy_nonnegative(value: Option<&Value>, key: &str, out: &mut Map<String, Value>) {
++    if let Some(v) = value.and_then(Value::as_i64).filter(|v| *v >= 0) { out.insert(key.into(), json!(v)); }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn legacy_never_invents_identity_turn_or_inventory_order() {
++        let v = from_legacy_summary(&json!({"scenario":"Ramen","turn":31,"ramen":{"sozai":[1,2,3]}}), "test");
++        assert!(v["run_id"].is_null()); assert!(v["state"]["baseGame"].get("turn").is_none());
++        assert!(v["state"]["ramen"].get("feeling_stock").is_none());
++        assert!(missing_fields(&v).contains(&"capture_coherence".to_string()));
++    }
++    #[test]
++    fn duplicate_polling_preserves_sequence_and_time() {
++        let mut p = Publisher::default();
++        let first = p.observe_summary(r#"{"scenario":"Ramen","stats":{"vital":70}}"#, "test", 100).unwrap().clone();
++        let duplicate = p.observe_summary(r#"{"stats":{"vital":70},"scenario":"Ramen"}"#, "test", 200).unwrap().clone();
++        assert_eq!(first, duplicate);
++        let updated = p.observe_summary(r#"{"scenario":"Ramen","stats":{"vital":71}}"#, "test", 300).unwrap();
++        assert_eq!(updated["snapshot_id"], 2); assert_eq!(updated["captured_at_ms"], 300);
++    }
++    #[test]
++    fn unknown_break_count_is_not_max_rank() {
++        let cards = (1..=6).map(|i| json!({"position":i,"support_card_id":30242,"limit_break_count":-1})).collect::<Vec<_>>();
++        let v = from_legacy_summary(&json!({"support_cards":cards}), "test");
++        assert!(v["state"]["baseGame"].get("cardId").is_none());
++    }
++    #[test]
++    fn ready_flag_does_not_bypass_validation() {
++        let mut p = Publisher::default();
++        let v = p.publish(json!({"ready":true,"missing_fields":[],"schema_version":1}), 10).unwrap();
++        assert_eq!(v["ready"], false); assert!(!v["missing_fields"].as_array().unwrap().is_empty());
++    }
++    #[test]
++    fn malformed_observation_preserves_previous_snapshot() {
++        let mut p = Publisher::default(); p.observe_summary("{}", "test", 10).unwrap();
++        let previous = p.current().cloned();
++        assert!(p.observe_summary("not-json", "test", 11).is_err()); assert_eq!(p.current(), previous.as_ref());
++    }
++    #[test]
++    fn producer_semantic_veto_survives_publication() {
++        let mut p = Publisher::default();
++        let value = p.publish(json!({"ready":false,"missing_fields":["partner_id_mapping_unverified"]}), 1).unwrap();
++        assert_eq!(value["ready"], false);
++        let fields = value["missing_fields"].as_array().unwrap();
++        assert!(fields.contains(&json!("partner_id_mapping_unverified")));
++        assert!(fields.contains(&json!("producer_not_ready")));
++    }
++    #[test]
++    fn non_event_requires_explicit_null_event() {
++        let without = json!({"stage":"train"});
++        assert!(missing_fields(&without).contains(&"event".into()));
++        let with = json!({"stage":"train","event":null});
++        assert!(!missing_fields(&with).contains(&"event".into()));
++    }
++}
+diff --git a/rust-toolchain.toml b/rust-toolchain.toml
+new file mode 100644
+index 0000000..08d9c83
+--- /dev/null
++++ b/rust-toolchain.toml
+@@ -0,0 +1,4 @@
++[toolchain]
++channel = "1.97.1"
++profile = "minimal"
++targets = ["aarch64-linux-android"]

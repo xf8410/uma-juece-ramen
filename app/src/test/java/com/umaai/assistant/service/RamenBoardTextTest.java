@@ -15,7 +15,7 @@ public class RamenBoardTextTest {
                 "\"search_n\":4096,\"elapsed_ms\":12697}");
         String line = RamenBoardText.decisionLine(decision);
         assertTrue(line, line.contains("建议：吃面/函馆-耐"));
-        assertTrue(line, line.contains("mean 66972"));
+        assertTrue(line, line.contains("终局预估 66972"));
         assertTrue(line, line.contains("4096次"));
         assertTrue(line, line.contains("12.7s"));
     }

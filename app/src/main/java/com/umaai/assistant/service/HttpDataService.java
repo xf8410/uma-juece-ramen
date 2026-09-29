@@ -5,6 +5,7 @@ import org.json.JSONObject;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.function.Supplier;
 
 import fi.iki.elonen.NanoHTTPD;
 
@@ -12,10 +13,15 @@ public final class HttpDataService extends NanoHTTPD {
     public static final int PORT = 18766;
     public interface OnDataListener { void onDataReceived(String data); }
     private final OnDataListener listener;
+    private final Supplier<String> status;
 
     public HttpDataService(OnDataListener listener) {
+        this(listener, () -> "running");
+    }
+    public HttpDataService(OnDataListener listener, Supplier<String> status) {
         super("127.0.0.1", PORT);
         this.listener = listener;
+        this.status = status;
     }
 
     public void startServer() throws IOException { start(SOCKET_READ_TIMEOUT, false); }
@@ -28,15 +34,24 @@ public final class HttpDataService extends NanoHTTPD {
                 value.put("app", "uma-juece-ramen");
                 value.put("scenario", "Ramen");
                 value.put("http_port", PORT);
-                value.put("status", "running");
+                value.put("status", status.get());
+                value.put("snapshot_schema_version", 1);
                 return json(value.toString());
             }
             if ("/data".equals(session.getUri()) && session.getMethod() == Method.POST) {
+                long length;
+                try { length = Long.parseLong(session.getHeaders().getOrDefault("content-length", "-1")); }
+                catch (NumberFormatException error) { length = -1; }
+                if (length < 1 || length > PrivateFiles.MAX_SNAPSHOT_BYTES)
+                    return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"error\":\"Content-Length must be 1..4194304\"}");
                 Map<String, String> files = new HashMap<>();
                 session.parseBody(files);
                 String body = files.get("postData");
+                if (body == null || body.length() > PrivateFiles.MAX_SNAPSHOT_BYTES)
+                    return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"error\":\"missing JSON body\"}");
+                new JSONObject(body);
                 if (body != null && listener != null) listener.onDataReceived(body);
-                return json("{\"ok\":true}");
+                return json("{\"ok\":true,\"accepted_for_validation\":true}");
             }
             // 决策日志拉取：adb forward tcp:18766 tcp:18766 && curl http://127.0.0.1:18766/decision_log
             if ("/decision_log".equals(session.getUri()) && session.getMethod() == Method.GET) {

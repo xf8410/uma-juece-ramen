@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "rust": "1.97.1",
+  "cargo_ndk": "4.1.2",
+  "jdk": "17.0.16+8",
+  "gradle": "8.11.1",
+  "gradle_wrapper_sha256": "2db75c40782f5e8ba1fc278a5574bab070adccb2d21ca5a6e5ed840888448046",
+  "agp": "8.9.2",
+  "android_compile_sdk": 34,
+  "android_build_tools": "35.0.0",
+  "ndk": "28.2.13676358",
+  "min_android_api": 26,
+  "production_abis": ["arm64-v8a"]
+}

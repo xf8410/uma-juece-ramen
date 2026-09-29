@@ -1,57 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:background="#1A1A1A"
-    android:gravity="center_horizontal"
-    android:orientation="vertical"
-    android:padding="24dp">
-
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="48dp"
-        android:text="拉面杯决策小黑板"
-        android:textColor="#FFAA44"
-        android:textSize="22sp"
-        android:textStyle="bold" />
-
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="专用版本 · 固定剧本 Ramen"
-        android:textColor="#AAAAAA"
-        android:textSize="13sp" />
-
-    <Button
-        android:id="@+id/btn_start_float"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="28dp"
-        android:text="启动拉面杯浮窗" />
-
-    <Button
-        android:id="@+id/btn_test_http"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:text="测试本地通信" />
-
-    <Button
-        android:id="@+id/btn_stop_float"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:text="停止悬浮窗" />
-
-    <TextView
-        android:id="@+id/tv_status"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="20dp"
-        android:gravity="center"
-        android:text="本地通信：未启动"
-        android:textColor="#88CC88"
-        android:textSize="13sp" />
-</LinearLayout>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent" android:fillViewport="true" android:background="#F4F5EF">
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="vertical" android:padding="24dp">
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="24dp" android:text="拉面杯 · 本地辅助" android:textSize="28sp" android:textColor="#172B24" android:textStyle="bold"/>
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="8dp" android:text="连接游戏，查看建议，由你执行每一步。" android:textSize="16sp" android:textColor="#4D6459"/>
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="28dp"
+            android:text="连接与状态" android:textStyle="bold" android:textSize="19sp" android:textColor="#172B24"/>
+        <TextView android:id="@+id/tv_status" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="10dp" android:padding="16dp" android:background="#E0E9DE" android:text="尚未启动"
+            android:textSize="15sp" android:textColor="#294B37" android:textIsSelectable="true"/>
+        <Button android:id="@+id/btn_start_float" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="启动 / 重新连接"/>
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal">
+            <Button android:id="@+id/btn_test_http" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:text="暂停 / 继续"/>
+            <Button android:id="@+id/btn_stop_float" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:text="停止"/>
+        </LinearLayout>
+        <Button android:id="@+id/btn_overlay" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="24dp" android:text="实时浮窗"/>
+        <Button android:id="@+id/btn_settings" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="策略、数据与模型"/>
+        <Button android:id="@+id/btn_records" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="对局记录与本地复盘"/>
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="24dp"
+            android:text="完整建议需要采集协议 V1。采集不完整时会显示具体缺项。" android:textSize="13sp" android:textColor="#596A60"/>
+    </LinearLayout>
+</ScrollView>

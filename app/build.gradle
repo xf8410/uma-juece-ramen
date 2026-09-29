@@ -1,11 +1,17 @@
 plugins {
     id 'com.android.application'
-    id 'org.jetbrains.kotlin.android'
+}
+
+def buildAbi = providers.gradleProperty('testAbi').getOrElse('arm64-v8a')
+if (!(buildAbi in ['arm64-v8a', 'x86_64'])) {
+    throw new GradleException('testAbi must be arm64-v8a or x86_64')
 }
 
 android {
     namespace 'com.umaai.assistant'
     compileSdk 34
+    buildToolsVersion '35.0.0'
+    ndkVersion '28.2.13676358'
 
     buildFeatures {
         buildConfig true
@@ -15,17 +21,20 @@ android {
         applicationId "com.umaai.assistant"
         minSdk 26
         targetSdk 34
-        versionCode 7
-        versionName "0.3.9-cloud"
+        versionCode 8
+        versionName "0.5.0-dev"
         buildConfigField "String", "SCENARIO_ID", '"Ramen"'
-        buildConfigField "String", "CLOUD_URL", '""'
 
         ndk {
-            abiFilters 'arm64-v8a', 'x86_64'
+            abiFilters buildAbi
         }
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix '.dev'
+            versionNameSuffix '-debug'
+        }
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
@@ -44,10 +53,22 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = '17'
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+            keepDebugSymbols += ['**/libuma_jni.so']
+        }
     }
 }
+
+// A missing native engine or an unversioned data directory is a build failure.
+// Use scripts/build_android.py to prepare these inputs before Gradle.
+tasks.register('verifyPackagingInputs', Exec) {
+    workingDir rootProject.projectDir
+    commandLine providers.environmentVariable('PYTHON').getOrElse('python'),
+            'scripts/verify_artifact.py', '--inputs', '--abi', buildAbi
+}
+tasks.named('preBuild').configure { dependsOn 'verifyPackagingInputs' }
 
 dependencies {
     implementation 'androidx.core:core-ktx:1.12.0'

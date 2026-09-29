@@ -1,0 +1,20 @@
+{
+  "head_weight": 9.696314861908057,
+  "shining_weight": 6.725655353828347,
+  "failure_penalty": 10.0,
+  "big_fail_penalty": 1354.7923251347659,
+  "jiban_value": 18.81180108970158,
+  "status_soft_cap": 60.018089442866234,
+  "vital_rest_threshold": 35,
+  "motivation_outing_threshold": 5,
+  "friend_outing_score": 74.80610951532915,
+  "outing_motivation_bonus": 242.04892497271567,
+  "special_overflow_threshold": 2,
+  "feeling_overflow_threshold": 5,
+  "rmj_urgency_margin": 100,
+  "no_ramen_base_score": 12.27256510129875,
+  "eat_ramen_base_score": 101.43954300913074,
+  "friend_click_bonus": 82.71322758976622,
+  "event_vital_bonus": 5.300591202866604,
+  "event_motivation_bonus": 70.79220403073876
+}

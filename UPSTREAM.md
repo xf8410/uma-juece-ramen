@@ -1,80 +1,40 @@
-# Ramen upstream lock
+# 公共引擎与采集契约
 
-## Pinned revision
+## 生产基线
 
-- Repository: https://github.com/xf8410/umaai-rs（fork，含 GA 注入通道修复；上游同步 f363386 + 修复 acb7735/3b4e940）
-- Branch observed: `master`
-- Commit: `53227d4b2c2c45fe441491a9df9c13949d773a7e`（2026-09-17，fork master = 上游 8 commit 合并 875dd2c + bench_base 冲突修复）
-- Scenario data blob: 以 fork 仓库 `gamedata/scenario_ramen.json` 当前版本为准
-- State model blob: 以 fork 仓库 `crates/umasim/src/game/ramen/state.rs` 当前版本为准
+生产 JNI 已切换到 `xulai1001/umaai-rs` 公共运行层。完整基线提交、增量补丁 SHA256 和导出文件 SHA256 以 `engine/source-lock.json` 为唯一来源。
 
-### 2026-09-17 sync notes（f11fdf4 → 53227d4）
-- fork master 合并上游 8 commit（8e9f7a5..04c739c）+ 合并冲突修复：
-  - 6376dd7 ga_lab 最优策略合并：通解卡组 + 9 旋钮参数组合档 + bench_base --deck + 基线重抓
-  - 70550cd 智力豁免白名单 + 已满位 PT 定价实验 token（trd/trdsh/trds）
-  - d9374e8 合宿训练诀窍全 MAX 填充修复（模拟器行为变化，历史基准失效）
-  - 968489f MCTS pt_favor_rate 定档 2.0 + 运气分改真实评分
-  - 合并遗留修复 53227d4：bench_base 重复 deck 字段/parse_deck_override 删除
-- API 兼容性：Trainer trait / RamenMctsTrainer / RecommendedRamenTrainer / RamenSearchStages 预期零破坏，cargo check 与 CI Build Ramen Android 双重验证。
-### 2026-09-16 sync notes（eeae510b → 3b4e940）
+当前新增公共层尚未发布为远端提交，因此 CI 从固定基线应用 `engine/runtime.patch`，校验每个文件后重建 `.engine-source`。不得依赖动态 master，不得只改一个 revision 而遗漏数据或补丁。
 
-- 依赖源从上游切换到 fork（xf8410/umaai-rs）：fork = 上游 9-15 master 同步 + ParamOverride GA
-  注入通道回植 + region_pt_weight 基因删除，CI 编译绿、四档 bench 5升2降（power_wisdom +1754）。
-- jueceramen 侧 **API 零破坏**：Trainer trait / RamenMctsTrainer / RecommendedRamenTrainer /
-  RamenSearchStages / GameView / rules 常量全部健在，cargo check 无 error。
-- 行为对拍（同 RamenStrategy 同卡组各 300 局）：均分 57389→57431（+42，噪声内）、
-  RMJ 全通 100%→100%、最高分 63474→66475（上游规则修正抬升上限）。
-- 上游新增 policy_schema 参数包体系：后续可让浮窗直接加载 GA 最优基因（batch_v5/best_genome.toml）。
-- 上游新增 NN 管线（convert754 / ramen_nn / onnx feature，规格 754 in / 234 out）：
-  浮窗接 NN 推理待 NN 权重定稿后另起 PR。
+历史 fork `53227d4`、GA 覆盖与近似重放保存在 `rust/research`，不进入生产 APK 的决策路径。旧分数和旧“零 API 破坏”结论不适用于当前版本。
 
-All Android constants in `RamenUpstreamData` must cite this revision. Updating this file and the constants/tests belongs in one PR.
+## 输入契约
 
-## 2026-08-29 sync notes（7cef1fa → eeae510b）
+唯一生产输入为 `RamenSnapshotV1`：
 
-- `RamenMctsTrainer` 的 rollout 与未搜阶段 fallback 已切换为
-  `RecommendedRamenTrainer`（正式推荐策略）——「手写策略 + 蒙特卡洛」由
-  上游结构保证：门控全关时与纯推荐策略逐位一致（上游守门测试钉死）。
-- rollout 提速约 -29% CPU（diag 输出改运行时门控）。
-- 五维上限剧本化（[3100,2400,2200,2200,2400]）上游已生效；
-  下方 newgame 2800 clamp 的旧记录按当时 rev 保留备查。
-- 险胜决策理由输出（output/reason）默认 NoopSink，安卓侧未接。
+- `schema_version=1`；真实 `run_id`、单调 `snapshot_id`、明确 `stage`。
+- `state.baseGame`、`state.ramen` 与公共协议一致；内部回合为 0–77。
+- `continuation` 提供吃面次数、真实 RMJ 结果、训练等级加成、待执行面与隐藏风味目标、继承附加值。
+- 事件阶段需要真实选项及效果。缺失不能用零值、固定卡组、模拟过程或空数组掩盖。
+- 采集版本、游戏版本、时间、完整性与来源一并保留。
+- `ready=false`、`capture_coherence=unverified` 或非空 `missing_fields` 禁止搜索。
 
-## 直读人头注入口径（本仓库约定）
+`GET /api/ai/ramen/v1/snapshot` 与推送复用同一份缓存。旧 `/summary` 只展示；其回合映射、人员 ID、槽剩余值等有未确认语义，不可直接当作完整 PC 状态。
 
-- hlpatch `trainings[].heads` 按「该训练界面人头数」理解（含卡/友人/NPC，
-  不含理事长/记者——两者位置注入时保持不动）。
-- 注入方式：按观测 heads 在训练之间**搬移可动人员**（多退少补），
-  不重建行结构；总人数与观测不一致时按比例缩放并出 warning。
-- `partner_ids` 语义未定，不使用（UPSTREAM 规则：未知映射保持未知）。
-- 彩圈（shining）由卡的落位与效果推导，无法直接注入，保持重放近似。
+## 输出与配置
 
-## Confirmed model details
+复用 `DecisionInfo`、`GameView` 与结构化动作，停止解析评分文本。每条事件关联局、快照、请求、配置和引擎版本。JNI 的流事件与最终 events 数组使用相同 `event_seq`，用于幂等记录。
 
-- Upstream simulator turns are zero-based.
-- Year boundaries are internal turns `0..23`, `24..47`, `48..71`.
-- RMJ settlement turns are internal `23`, `47`, `71`; hlpatch/UI external equivalents are normally `24`, `48`, `72`.
-- Super Ramen is internal turns `72..77`; UI external equivalents are normally `73..78`.
-- Feeling stock has three counters, total shared capacity 10, and FIFO overflow order.
-- Each feeling slot completes at 7.
-- Special feeling capacity is 4; at most 2 substitutions may be used for one normal ramen.
-- RMJ success thresholds are `1500`, `3000`, `3500`; `5000` is the final great-success threshold.
-- Per-year base scenario Pt gains are `300`, `400`, `500`, with per-bowl deltas `30`, `40`, `50` and an annual stacking cap of five bowls.
-- Scenario data declares five-stat limits `[3100,2400,2200,2200,2400]`, while current `RamenGame::newgame` clamps every entry to `2800`. The Android app records both facts and does not invent a third cap.
+默认 MCTS 8192，其他策略配置从锁定的 `default_config.toml` 读取。用户明确更改预算才切换。生产策略不注入旧 GA；fallback 与 rollout 使用同一正式配置。
 
-## State mapping target
+模型必须携带旁车、适用卡组及兼容信息，并验证真实 ONNX 图。没有兼容模型时不能启用 NN。
 
-| Upstream `RamenState` | hlpatch summary candidate |
-|---|---|
-| `feeling_stock` | `ramen.sozai` |
-| `feeling_slot` | `ramen.acquisition_gauges` (verify whether value or remaining count) |
-| `feeling_queue` | `ramen.feeling_info` |
-| `special_feeling` | `ramen.special_feeling_num` |
-| `selected_regions` | `ramen.selected_region_ids` (verify zero/one-based ID conversion) |
-| `scenario_pt` | `ramen.checkpoint_pt` |
-| `current_ramen` | runtime active/selected ramen field; not yet mapped |
-| `super_ramen` | not yet mapped |
-| `eat_count` | not yet mapped |
-| `train_feeling_type` | command gauge vectors/markers; not yet mapped |
+## 更新流程
 
-Unknown mappings must remain unknown; UI heuristics must not be fed into the future Rust state importer as facts.
+1. 修改公共引擎并完成 PC/公共层相关回归。
+2. 显式 capture 产生新补丁和锁文件，审阅全部差异。
+3. 重新构建 JNI 和 APK，检查 `.so`、ELF/ZIP 16 KB 对齐与版本清单。
+4. 执行同输入、同种子、同预算、同并行度的两端对照。
+5. 完成真机阶段、长局和升级验收后再发布。
+
+真实采集、正式模型和设备验证的未完成项见 [DEVELOPMENT.md](DEVELOPMENT.md)。

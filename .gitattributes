@@ -1,0 +1,12 @@
+# Patch hashes and the shell wrapper must survive Windows/Linux checkout unchanged.
+engine/runtime.patch -text
+engine/source-lock.json text eol=lf
+docs/handoff/collector.patch -text
+docs/handoff/collector-source-lock.json text eol=lf
+gradlew text eol=lf
+gradlew.bat text eol=crlf
+gradle/wrapper/gradle-wrapper.jar binary
+*.py text eol=lf
+*.yml text eol=lf
+rust-toolchain.toml text eol=lf
+toolchains.json text eol=lf

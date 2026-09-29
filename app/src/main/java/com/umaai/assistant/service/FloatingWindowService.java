@@ -1,780 +1,429 @@
 package com.umaai.assistant.service;
 
-import android.app.Notification;
-import android.app.NotificationChannel;
-import android.app.NotificationManager;
-import android.app.Service;
-import android.content.Intent;
+import android.app.*;
+import android.content.*;
+import android.content.res.Configuration;
 import android.graphics.PixelFormat;
-import android.os.Build;
-import android.os.Handler;
-import android.os.IBinder;
-import android.os.Looper;
-import android.util.Log;
-import android.view.Gravity;
-import android.view.LayoutInflater;
-import android.view.MotionEvent;
-import android.view.View;
-import android.view.WindowManager;
+import android.os.*;
+import android.provider.Settings;
+import android.view.*;
 import android.widget.TextView;
 import androidx.core.app.NotificationCompat;
+import com.umaai.assistant.MainActivity;
 import com.umaai.assistant.R;
 import org.json.JSONArray;
 import org.json.JSONObject;
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import java.io.*;
+import java.net.*;
 import java.util.Locale;
+import java.util.concurrent.*;
 
-/**
- * 拉面杯浮窗服务（v0.3.9）。
- *
- * v0.3.9 变更：
- * - 修复第1回合搜索 panic（index out of bounds: len 0）：根因是 fast_forward
- *   跳过回合内阶段导致分布未初始化，现已把 Begin→Distribute 纳入重放建分布
- *
- * v0.3.8 变更：
- * - 候选条形图差值列全部显示相对差值（best 显示 +0），不再出现五位数绝对分
- *
- * v0.3.7 变更：
- * - 竖屏浮窗拉高：compact 模式下竖屏也显示状态行+训练明细
- * - 候选评分口径统一：采用 wm=（PT 加权分，与选择口径一致），消除"建议非最高分"困惑
- * - 搜索 panic 透出具体信息（不再只报 panic during search）
- *
- * v0.3.6 变更：
- * - 窗口位置屏内 clamp：游戏横竖屏切换后系统保持 overlay 坐标，横屏拖到
- *   靠右/靠下的窗口切回竖屏可能超出屏宽不可见且把手收不到触摸（表现为
- *   "竖屏无法移动浮窗"）。现在 render 与 ACTION_DOWN 时兜底拉回屏内，
- *   拖动过程实时 clamp 防拖出屏；多点触控只跟随按下主指防坐标跳变。
- *
- * 通信架构：
- * - hlpatch so 推送 JSON → HttpDataService(:18766) 或轮询(:18765/summary)
- * - JSON 透传给 UmaNativeBridge.search() → Rust reconcile + 重放重建 + MCTS 搜索
- * - 返回结构化 JSON（view + decision + training_decision + reconcile）→ 渲染浮窗
- * - 决策日志：每回合 summary+decision 一行、局末 outcome 一行追加到
- *   decision_log.jsonl（RamenDecisionLogger，GET /decision_log 可拉取），
- *   目标是喂 rust/src/optimize.rs 用真实对局校准 strategy_optimized.json
- *
- * 显示内容（对齐 PC 黑板，EtherealAO 版）：
- * - 主建议 + 搜索规模（建议：吃面/函馆-耐（终局预估 66972 · 4096次/12.7s））
- * - 候选条形图（BoardChartsView：每候选一行 标签+比例条+相对差值，选中项绿色，
- *   喂 decision 的 candidate_displays/candidate_scores/action_index）
- * - 训练建议（训练建议：速度训练（终局预估 X · 64次/…ms），来自 Rust Train 阶段补搜）
- * - 训练明细行（速: 速46 力14 27pt 体力-25 失败10% 头3光2）
- * - 运气行（v0.3.4：运:总±X 回±Y，见下）
- *
- * v0.3.5 变更：
- * - 紧凑模式开关：手机屏不够放全部信息——面板右上角新增一枚可点小按钮
- *   （独立悬浮窗，主面板保持不可触碰不挡游戏）。「简」= 收起状态/训练明细/
- *   条形图/运气/⚠警告/训练建议，只留回合行+主建议行；「详」= 全部展开。
- *   状态持久化（SharedPreferences），重开服务保持
- * - 运气/百分比格式改 Locale.US，避免个别系统区域设置产出本地化数字
- *
- * v0.3.4 变更：
- * - ⚠ 校正警告显示原文（最多2条/每条40字），不再是干巴巴的条数——
- *   用户反馈看不懂 ⚠1 是什么；同时 Rust v0.3.2 的「人头注入」摘要
- *   也会出现在警告里，可直接核对注入是否生效
- * - 运气追踪：mean 是「模拟到育成结束的期望总分」——第一回合的 mean
- *   记为本局基准；运气:总 = 当前 mean − 基准（整局相对开局的漂移）；
- *   运气:回 = 当前 mean − 上一回合 mean（本回合的增益/波动）。
- *   中途接入（错过第1回合）时以最早观测为近似基准
- *
- * v0.3.3 变更：
- * - 接入 RamenDecisionLogger（数据收集）：日志写盘在后台单线程，不影响渲染
- *
- * v0.3.2 变更：
- * - 候选差值从文字行（「#2 吃面/东京-智 -731」）改为 tv_turn 下方的候选条形图
- *   （BoardChartsView，Canvas 绘制，无候选/评分全 0 时自动隐藏不占空间）
- *
- * v0.3.1 变更：
- * - 删除 Java 端「训练兜底」（TrainingEvaluator）：小黑板已有 hlpatch 真实训练
- *   明细，Java 端再算一遍纯属浪费算力，且质量远低于模拟器搜索
- * - hlpatch 没发 trainings（非行动画面）时，Rust 在 Train 阶段补搜并返回
- *   training_decision，浮窗显示「训练建议：…」；trainings 非空时不显示该行
- * - Rust 侧 v0.3.1 起先重放重建（断线重连）再搜索，非行动画面也能给出
- *   有依据的吃面/训练建议
- *
- * 回合口径：
- * - hlpatch 的 turn 与游戏 UI「第N回合」一致（1-based），直读时标注「直读」
- * - AI（umaai-rs）内部回合从 0 开始，浮窗同时显示 AI 内部值便于核对
- * - 旧版 hlpatch 无 turn 字段时回退 month/half 显示，Rust 侧再推导
- *
- * hlpatch v3.27.22 JSON 格式：
- * - chara 对象（speed/stamina/power/guts/wiz/vital/max_vital/motivation/skill_point/scenario_id）
- * - month(1-12) + half(1-2)，v3.27.17+ 补发 turn
- * - 可选 ramen 对象（sozai/feeling/acquisition_gauges/checkpoint_pt）
- * - 顶层 trainings（五项训练收益/失败率/人头/发光，仅行动画面非空）
- */
-public final class FloatingWindowService extends Service implements HttpDataService.OnDataListener {
-    private static final String TAG = "RamenFloat";
+/** Foreground collection and display. Computation lives exclusively in :engine. */
+public final class FloatingWindowService extends Service implements HttpDataService.OnDataListener, EngineClient.Listener {
+    public static final String ACTION_PAUSE = "com.umaai.assistant.PAUSE";
+    public static final String ACTION_RESUME = "com.umaai.assistant.RESUME";
+    public static final String ACTION_RECONFIGURE = "com.umaai.assistant.RECONFIGURE";
+    public static final String ACTION_STOP = "com.umaai.assistant.STOP";
     private static final String CHANNEL = "ramen_overlay";
-    private static final String PREFS = "ramen_overlay";
-    private static final String PREF_COMPACT = "compact";
-    private static final int NOTIFICATION_ID = 1401;
-    private static final long STALE_MS = 5000;
-    private static final int DEFAULT_UMA_ID = 102601;
-    private static final int[] DEFAULT_CARDS = {302424, 302894, 303044, 302924, 303024, 303054};
-
+    private static final int NOTIFICATION = 1401;
     private final Handler main = new Handler(Looper.getMainLooper());
-    /** 面板竖条宽度（dp）：图表+训练详情在小字号下的可读下限 */
-    private static final int PANEL_WIDTH_DP = 172;
-    /** 把手拖动判定阈值（dp）：位移超过才算拖动，否则视为点击 */
-    private static final float HANDLE_DRAG_THRESHOLD_DP = 6f;
-
-    // 双窗口拖动：面板保持穿透不可摸，把手（简/详按钮）可摸可拖，拖动时面板跟随
-    private WindowManager.LayoutParams panelParams;
-    private WindowManager.LayoutParams toggleParams;
-    private float handleDownRawX, handleDownRawY, handleStartX, handleStartY, panelStartY;
-    private boolean handleMoved;
-    /** 拖动主指针 id：多点触控时只跟随按下那根手指，防止第二根手指造成坐标跳变 */
-    private int handlePointerId = -1;
-
-    private WindowManager windowManager;
-    private View panel;
-    private TextView turnView, recommendView, statusView, skillView, ramenView, trainingsView, sourceView;
-    private BoardChartsView chartsView;
+    private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
+    private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private final SnapshotOrderTracker inputOrder=new SnapshotOrderTracker();
     private HttpDataService server;
-    private volatile boolean polling, searchRunning;
-    private volatile long lastDataAt;
-    private volatile String lastSearchKey = "";
-    private volatile JSONObject lastSearchResult, pendingSummary, lastSummary;
-    private Thread searchThread;
+    private EngineClient engine;
+    private RunArchive archive;
+    private volatile JSONObject options;
+    private volatile JSONObject requestedOptions;
+    private SnapshotEnvelope latest;
+    private File latestFile;
+    private JSONObject lastDecision;
+    private volatile boolean destroyed, paused;
+    private volatile long lastPushAt;
+    private volatile String status = "等待采集端连接";
+    private String source = "";
+    private WindowManager windows;
+    private View panel;
+    private TextView title, recommendation, stats, details, origin, toggle;
+    private BoardChartsView chart;
+    private WindowManager.LayoutParams panelParams, toggleParams;
+    private boolean compact;
+    private float downX, downY;
+    private int startX, startY;
+    private boolean moved;
+    private int pointer = -1;
 
-    // 紧凑模式（v0.3.5）：true = 只显示回合行+主建议行
-    private volatile boolean compactMode;
-    private TextView toggleBtn;
-
-    // 技能评分评估（v0.4.0）：SkillScoreEngine 移植 URA 小黑板技能评估。
-    // consume 里按 (turn, skill_point) 去重后台计算，render 里读取展示。
-    private volatile JSONObject lastSkillEval;
-    private volatile String lastSkillKey = "";
-    private volatile boolean skillComputing;
-
-    // 运气追踪（v0.3.4）：
-    // - firstMean：第一回合（或新一局最早观测）的 mean，= 总运气基准
-    // - prevMean / prevLuckTurn：上一条新决策的 mean 与回合，= 当回合运气基准
-    // - lastLuckKey：去重（同回合重复渲染不重复计算）
-    private volatile double firstMean = Double.NaN;
-    private volatile double prevMean = Double.NaN;
-    private volatile int prevLuckTurn = -1;
-    private volatile String lastLuckKey = "";
-
-    @Override
-    public void onCreate() {
+    @Override public void onCreate() {
         super.onCreate();
-        createNotificationChannel();
-        startForeground(NOTIFICATION_ID, notification("等待拉面杯数据"));
-        compactMode = getSharedPreferences(PREFS, MODE_PRIVATE)
-                .getBoolean(PREF_COMPACT, false);
-        createPanel();
-        createToggleButton();
-        // 决策日志：真实对局数据收集（outcome 的 config 回显本服务固定搜索配置）
-        RamenDecisionLogger.init(getFilesDir(), DEFAULT_UMA_ID, DEFAULT_CARDS);
+        getSharedPreferences("runtime_status",MODE_PRIVATE).edit().putBoolean("running",true).apply();
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        manager.createNotificationChannel(new NotificationChannel(CHANNEL, "拉面杯辅助", NotificationManager.IMPORTANCE_LOW));
+        startForeground(NOTIFICATION, notification("等待采集端连接"));
+        if (!Settings.canDrawOverlays(this)) { publish("尚未授予悬浮窗权限"); stopSelf(); return; }
+        archive = new RunArchive(getFilesDir());
+        compact = getSharedPreferences("ramen_overlay",MODE_PRIVATE).getBoolean("compact",true);
         try {
-            server = new HttpDataService(this);
-            server.startServer();
-        } catch (Exception e) {
-            Log.e(TAG, "HTTP server start failed", e);
-            stopSelf();
-            return;
-        }
-        startPolling();
-        initNativeSearch();
+            JSONObject initialOptions = EngineSettings.read(this); createWindows();
+            initializeEngine(initialOptions,0);
+            server = new HttpDataService(this, () -> status); server.startServer();
+            poller.scheduleWithFixedDelay(this::poll,0,2,TimeUnit.SECONDS);
+        } catch (Exception error) { publish("启动失败：" + error.getMessage()); stopSelf(); }
     }
-
-    @Override
-    public IBinder onBind(Intent i) { return null; }
-
-    @Override
-    public int onStartCommand(Intent i, int f, int id) { return START_STICKY; }
-
-    @Override
-    public void onDestroy() {
-        polling = false;
-        if (server != null) server.stopServer();
-        if (windowManager != null) {
-            if (panel != null) windowManager.removeView(panel);
-            if (toggleBtn != null) windowManager.removeView(toggleBtn);
+    @Override public IBinder onBind(Intent intent) { return null; }
+    @Override public int onStartCommand(Intent intent,int flags,int id) {
+        String action = intent == null ? "" : intent.getAction();
+        if (ACTION_STOP.equals(action)) { stopSelf(); return START_NOT_STICKY; }
+        if (ACTION_PAUSE.equals(action)) {
+            paused = true; lastDecision = null;
+            if(engine!=null) { engine.close(); engine=null; }
+            publish("已暂停实时计算；采集与记录继续"); render();
+        } else if (ACTION_RESUME.equals(action) || ACTION_RECONFIGURE.equals(action)) {
+            paused=false; lastDecision=null;
+            if(engine!=null) { engine.close();engine=null; }
+            try {
+                initializeEngine(EngineSettings.read(this),300);
+            } catch(Exception error) { publish("配置读取失败："+error.getMessage()); }
         }
-        RamenDecisionLogger.flush(); // 收尾当前 run（幂等）
+        return START_NOT_STICKY;
+    }
+    @Override public void onDestroy() {
+        if(engine!=null)engine.close();
+        destroyed=true; poller.shutdownNow();
+        if(server!=null)server.stopServer();
+        main.removeCallbacksAndMessages(null);
+        if(windows!=null) {
+            if(panel!=null && panel.isAttachedToWindow()) windows.removeView(panel);
+            if(toggle!=null && toggle.isAttachedToWindow()) windows.removeView(toggle);
+        }
+        if(archive!=null) io.execute(() -> { try { archive.finish("process_exit"); } catch(Exception e) { android.util.Log.e("RamenArchive","关闭记录失败",e); } });
+        io.shutdown(); stopForeground(STOP_FOREGROUND_REMOVE);
+        getSharedPreferences("runtime_status",MODE_PRIVATE).edit().putBoolean("running",false).putString("status","已停止 · "+status).apply();
         super.onDestroy();
     }
-
-    @Override
-    public void onDataReceived(String data) { consume(data, "实时"); }
-
-    // ── 数据接收 ──────────────────────────────────────────────────────
-
-    private void consume(String data, String source) {
-        if (data == null || data.isEmpty()) return;
-        try {
-            JSONObject s = new JSONObject(data);
-            // hlpatch v3.27.22: 有 chara 对象或 stats 对象都接受
-            if (!s.has("chara") && !s.has("stats")) return;
-            lastDataAt = System.currentTimeMillis();
-            lastSummary = s;
-            computeSkillScore(s);
-            main.post(() -> render(s, source));
-        } catch (Exception ignored) { }
-    }
-
-    // ── 技能评分评估（v0.4.0）────────────────────────────────────────
-    // 同回合同技能点只算一次；后台线程跑 DP，算完 post 重渲染。
-    private void computeSkillScore(JSONObject s) {
-        if (skillComputing) return;
-        if (!SkillScoreEngine.isLoaded()) SkillScoreEngine.ensureLoaded(this);
-        if (!SkillScoreEngine.isLoaded()) return;
-        JSONObject chara = s.optJSONObject("chara");
-        if (chara == null || !s.has("skill_tips")) return;
-        int turn = s.optInt("turn", -1);
-        int sp = chara.optInt("skill_point", -1);
-        String key = turn + ":" + sp;
-        if (key.equals(lastSkillKey)) return;
-        skillComputing = true;
-        lastSkillKey = key;
-        new Thread(() -> {
-            JSONObject ev = null;
+    @Override public void onDataReceived(String data) { lastPushAt=System.currentTimeMillis();consume(data,"实时推送"); }
+    private void consume(String data,String from) {
+        if(destroyed || data==null || data.length()>PrivateFiles.MAX_SNAPSHOT_BYTES) return;
+        io.execute(() -> {
+            if(destroyed)return;
             try {
-                ev = SkillScoreEngine.evaluate(s);
-            } catch (Exception e) {
-                android.util.Log.e(TAG, "skill eval failed", e);
-            } finally {
-                final JSONObject fev = ev;
-                if (fev != null && fev.optBoolean("ok", false)) lastSkillEval = fev;
-                skillComputing = false;
-                JSONObject snap = lastSummary;
-                if (snap != null) main.post(() -> render(snap, "技能刷新"));
-            }
-        }, "RamenSkill").start();
-    }
-
-    /** 技能行文案：竖条窄屏友好，简/详两档 */
-    private String skillLine() {
-        JSONObject ev = lastSkillEval;
-        if (ev == null || !ev.optBoolean("ok", false)) return "";
-        StringBuilder b = new StringBuilder();
-        b.append("\u8bc4").append(ev.optInt("total_point", 0));
-        String rank = ev.optString("rank", "");
-        if (!rank.isEmpty()) b.append(" ").append(rank);
-        int toNext = ev.optInt("points_to_next", -1);
-        if (toNext > 0) b.append(" +").append(toNext).append("\u2192").append(ev.optString("next_rank", ""));
-        if (compactMode) return b.toString();
-        JSONArray learn = ev.optJSONArray("learn");
-        if (learn != null && learn.length() > 0) {
-            b.append("\n\u8350:");
-            int n = Math.min(learn.length(), 3);
-            for (int i = 0; i < n; i++) {
-                JSONObject l = learn.optJSONObject(i);
-                if (l == null) continue;
-                String name = l.optString("name", "?");
-                if (name.length() > 8) name = name.substring(0, 8);
-                b.append(i > 0 ? " " : "").append(name)
-                 .append("(").append(l.optInt("cost", 0)).append(")");
-            }
-            if (learn.length() > 3) b.append("+").append(Math.max(0, ev.optInt("learn_total", learn.length()) - 3));
-        }
-        String avg = ev.optString("avg_eff", "");
-        if (!avg.isEmpty()) b.append(" \u5747").append(avg);
-        String marg = ev.optString("marginal_eff", "");
-        if (!marg.isEmpty()) b.append(" \u8fb9").append(marg);
-        return b.toString();
-    }
-
-    // ── 渲染 ──────────────────────────────────────────────────────────
-
-    private void render(JSONObject s, String source) {
-        clampWindowsToScreen();
-        // 判断是否拉面杯场景
-        JSONObject chara = s.optJSONObject("chara");
-        JSONObject stats = s.optJSONObject("stats");
-        JSONObject charaOrStats = chara != null ? chara : stats;
-
-        if (charaOrStats == null) return;
-
-        int scenarioId = charaOrStats.optInt("scenario_id", -1);
-        String scenario = s.optString("scenario", "");
-        // scenario_id=14 是拉面杯；或者 scenario 字段为 "Ramen"
-        boolean isRamen = scenarioId == 14 || "Ramen".equals(scenario);
-
-        if (!isRamen) {
-            turnView.setText("非拉面杯");
-            recommendView.setText("此版本仅支持拉面杯");
-            statusView.setText("");
-            skillView.setVisibility(View.GONE);
-            ramenView.setText("");
-            trainingsView.setText("");
-            chartsView.clear();
-            return;
-        }
-
-        // 渲染基础状态
-        renderBasicState(s, charaOrStats, source);
-
-        // 决策日志 run 生命周期（开局/中途入局/终盘收尾），先于搜索结果处理
-        RamenDecisionLogger.onSummary(s);
-
-        // 渲染搜索结果（如果有）
-        renderSearchResult(s);
-
-        // 触发搜索（如果回合变化且 native 可用）
-        String key = searchKey(s);
-        if (!key.equals(lastSearchKey) && !searchRunning && UmaNativeBridge.isAvailable()) {
-            triggerSearch(s, key);
-        }
-    }
-
-    private void renderBasicState(JSONObject s, JSONObject chara, String source) {
-        // 回合显示：
-        // - hlpatch 直读 turn（游戏 UI 第N回合，1-based）→ 标「直读」并附 AI 内部值（0-based）
-        // - 旧版 hlpatch 无 turn → 显示 month/half，Rust 侧推导
-        int turn = s.has("turn") ? s.optInt("turn", -1) : -1;
-        int month = s.optInt("month", -1);
-        int half = s.optInt("half", -1);
-
-        String turnText;
-        if (turn > 0) {
-            turnText = "第" + turn + "回合 直读(AI:" + (turn - 1) + ")";
-        } else if (turn == 0) {
-            turnText = "第1回合 直读(AI:0)";
-        } else if (month > 0 && half > 0) {
-            turnText = month + "月" + (half == 1 ? "前" : "后");
-        } else {
-            turnText = "拉面杯";
-        }
-
-        // 拉面杯状态行
-        JSONObject ramen = s.optJSONObject("ramen");
-        String ramenText = "";
-        if (ramen != null) {
-            StringBuilder rb = new StringBuilder();
-            int pt = ramen.optInt("checkpoint_pt", -1);
-            if (pt >= 0) rb.append("RMJ Pt:").append(pt).append("  ");
-            JSONArray sozai = ramen.optJSONArray("sozai");
-            if (sozai != null && sozai.length() >= 3) {
-                rb.append("诀窍:").append(sozai.optInt(0)).append("/")
-                  .append(sozai.optInt(1)).append("/")
-                  .append(sozai.optInt(2));
-            }
-            int special = ramen.optInt("special_feeling_num", -1);
-            if (special >= 0) rb.append("  隐藏:").append(special);
-            ramenText = rb.toString();
-        }
-
-        turnView.setText(turnText + (ramenText.isEmpty() ? "" : " · " + ramenText));
-
-        // 五维 + 体力 + 干劲
-        int spd = chara.optInt("speed");
-        int sta = chara.optInt("stamina");
-        int pow = chara.optInt("power");
-        int gut = chara.optInt("guts");
-        int wiz = chara.optInt("wiz");
-        int total = spd + sta + pow + gut + wiz;
-        int vital = chara.optInt("vital", -1);
-        int maxVital = chara.optInt("max_vital", -1);
-        int skillPt = chara.optInt("skill_point", -1);
-        String mot = chara.optString("motivation", "?");
-
-        statusView.setText(
-            "速" + spd + " 耐" + sta + " 力" + pow + " 根" + gut + " 智" + wiz +
-            "  总" + total +
-            (skillPt >= 0 ? " Pt" + skillPt : "") +
-            (vital >= 0 ? "\n体力" + vital + "/" + (maxVital > 0 ? maxVital : "?") : "") +
-            " 干劲" + mot
-        );
-
-        // 训练数据（hlpatch /summary 顶层 trainings，仅行动画面非空）
-        JSONArray trainings = s.optJSONArray("trainings");
-        String detail = RamenBoardText.trainingLines(trainings);
-        trainingsView.setText(detail.isEmpty() ? "训练数据：无" : detail);
-
-        // 技能评分行（v0.4.0）：紧凑模式也保留（技能购买是关键决策）
-        String skillText = skillLine();
-        skillView.setText(skillText);
-        skillView.setVisibility(skillText.isEmpty() ? View.GONE : View.VISIBLE);
-
-        // 紧凑模式（v0.3.5）：状态行/训练明细收起，只留回合行+主建议行+来源行
-        // v0.3.7: 竖屏时即使 compact 模式也显示状态+训练明细（用户反馈竖屏浮窗太小需拉高）
-        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
-        boolean portrait = dm.heightPixels >= dm.widthPixels;
-        statusView.setVisibility((compactMode && !portrait) ? View.GONE : View.VISIBLE);
-        trainingsView.setVisibility((compactMode && !portrait) ? View.GONE : View.VISIBLE);
-
-        // 来源 + AI 状态
-        String aiStatus = UmaNativeBridge.isAvailable() ? "AI就绪" : "安全兜底";
-        sourceView.setText(source + " · " + aiStatus);
-
-        // 通知栏
-        NotificationManager m = getSystemService(NotificationManager.class);
-        if (m != null) m.notify(NOTIFICATION_ID, notification("拉面杯 " + turnText));
-    }
-
-    private void renderSearchResult(JSONObject s) {
-        if (searchRunning) {
-            recommendView.setText("模拟搜索中…");
-            chartsView.clear();
-            return;
-        }
-
-        JSONObject result = lastSearchResult;
-        if (result != null && result.optBoolean("ok", false)) {
-            JSONObject decision = result.optJSONObject("decision");
-            if (decision != null) {
-                StringBuilder b = new StringBuilder(RamenBoardText.decisionLine(decision));
-
-                // 运气追踪（v0.3.4）：
-                // - mean（decision.score）= 模拟到育成结束的期望总分
-                // - 总运气 = 当前 mean − 第一回合 mean（整局相对开局的漂移）
-                // - 当回合运气 = 当前 mean − 上一回合 mean（本回合的增益/波动）
-                // 新一局判定：回合回退（turn 变小）；第1回合强制重设基准；
-                // 中途接入（错过第1回合）以最早观测为近似基准
-                double mean = decision.optDouble("score", 0.0);
-                int turnNow = s.has("turn") ? s.optInt("turn", -1) : -1;
-                String key = searchKey(s);
-                if (mean > 0 && turnNow > 0 && !key.equals(lastLuckKey)) {
-                    lastLuckKey = key;
-                    if (turnNow == 1 || prevLuckTurn < 0 || turnNow < prevLuckTurn) {
-                        firstMean = mean;
-                    }
-                    StringBuilder luck = new StringBuilder();
-                    if (!Double.isNaN(firstMean)) {
-                        luck.append(" 总").append(String.format(Locale.US, "%+.0f", mean - firstMean));
-                    }
-                    if (!Double.isNaN(prevMean) && turnNow == prevLuckTurn + 1) {
-                        luck.append(" 回").append(String.format(Locale.US, "%+.0f", mean - prevMean));
-                    }
-                    if (luck.length() > 0) {
-                        b.append("\n运气").append(luck);
-                    }
-                    prevMean = mean;
-                    prevLuckTurn = turnNow;
+                // Publication and consumption both happen on this IO queue. A new
+                // configuration is never visible before its provenance is registered.
+                final JSONObject captureOptions=options;
+                JSONObject json=new JSONObject(data);
+                if(json.optInt("schema_version",-1)!=1) {
+                    main.post(() -> {
+                        if(destroyed)return;
+                        latest=null; latestFile=null; lastDecision=null; source=from;
+                        if(engine!=null)engine.invalidate();
+                        publish("旧版摘要仅供展示，请升级采集协议 V1");
+                        title.setText("拉面杯 · 旧版采集");
+                        stats.setText(legacySummary(json));
+                        recommendation.setText("尚无完整盘面，无法给出建议"); chart.clear();
+                    }); return;
                 }
-
-                // 候选差值（PC 黑板「决策理由」图形版）：喂 BoardChartsView 画横条，
-                // 标签走 RamenBoardText.translate 中文化，选中项绿色；
-                // 紧凑模式不画条形图（省空间）
-                if (compactMode) {
-                    chartsView.clear();
-                } else {
-                    chartsView.setCandidates(
-                            decision.optJSONArray("candidate_displays"),
-                            decision.optJSONArray("candidate_scores"),
-                            decision.optInt("action_index", 0));
+                String readiness=SnapshotEnvelope.readinessProblem(json);
+                if(!SnapshotEnvelope.hasIdentity(json)) {
+                    String digest=PrivateFiles.sha256(data.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    PrivateFiles.write(new File(getFilesDir(),"unassigned-observations/"+digest+".json"),data);
+                    main.post(()-> {
+                        if(destroyed)return;
+                        if(engine!=null)engine.invalidate();latest=null;latestFile=null;lastDecision=null;source=from;
+                        publish(readiness.isEmpty()?"采集端尚未取得真实局与快照标识":readiness);
+                        title.setText("拉面杯 · 采集中");recommendation.setText(status);chart.clear();
+                        JSONObject display=json.optJSONObject("display_summary");stats.setText(display==null?"等待完整盘面":legacySummary(display));
+                        details.setText(status);
+                    });return;
                 }
-
-                // 决策日志：本回合 summary+decision 一行（按 searchKey 去重，一回合一行）
-                RamenDecisionLogger.onDecision(s, decision, searchKey(s));
-
-                // 训练建议：hlpatch 没发 trainings（非行动画面）时由 Rust 在
-                // Train 阶段补搜返回；trainings 非空时不显示（黑板已有真实明细）
-                if (!compactMode) {
-                    JSONObject td = result.optJSONObject("training_decision");
-                    if (td != null) {
-                        // decisionLine 输出「建议：X（…）」，前拼「训练」→「训练建议：X（…）」
-                        b.append("\n训练").append(RamenBoardText.decisionLine(td));
-                    }
-                }
-
-                // 校正警告（v0.3.4）：显示原文而不是干巴巴的条数——用户反馈
-                // 看不懂 ⚠1 是什么。常见为良性近似（feeling_slot 从 remaining
-                // 近似转换）；Rust v0.3.2 的「人头注入」摘要也在这里，可直接
-                // 核对注入是否生效。紧凑模式收起。
-                if (!compactMode) {
-                    JSONObject reconcile = result.optJSONObject("reconcile");
-                    JSONArray warnings = reconcile == null ? null : reconcile.optJSONArray("warnings");
-                    if (warnings != null && warnings.length() > 0) {
-                        StringBuilder wb = new StringBuilder("\n⚠");
-                        int show = Math.min(warnings.length(), 2);
-                        for (int i = 0; i < show; i++) {
-                            if (i > 0) wb.append("；");
-                            String w = warnings.optString(i);
-                            if (w.length() > 40) w = w.substring(0, 40) + "…";
-                            wb.append(w);
-                        }
-                        if (warnings.length() > 2) {
-                            wb.append(" 等").append(warnings.length()).append("条");
-                        }
-                        b.append(wb);
-                    }
-                }
-
-                recommendView.setText(b.toString());
-                return;
-            }
-        }
-
-        chartsView.clear();
-
-        if (result != null && !result.optBoolean("ok", false)) {
-            String error = result.optString("error", "");
-            if (!error.isEmpty()) {
-                recommendView.setText("搜索失败：" + error);
-                return;
-            }
-        }
-
-        // 无搜索结果
-        recommendView.setText("等待搜索…");
-    }
-
-    // ── 搜索触发 ──────────────────────────────────────────────────────
-
-    /**
-     * 搜索去重键：直读 turn（若有）+ month/half + vital + motivation + sozai。
-     * 不再依赖 sozai 字符串（格式不稳定）以外的推断值。
-     */
-    static String searchKey(JSONObject s) {
-        JSONObject chara = s.optJSONObject("chara");
-        JSONObject stats = s.optJSONObject("stats");
-        JSONObject c = chara != null ? chara : stats;
-        JSONObject r = s.optJSONObject("ramen");
-
-        int turn = s.has("turn") ? s.optInt("turn", -1) : -1;
-        return turn + ":" + s.optInt("month") + ":" + s.optInt("half") + ":" +
-               (c == null ? "" : c.optInt("vital") + ":" + c.optString("motivation")) + ":" +
-               (r == null ? "" : r.optInt("checkpoint_pt") + ":" + r.optString("sozai"));
-    }
-
-    private void initNativeSearch() {
-        new Thread(() -> {
-            if (UmaNativeBridge.init(this)) {
+                SnapshotEnvelope snapshot=SnapshotEnvelope.parse(data);
+                File file=archive.capture(snapshot,captureOptions);
                 main.post(() -> {
-                    if (sourceView != null) {
-                        sourceView.setText(sourceView.getText().toString().replace("安全兜底", "AI就绪"));
-                    }
+                    if(destroyed)return;
+                    if(!inputOrder.observe(snapshot.runId,snapshot.snapshotId))return;
+                    if(latest!=null && latest.runId==snapshot.runId && snapshot.snapshotId<=latest.snapshotId)return;
+                    source=from;
+                    latest=snapshot; latestFile=file; lastDecision=null;
+                    // Queue also rejects a late message from a retired run.
+                    if(!snapshot.missingReason().isEmpty()) { if(engine!=null)engine.invalidate(); }
+                    else submit(snapshot,file);
+                    String missing=snapshot.missingReason();
+                    if(!missing.isEmpty())publish(missing);
+                    render();
                 });
-            }
-        }, "NativeInit").start();
-    }
-
-    private void triggerSearch(JSONObject s, String key) {
-        searchRunning = true;
-        lastSearchKey = key;
-        pendingSummary = s;
-        recommendView.setText("模拟搜索中...");
-
-        if (searchThread != null && searchThread.isAlive()) return;
-
-        searchThread = new Thread(() -> {
-            JSONObject snap = pendingSummary;
-            JSONObject result = snap == null ? null :
-                UmaNativeBridge.search(snap, DEFAULT_UMA_ID, DEFAULT_CARDS, 0);
-            lastSearchResult = result;
-            searchRunning = false;
-            main.post(() -> {
-                if (snap != null) render(snap, "搜索完成");
-            });
-        }, "NativeSearch");
-        searchThread.setDaemon(true);
-        searchThread.start();
-    }
-
-    // ── 浮窗 + 通信 ───────────────────────────────────────────────────
-
-    private void createPanel() {
-        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-        panel = LayoutInflater.from(this).inflate(R.layout.floating_window, null);
-        int type = Build.VERSION.SDK_INT >= 26 ?
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY :
-            WindowManager.LayoutParams.TYPE_PHONE;
-        int flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
-        // 竖条形态：贴屏幕左缘、宽 PANEL_WIDTH_DP，横屏游戏时可读不挡中心 UI。
-        // 面板保持 FLAG_NOT_TOUCHABLE（穿透不挡游戏），移动通过把手拖动实现。
-        WindowManager.LayoutParams p = new WindowManager.LayoutParams(
-            dp(PANEL_WIDTH_DP),
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            type, flags, PixelFormat.TRANSLUCENT);
-        p.gravity = Gravity.TOP | Gravity.START;
-        p.x = 0;
-        p.y = dp(120);
-        panelParams = p;
-        turnView = panel.findViewById(R.id.tv_turn);
-        chartsView = panel.findViewById(R.id.chart_candidates);
-        recommendView = panel.findViewById(R.id.tv_recommend);
-        statusView = panel.findViewById(R.id.tv_status);
-        skillView = panel.findViewById(R.id.tv_skill);
-        ramenView = panel.findViewById(R.id.tv_ramen);
-        trainingsView = panel.findViewById(R.id.tv_trainings);
-        sourceView = panel.findViewById(R.id.tv_source);
-        windowManager.addView(panel, p);
-    }
-
-    /**
-     * 紧凑模式开关（v0.3.5）。
-     *
-     * 主面板带 FLAG_NOT_TOUCHABLE（不挡游戏），无法直接放按钮——所以用一枚
-     * 独立的小悬浮窗（仅 FLAG_NOT_FOCUSABLE，可点）贴在面板右上角。
-     * 「简」= 收起详情；「详」= 展开详情。状态持久化。
-     */
-    private void createToggleButton() {
-        toggleBtn = new TextView(this);
-        toggleBtn.setText(compactMode ? "详" : "简");
-        toggleBtn.setTextSize(11);
-        toggleBtn.setTextColor(0xFF202020);
-        toggleBtn.setBackgroundColor(0xCCEEEEEE);
-        toggleBtn.setPadding(dp(7), dp(2), dp(7), dp(2));
-        int type = Build.VERSION.SDK_INT >= 26 ?
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY :
-            WindowManager.LayoutParams.TYPE_PHONE;
-        // 把手窗口：仅去 FLAG_NOT_TOUCHABLE（可摸），保持 FLAG_NOT_FOCUSABLE；
-        // 面板自身永远穿透（FLAG_NOT_TOUCHABLE 不取消），移动只通过拖动把手完成。
-        WindowManager.LayoutParams p = new WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            type,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            PixelFormat.TRANSLUCENT);
-        p.gravity = Gravity.TOP | Gravity.START;
-        p.x = dp(PANEL_WIDTH_DP + 8);  // 竖条右侧空隙，把手贴面板边上
-        p.y = dp(122);
-        toggleParams = p;
-        // 拖动=移动面板+把手；轻点（未超阈值）=简/详切换
-        toggleBtn.setOnTouchListener((v, ev) -> {
-            switch (ev.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
-                    // 旋转/历史漂移兜底：按下前先把窗口拉回屏内，起点用修正后坐标
-                    clampWindowsToScreen();
-                    handlePointerId = ev.getPointerId(0);
-                    handleDownRawX = ev.getRawX();
-                    handleDownRawY = ev.getRawY();
-                    handleStartX = toggleParams.x;
-                    handleStartY = toggleParams.y;
-                    panelStartY = panelParams.y;
-                    handleMoved = false;
-                    break;
-                case MotionEvent.ACTION_MOVE: {
-                    if (handlePointerId != -1 && ev.findPointerIndex(handlePointerId) < 0) break;
-                    float dx = ev.getRawX() - handleDownRawX;
-                    float dy = ev.getRawY() - handleDownRawY;
-                    if (!handleMoved && Math.hypot(dx, dy) > dp(Math.round(HANDLE_DRAG_THRESHOLD_DP))) {
-                        handleMoved = true;
-                    }
-                    if (handleMoved) {
-                        toggleParams.x = Math.round(handleStartX + dx);
-                        toggleParams.y = Math.round(handleStartY + dy);
-                        panelParams.y = Math.round(panelStartY + dy);
-                        clampWindowsToScreen();
-                        windowManager.updateViewLayout(toggleBtn, toggleParams);
-                        windowManager.updateViewLayout(panel, panelParams);
-                    }
-                    break;
+            } catch(Exception error) { main.post(() -> {
+                if(!destroyed) {
+                    if(engine!=null)engine.invalidate();latest=null;latestFile=null;lastDecision=null;
+                    publish("采集数据无法使用："+error.getMessage());render();
                 }
-                case MotionEvent.ACTION_UP:
-                    if (!handleMoved) {
-                        compactMode = !compactMode;
-                        getSharedPreferences(PREFS, MODE_PRIVATE)
-                                .edit().putBoolean(PREF_COMPACT, compactMode).apply();
-                        toggleBtn.setText(compactMode ? "详" : "简");
-                        JSONObject snap = lastSummary;
-                        if (snap != null) {
-                            main.post(() -> render(snap, "视图切换"));
+            }); }
+        });
+    }
+    private void submit(SnapshotEnvelope snapshot,File file) {
+        if(engine==null||paused||!snapshot.missingReason().isEmpty())return;
+        final JSONObject configuration=options;
+        io.execute(()-> {
+            try {
+                archive.capture(snapshot,configuration);
+                main.post(()-> {
+                    if(destroyed||paused||engine==null||configuration!=options||latest==null
+                        ||latest.runId!=snapshot.runId||latest.snapshotId!=snapshot.snapshotId)return;
+                    engine.submit(new EngineClient.Task(snapshot.runId,snapshot.snapshotId,engine.configId(),file,false));
+                });
+            }catch(Exception error){main.post(()->{if(!destroyed)publish("配置代记录失败："+error.getMessage());});}
+        });
+    }
+    private void initializeEngine(JSONObject configuration,long delay) {
+        requestedOptions=configuration;
+        io.execute(()-> {
+            try {
+                if(destroyed||configuration!=requestedOptions)return;
+                recordVersions(configuration);
+                if(destroyed||configuration!=requestedOptions)return;
+                options=configuration;
+                main.postDelayed(()-> {
+                    if(destroyed||paused||configuration!=options||configuration!=requestedOptions)return;
+                    engine=new EngineClient(this,configuration,this);engine.start();
+                    if(latest!=null&&latestFile!=null)submit(latest,latestFile);
+                },delay);
+            }catch(Exception error){main.post(()->{if(!destroyed)publish("版本信息无法登记："+error.getMessage());});}
+        });
+    }
+    private void recordVersions(JSONObject configuration) throws Exception {
+        JSONObject versions=new JSONObject();
+        try {
+            try(InputStream in=getAssets().open("gamedata/manifest.json")) {
+                String raw=PrivateFiles.read(in,1024*1024);JSONObject manifest=new JSONObject(raw);
+                versions.put("engine_revision",manifest.getString("engine_revision"))
+                    .put("data_version",PrivateFiles.sha256(raw.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+            }
+            try(InputStream in=getAssets().open("gamedata/default_config.toml")) {
+                String config=PrivateFiles.read(in,1024*1024);
+                java.util.regex.Matcher bonus=java.util.regex.Pattern.compile("(?m)^\\s*mcts_turn_bonus\\s*=\\s*([+-]?\\d+)\\s*(?:#.*)?$").matcher(config);
+                if(bonus.find())versions.put("mcts_turn_bonus",Integer.parseInt(bonus.group(1)));
+            }
+            String model="mcts".equals(configuration.optString("policy"))?"":configuration.optString("model_path","");
+            versions.put("model_version",model.isEmpty()?"not_used":PrivateFiles.sha256(new File(model)));
+        }catch(Exception error){android.util.Log.w("RamenArchive","版本来源尚未取得",error);}
+        archive.registerConfiguration(configuration,versions);
+    }
+    private void poll() {
+        if(destroyed||System.currentTimeMillis()-lastPushAt<5000)return;
+        String value=get("http://127.0.0.1:18765/api/ai/ramen/v1/snapshot");
+        if(value!=null)consume(value,"本机采集");
+        else {
+            String legacy=get("http://127.0.0.1:18765/summary");
+            if(legacy!=null)consume(legacy,"旧版采集");
+            else main.post(() -> {
+                if(!destroyed&&System.currentTimeMillis()-lastPushAt>=5000) {
+                    if(engine!=null)engine.invalidate();latest=null;latestFile=null;lastDecision=null;
+                    publish("采集连接中断；等待本机 18765 端口");render();
+                }
+            });
+        }
+    }
+    private static String get(String address) {
+        HttpURLConnection connection=null;
+        try {
+            connection=(HttpURLConnection)new URL(address).openConnection();
+            connection.setConnectTimeout(1000);connection.setReadTimeout(1500);
+            if(connection.getResponseCode()!=200)return null;
+            try(InputStream in=connection.getInputStream()) { return PrivateFiles.read(in,PrivateFiles.MAX_SNAPSHOT_BYTES); }
+        } catch(Exception error) { return null; }
+        finally { if(connection!=null)connection.disconnect(); }
+    }
+    @Override public void onStatus(String message) { if(!destroyed)publish(message); }
+    @Override public void onEvent(EngineClient.Task task,JSONObject event) {
+        JSONObject body=event.optJSONObject("event");
+        if(body==null)body=event;
+        final JSONObject payload=body;
+        record(() -> archive.event(task,payload,event.optInt("event_seq",0)));
+        if(!current(task))return;
+        applyEvent(payload);render();
+    }
+    @Override public void onResult(EngineClient.Task task,JSONObject result) {
+        record(() -> archive.result(task,result));
+        if(!current(task))return;
+        if(result.has("ok")&&!result.optBoolean("ok")) { publish("计算失败："+result.optString("error"));lastDecision=null;render();return; }
+        JSONObject evaluation=result.optJSONObject("evaluation");
+        if(evaluation==null)evaluation=result;
+        JSONArray events=evaluation.optJSONArray("events");
+        if(events!=null)for(int i=0;i<events.length();i++) { JSONObject event=events.optJSONObject(i);if(event!=null)applyEvent(event); }
+        publish(lastDecision==null?"本阶段暂无可执行建议":"计算完成");render();
+    }
+    @Override public void onFailure(EngineClient.Task task,String error) {
+        if(task!=null)record(() -> archive.event(task,new JSONObject().put("type","failed").put("error",error)));
+        lastDecision=null;publish(error);render();
+    }
+    @Override public void onDiscarded(EngineClient.Task task,String reason) {
+        record(() -> archive.event(task,new JSONObject().put("type","cancelled").put("reason",reason)));
+    }
+    private void applyEvent(JSONObject event) {
+        String type=event.optString("type");
+        if("decision".equals(type))lastDecision=event.optJSONObject("decision");
+        else if("skipped".equals(type)||"failed".equals(type)||"cancelled".equals(type)) {
+            lastDecision=null;publish(event.optString("reason",event.optString("error","等待新盘面")));
+        }
+    }
+    private boolean current(EngineClient.Task task) {
+        return !destroyed&&!paused&&latest!=null&&latest.runId==task.runId&&latest.snapshotId==task.snapshotId
+            &&engine!=null&&engine.configId().equals(task.configId);
+    }
+    private interface DiskAction { void run() throws Exception; }
+    private void record(DiskAction action) {
+        if(destroyed)return;
+        io.execute(() -> { try { action.run(); } catch(Exception error) { main.post(() -> { if(!destroyed)publish("记录保存失败："+error.getMessage()); }); } });
+    }
+    private void publish(String text) {
+        status=text;
+        getSharedPreferences("runtime_status",MODE_PRIVATE).edit().putString("status",text).putBoolean("paused",paused)
+            .putLong("updated",System.currentTimeMillis()).apply();
+        if(origin!=null)origin.setText(text);
+        NotificationManager manager=getSystemService(NotificationManager.class);
+        if(manager!=null&&!destroyed)manager.notify(NOTIFICATION,notification(text));
+    }
+    private void render() {
+        if(panel==null||destroyed)return;
+        if(latest==null) { recommendation.setText(status);return; }
+        title.setText((latest.turn()<0?"回合未知":"第 "+(latest.turn()+1)+" 回合")+" · "+stageName(latest.stage));
+        JSONObject state=latest.json.optJSONObject("state"), base=state==null?null:state.optJSONObject("baseGame");
+        if(base!=null)stats.setText("体力 "+base.optString("vital","?")+"/"+base.optString("maxVital","?")
+            +"  干劲 "+base.optString("motivation","?")+"\n五维 "+base.optString("fiveStatus","未采集")+"\n技能点 "+base.optString("skillPt","?"));
+        else stats.setText("基础状态尚未采集");
+        if(paused)recommendation.setText("已暂停计算");
+        else if(lastDecision==null)recommendation.setText(status);
+        else {
+            JSONArray names=lastDecision.optJSONArray("candidate_descriptions"),scores=lastDecision.optJSONArray("candidate_scores");
+            int selected=lastDecision.optInt("action_index",-1);
+            String name=names!=null&&selected>=0&&selected<names.length()?names.optString(selected):"动作信息缺失";
+            String scoreType=lastDecision.optString("score_type","");
+            JSONObject extra=lastDecision.optJSONObject("scenario_extra");
+            if(scoreType.isEmpty()&&extra!=null)scoreType=extra.optString("score_type","");
+            recommendation.setText("建议："+name+(scoreType.isEmpty()?"":"\n评分口径："+scoreLabel(scoreType)));
+            StringBuilder explanation=new StringBuilder();
+            if(names!=null)for(int i=0;i<names.length();i++) {
+                explanation.append(i==selected?"● ":"○ ").append(names.optString(i));
+                if(scores!=null&&i<scores.length()&&!scores.isNull(i))explanation.append("  ").append(String.format(Locale.ROOT,"%.2f",scores.optDouble(i)));
+                else explanation.append("  无评分");
+                explanation.append('\n');
+            }
+            if(extra!=null) {
+                JSONObject reason=extra.optJSONObject("reason");
+                if(reason!=null) {
+                    explanation.append("\n本次选项比较");
+                    if(reason.has("chosen_n"))explanation.append(" · 已模拟 ").append(reason.optInt("chosen_n")).append(" 次");
+                    explanation.append('\n');
+                    JSONArray rivals=reason.optJSONArray("rivals");
+                    if(rivals!=null)for(int i=0;i<rivals.length();i++) {
+                        JSONObject rival=rivals.optJSONObject(i);if(rival==null)continue;
+                        explanation.append(rival.optString("desc")).append("：相对建议 ")
+                            .append(String.format(Locale.ROOT,"%+.1f",rival.optDouble("gap"))).append('\n');
+                        for(String group:new String[]{"pros","cons"}) {
+                            JSONArray changes=rival.optJSONArray(group);if(changes==null)continue;
+                            for(int j=0;j<changes.length();j++) {
+                                JSONObject change=changes.optJSONObject(j);if(change==null)continue;
+                                explanation.append("  ").append(change.optString("label"))
+                                    .append(String.format(Locale.ROOT," %+.1f",change.optDouble("delta"))).append('\n');
+                            }
                         }
                     }
-                    break;
+                }
+                JSONObject hint=extra.optJSONObject("nn_hint");
+                if(hint!=null)explanation.append("NN 参考：").append(hint.optString("choice","暂无建议")).append('\n');
             }
-            return true;
+            if(base!=null)explanation.append("\n训练等级进度：").append(base.optString("trainLevelCount","未采集")).append('\n');
+            JSONObject observed=latest.json.optJSONObject("display_summary");
+            if(observed!=null) {
+                String trainings=RamenBoardText.trainingLines(observed.optJSONArray("trainings"));
+                if(!trainings.isEmpty())explanation.append("\n已观测训练\n").append(trainings);
+            }
+            details.setText(explanation.toString());
+            if(!compact && names!=null && scores!=null && names.length()==scores.length())chart.setCandidates(names,scores,selected);
+            else chart.clear();
+        }
+        if(lastDecision==null) { chart.clear();details.setText(latest.missingReason()); }
+        stats.setVisibility(compact?View.GONE:View.VISIBLE);details.setVisibility(compact?View.GONE:View.VISIBLE);
+        recommendation.setMaxLines(compact?5:Integer.MAX_VALUE);
+        recommendation.setEllipsize(compact?android.text.TextUtils.TruncateAt.END:null);
+        origin.setText(source+" · "+status);toggle.setText(compact?"展开":"收起");
+        main.post(this::clamp);
+    }
+    public static String stageName(String stage) {
+        switch(stage) {
+            case "train":return "行动";case "ramen_select":return "吃面";case "special_select":return "隐藏风味";
+            case "region_select":return "地区";case "super_ramen_select":return "超级拉面";case "event":return "事件";
+            case "settlement":return "结算";default:return "等待采集";
+        }
+    }
+    private static String scoreLabel(String type) {
+        switch(type) {
+            case "terminal_score":case "mcts":return "模拟终局评分";
+            case "heuristic":case "handwritten":return "手写策略估值";
+            case "nn":case "neural":return "模型输出";
+            case "none":return "无评分";
+            default:return type;
+        }
+    }
+    private static String legacySummary(JSONObject json) {
+        JSONObject c=json.optJSONObject("chara");if(c==null)c=json.optJSONObject("stats");
+        return c==null?"未收到基础属性":"体力 "+c.optString("vital","?")+"  干劲 "+c.optString("motivation","?");
+    }
+    private void createWindows() {
+        windows=getSystemService(WindowManager.class);
+        panel=LayoutInflater.from(this).inflate(R.layout.floating_window,null);
+        title=panel.findViewById(R.id.tv_turn);recommendation=panel.findViewById(R.id.tv_recommend);
+        stats=panel.findViewById(R.id.tv_status);details=panel.findViewById(R.id.tv_trainings);
+        origin=panel.findViewById(R.id.tv_source);chart=panel.findViewById(R.id.chart_candidates);
+        panel.findViewById(R.id.tv_skill).setVisibility(View.GONE);panel.findViewById(R.id.tv_ramen).setVisibility(View.GONE);
+        panelParams=new WindowManager.LayoutParams(dp(220),WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE|WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,PixelFormat.TRANSLUCENT);
+        panelParams.gravity=Gravity.TOP|Gravity.START;panelParams.y=dp(100);
+        windows.addView(panel,panelParams);
+        toggle=new TextView(this);toggle.setText(compact?"展开":"收起");toggle.setTextSize(14);toggle.setTextColor(0xff17231e);
+        toggle.setBackgroundColor(0xeeecf3ed);toggle.setPadding(dp(12),dp(8),dp(12),dp(8));
+        toggleParams=new WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT,WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,PixelFormat.TRANSLUCENT);
+        toggleParams.gravity=Gravity.TOP|Gravity.START;toggleParams.x=dp(220);toggleParams.y=dp(100);
+        toggle.setContentDescription("点击展开或收起；拖动移动浮窗");
+        toggle.setOnTouchListener((view,event)-> {
+            switch(event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    clamp();pointer=event.getPointerId(0);downX=event.getRawX();downY=event.getRawY();startX=panelParams.x;startY=panelParams.y;moved=false;return true;
+                case MotionEvent.ACTION_MOVE:
+                    if(event.findPointerIndex(pointer)!=0)return true;
+                    float dx=event.getRawX()-downX,dy=event.getRawY()-downY;
+                    if(Math.hypot(dx,dy)>dp(6))moved=true;
+                    if(moved) { panelParams.x=startX+Math.round(dx);panelParams.y=startY+Math.round(dy);clamp(); }return true;
+                case MotionEvent.ACTION_UP:
+                    if(!moved) { compact=!compact;getSharedPreferences("ramen_overlay",MODE_PRIVATE).edit().putBoolean("compact",compact).apply();render(); }
+                    pointer=-1;return true;
+                case MotionEvent.ACTION_CANCEL:pointer=-1;return true;
+                default:return true;
+            }
         });
-        windowManager.addView(toggleBtn, p);
+        windows.addView(toggle,toggleParams);
     }
-
-    /**
-     * 把主面板与把手窗口位置 clamp 回屏幕内。
-     *
-     * 背景：游戏横竖屏切换时系统保持 overlay 窗口 x/y 原值——横屏下拖到
-     * 靠右/靠下的窗口，切回竖屏（或反之）后坐标可能超出新屏宽高，窗口
-     * 不可见且把手收不到触摸，表现为"浮窗无法移动"。此处在数据刷新
-     * （render）与触摸按下（ACTION_DOWN）时兜底拉回；拖动过程中调用
-     * 则防止把窗口拖出屏幕。
-     */
-    private void clampWindowsToScreen() {
-        try {
-            android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
-            int sw = dm.widthPixels, sh = dm.heightPixels;
-            boolean changed = false;
-            if (panel != null && panel.getWidth() > 0) {
-                int nx = Math.max(0, Math.min(panelParams.x, sw - panel.getWidth()));
-                int ny = Math.max(0, Math.min(panelParams.y, sh - panel.getHeight()));
-                if (nx != panelParams.x || ny != panelParams.y) {
-                    panelParams.x = nx; panelParams.y = ny; changed = true;
-                }
-            }
-            if (toggleBtn != null && toggleBtn.getWidth() > 0) {
-                int nx = Math.max(0, Math.min(toggleParams.x, sw - toggleBtn.getWidth()));
-                int ny = Math.max(0, Math.min(toggleParams.y, sh - toggleBtn.getHeight()));
-                if (nx != toggleParams.x || ny != toggleParams.y) {
-                    toggleParams.x = nx; toggleParams.y = ny; changed = true;
-                }
-            }
-            if (changed) {
-                windowManager.updateViewLayout(panel, panelParams);
-                windowManager.updateViewLayout(toggleBtn, toggleParams);
-            }
-        } catch (Exception ignored) {
-        }
+    private void clamp() {
+        if(destroyed||panel==null||toggle==null)return;
+        android.graphics.Rect bounds=Build.VERSION.SDK_INT>=30?windows.getCurrentWindowMetrics().getBounds():
+            new android.graphics.Rect(0,0,getResources().getDisplayMetrics().widthPixels,getResources().getDisplayMetrics().heightPixels);
+        int width=bounds.width(),height=bounds.height();
+        panelParams.height=compact?WindowManager.LayoutParams.WRAP_CONTENT:Math.max(dp(180),Math.round(height*0.7f));
+        panelParams.flags=WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE|(compact?WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE:0);
+        panelParams.width=Math.min(dp(220),Math.max(dp(120),width-dp(64)));
+        panelParams.x=Math.max(0,Math.min(panelParams.x,width-panelParams.width));
+        panelParams.y=Math.max(0,Math.min(panelParams.y,height-Math.max(dp(48),panel.getHeight())));
+        toggleParams.x=Math.max(0,Math.min(panelParams.x+panelParams.width,width-Math.max(dp(56),toggle.getWidth())));
+        toggleParams.y=Math.max(0,Math.min(panelParams.y,height-Math.max(dp(48),toggle.getHeight())));
+        if(panel.isAttachedToWindow())windows.updateViewLayout(panel,panelParams);
+        if(toggle.isAttachedToWindow())windows.updateViewLayout(toggle,toggleParams);
     }
-
-    private int dp(int v) {
-        return Math.round(v * getResources().getDisplayMetrics().density);
-    }
-
-    private void startPolling() {
-        polling = true;
-        Thread t = new Thread(() -> {
-            while (polling) {
-                if (System.currentTimeMillis() - lastDataAt > STALE_MS) {
-                    String b = get("http://127.0.0.1:18765/summary");
-                    if (b != null) consume(b, "轮询");
-                }
-                try {
-                    Thread.sleep(2000);
-                } catch (InterruptedException e) {
-                    return;
-                }
-            }
-        }, "RamenPoll");
-        t.setDaemon(true);
-        t.start();
-    }
-
-    private static String get(String a) {
-        HttpURLConnection c = null;
-        try {
-            c = (HttpURLConnection) new URL(a).openConnection();
-            c.setConnectTimeout(1500);
-            c.setReadTimeout(2000);
-            if (c.getResponseCode() != 200) return null;
-            BufferedReader r = new BufferedReader(
-                new InputStreamReader(c.getInputStream(), "UTF-8"));
-            StringBuilder b = new StringBuilder();
-            String l;
-            while ((l = r.readLine()) != null) b.append(l);
-            r.close();
-            return b.toString();
-        } catch (Exception e) {
-            return null;
-        } finally {
-            if (c != null) c.disconnect();
-        }
-    }
-
-    private void createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= 26) {
-            NotificationManager m = getSystemService(NotificationManager.class);
-            if (m != null) {
-                m.createNotificationChannel(new NotificationChannel(
-                    CHANNEL, "拉面杯浮窗", NotificationManager.IMPORTANCE_LOW));
-            }
-        }
-    }
-
-    private Notification notification(String t) {
-        return new NotificationCompat.Builder(this, CHANNEL)
-            .setContentTitle("拉面杯决策浮窗")
-            .setContentText(t)
-            .setSmallIcon(android.R.drawable.ic_menu_info_details)
-            .setOngoing(true)
-            .build();
+    @Override public void onConfigurationChanged(Configuration configuration) { super.onConfigurationChanged(configuration);main.post(this::clamp); }
+    private int dp(int value) { return Math.round(value*getResources().getDisplayMetrics().density); }
+    private Notification notification(String text) {
+        PendingIntent open=PendingIntent.getActivity(this,0,new Intent(this,MainActivity.class),PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
+        PendingIntent pause=PendingIntent.getService(this,1,new Intent(this,FloatingWindowService.class).setAction(paused?ACTION_RESUME:ACTION_PAUSE),PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
+        PendingIntent stop=PendingIntent.getService(this,2,new Intent(this,FloatingWindowService.class).setAction(ACTION_STOP),PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
+        return new NotificationCompat.Builder(this,CHANNEL).setContentTitle("拉面杯本地辅助").setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_menu_info_details).setContentIntent(open).setOngoing(true)
+            .addAction(0,paused?"继续":"暂停",pause).addAction(0,"停止",stop).build();
     }
 }

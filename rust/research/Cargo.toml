@@ -1,0 +1,61 @@
+# 独立 workspace：云盘工作区根目录有无关的 hachimi_ura Cargo.toml，会劫持
+# cargo 的 workspace 向上解析；此空表把本 crate 钉成独立 workspace（2026-09-17）
+[workspace]
+
+[package]
+name = "uma-jni"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "ramen_batch"
+path = "src/batch.rs"
+
+[[bin]]
+name = "ramen_batch_genome"
+path = "src/batch_genome.rs"
+
+[[bin]]
+name = "ramen_optimize"
+path = "src/optimize.rs"
+
+[[bin]]
+name = "ramen_card_benchmark"
+path = "src/card_benchmark.rs"
+
+[dependencies]
+# 2026-09-16: eeae510b → 3b4e940（xf8410/umaai-rs fork：f363386 同步上游 9-15 master
+#   + acb7735 回植 ParamOverride GA 注入通道 + 3b4e940 删 region_pt_weight 基因）
+# 上游关键变更（8-28 → 9-15，72 commits）：
+# - policy.rs：地区打分重构（主位加成 region_main_bias_bonus / 浪费惩罚 region_waste_penalty，
+#   移除 pt_bonus/hint 恒定项）；weak_cover 三态化
+# - PT 定价固化：pt_tradeoff_shining=36.0 / pt_tradeoff=16.0（7build×100 局标定）
+# - 新增 policy_schema 参数包体系（可加载 GA 最优基因）、NN 管线（convert754/ramen_nn/onnx feature）
+# - 兼容性验证：jueceramen 全部 API 零破坏（cargo check 绿）；行为对拍 300 局均分 +42（噪声内），
+#   RMJ 全通 100%，最高分 63474→66475（上限抬升）
+# 2026-09-17: f11fdf4 → 53227d4（同步上游 8 commit 调优 + 合并冲突修复 53227d4）：
+#   - 6376dd7 ga_lab 最优策略合并（通解卡组+9 旋钮参数组合档+bench_base --deck）
+#   - 70550cd 智力豁免白名单 + 已满位 PT 定价实验 token（trd/trdsh/trds）
+#   - d9374e8 合宿训练诀窍全 MAX 填充修复（模拟器行为变化）
+#   - 968489f MCTS pt_favor_rate 定档 2.0 + 运气分改真实评分
+umasim = { git = "https://github.com/xf8410/umaai-rs", rev = "53227d4b2c2c45fe441491a9df9c13949d773a7e", default-features = false, features = ["diag", "no-color"] }
+jni = { version = "0.21", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.9"
+rayon = "1"
+anyhow = "1"
+log = "0.4"
+android_logger = { version = "0.14", optional = true }
+
+[features]
+default = ["jni-support"]
+jni-support = ["dep:jni", "dep:android_logger"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

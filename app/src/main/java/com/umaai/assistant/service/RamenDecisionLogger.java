@@ -71,6 +71,8 @@ public final class RamenDecisionLogger {
     /** 服务启动时初始化；重复调用会重置 run 生命周期（视为新服务会话）。 */
     public static void init(File filesDir, int configUmaId, int[] configCards) {
         synchronized (LOCK) {
+            if(filesDir!=null&&!filesDir.isDirectory()&&!filesDir.mkdirs())
+                throw new IllegalArgumentException("无法创建旧版日志目录："+filesDir);
             logFile = filesDir == null ? null : new File(filesDir, "decision_log.jsonl");
             umaId = configUmaId;
             cards = configCards == null ? new int[0] : configCards.clone();

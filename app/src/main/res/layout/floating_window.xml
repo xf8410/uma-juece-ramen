@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/panel_root"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:background="#D9000000"
-    android:orientation="vertical"
-    android:padding="5dp">
+    android:padding="8dp">
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical">
 
     <TextView
         android:id="@+id/tv_turn"
@@ -13,7 +13,7 @@
         android:layout_height="wrap_content"
         android:text="等待数据"
         android:textColor="#FFAA44"
-        android:textSize="10sp"
+        android:textSize="13sp"
         android:textStyle="bold" />
 
     <!-- 候选条形图（v0.3.2）：tv_turn 下方，Rust decision 喂图，
@@ -30,7 +30,7 @@
         android:layout_height="wrap_content"
         android:text="等待行动建议"
         android:textColor="#55FF99"
-        android:textSize="11sp"
+        android:textSize="15sp"
         android:textStyle="bold" />
 
     <TextView
@@ -38,7 +38,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:textColor="#FFFFFF"
-        android:textSize="9sp" />
+        android:textSize="12sp" />
 
     <!-- 技能评分评估（v0.4.0）：SkillScoreEngine 输出，无数据时 GONE -->
     <TextView
@@ -47,7 +47,7 @@
         android:layout_height="wrap_content"
         android:visibility="gone"
         android:textColor="#66CCFF"
-        android:textSize="8sp" />
+        android:textSize="12sp" />
 
     <TextView
         android:id="@+id/tv_ramen"
@@ -55,7 +55,7 @@
         android:layout_height="wrap_content"
         android:paddingTop="2dp"
         android:textColor="#FFBB66"
-        android:textSize="8sp" />
+        android:textSize="12sp" />
 
     <TextView
         android:id="@+id/tv_trainings"
@@ -63,15 +63,17 @@
         android:layout_height="wrap_content"
         android:fontFamily="monospace"
         android:textColor="#DDDDDD"
-        android:textSize="8sp" />
+        android:textSize="12sp" />
 
     <TextView
         android:id="@+id/tv_source"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="等待本地数据"
-        android:textColor="#777777"
-        android:textSize="7sp" />
+        android:textColor="#A4B2AA"
+        android:maxLines="3"
+        android:ellipsize="end"
+        android:textSize="11sp" />
 
     <TextView
         android:id="@+id/tv_scenario"
@@ -87,4 +89,5 @@
         android:layout_width="1dp"
         android:layout_height="1dp"
         android:visibility="gone" />
-</LinearLayout>
+    </LinearLayout>
+</ScrollView>

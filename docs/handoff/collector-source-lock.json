@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/xf8410/so-history-backup.git",
+  "baseline_revision": "721c086220ea081523229d88623de5abddd97eaa",
+  "patch_sha256": "49db53d98d73aa3c49dcfb35a9c4aaa00a54cd96959a1635c89f8ac3a623104e",
+  "patch_format": "git diff --cached --binary --no-renames from raw baseline blobs",
+  "hash_encoding": "SHA256 of UTF-8 bytes with CRLF normalized to LF; raw Git baseline hash recorded separately",
+  "affected_files": {
+    ".github/workflows/ramen-observation.yml": {
+      "change": "added",
+      "before_sha256_lf": null,
+      "before_git_blob_sha256": null,
+      "after_sha256_lf": "eac4392a600700761b88ab2afbb3f5cde147dead21daaaa941ce03eb035fc99e"
+    },
+    "docs/RAMEN_RUNTIME_SNAPSHOT_V1.md": {
+      "change": "added",
+      "before_sha256_lf": null,
+      "before_git_blob_sha256": null,
+      "after_sha256_lf": "cde27563b59d03a940d57f348abd5ffc20f4c4ebc5aeb3573e31562871d2899b"
+    },
+    "hachimi_ura_plugin/Cargo.lock": {
+      "change": "modified",
+      "before_sha256_lf": "e99dfc52a4211286a4847f422a29b2975734d7897bef059c4a57c1f89e1f48c0",
+      "before_git_blob_sha256": "e99dfc52a4211286a4847f422a29b2975734d7897bef059c4a57c1f89e1f48c0",
+      "after_sha256_lf": "3752b09c55a95e956cea6b2236df860495c7d69b12bd678696c78ca583c621a6"
+    },
+    "hachimi_ura_plugin/Cargo.toml": {
+      "change": "modified",
+      "before_sha256_lf": "32808a107ae6d85fba092cf8c85714063c051aeae4e4d96dedfbf44498a78353",
+      "before_git_blob_sha256": "32808a107ae6d85fba092cf8c85714063c051aeae4e4d96dedfbf44498a78353",
+      "after_sha256_lf": "4cc5180c5a11ffb579bfe4e613a185c696e106f88ba3e18ca8e35c14114d9cf3"
+    },
+    "hachimi_ura_plugin/src/lib.rs": {
+      "change": "modified",
+      "before_sha256_lf": "c7fbf94b308cf20268e6f1530b5ca48abc1074f9a32e6a7109624656f9c13c02",
+      "before_git_blob_sha256": "c7fbf94b308cf20268e6f1530b5ca48abc1074f9a32e6a7109624656f9c13c02",
+      "after_sha256_lf": "a089d6088aa281efebaa217f97d4c6126f50a0f03fb64d9da8d94cf710619b8b"
+    },
+    "ramen_observation/.gitignore": {
+      "change": "added",
+      "before_sha256_lf": null,
+      "before_git_blob_sha256": null,
+      "after_sha256_lf": "306fd52e74fca6746e12acc750f232de15e71da917756a1270d74c91f5eb7368"
+    },
+    "ramen_observation/Cargo.lock": {
+      "change": "added",
+      "before_sha256_lf": null,
+      "before_git_blob_sha256": null,
+      "after_sha256_lf": "1ca40f15edc59508019aede1b3956b9eabef09020378bd7bed4c13c8dea97a60"
+    },
+    "ramen_observation/Cargo.toml": {
+      "change": "added",
+      "before_sha256_lf": null,
+      "before_git_blob_sha256": null,
+      "after_sha256_lf": "89631cc4e2320b2faa999f4ed64542b4849b313da0edfe0431f57f3dc6777a20"
+    },
+    "ramen_observation/src/lib.rs": {
+      "change": "added",
+      "before_sha256_lf": null,
+      "before_git_blob_sha256": null,
+      "after_sha256_lf": "9b54b1ae5e5456992821a4935b95b72d8ced41f94c9fd9661513cc248fe7e8a2"
+    },
+    "rust-toolchain.toml": {
+      "change": "added",
+      "before_sha256_lf": null,
+      "before_git_blob_sha256": null,
+      "after_sha256_lf": "91d03b4b59f682cc3e8526970c22322c341b8cc0002a35508419bb06d943584e"
+    }
+  }
+}

@@ -5,249 +5,97 @@ on:
     branches: [main, 'workbench/*']
   pull_request:
   workflow_dispatch:
-    inputs:
-      sim_count:
-        description: '模拟局数（0=不跑模拟；基因组 A/B 随 simulate 同跑）'
-        default: '1000'
-        type: string
-      strategy_json:
-        description: '策略参数 JSON（留空用仓库内置优化参数）'
-        default: ''
-        type: string
-      opt_mode:
-        description: '优化模式（cmaes / bayes / 0=不跑；跑完会自动提交策略文件）'
-        default: '0'
-        type: string
-      opt_arg1:
-        description: 'CMA-ES=代数 / Bayes=初始采样数'
-        default: '10'
-        type: string
-      opt_arg2:
-        description: 'CMA-ES=种群 / Bayes=迭代次数'
-        default: '8'
-        type: string
-      opt_games:
-        description: '每次评估局数'
-        default: '50'
-        type: string
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
-  rust-check:
-    runs-on: ubuntu-latest
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - uses: actions/setup-python@v5
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: rust-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
-          restore-keys: rust-${{ runner.os }}-
-      - name: Build batch runner
-        run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_batch
-      - name: Build optimizer
-        run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_optimize
-      - name: Build JNI lib
-        run: cargo build --manifest-path rust/Cargo.toml --lib
-      # 单元测试：gamedata 缺失时依赖 gamedata 的测试自行跳过（setup_gamedata），
-      # 纯解析类测试（reconcile 观测解析 / breakdown 解析）在此真正执行
-      - name: Run Rust tests
-        run: cargo test --manifest-path rust/Cargo.toml --lib
-
-  simulate:
-    if: github.event_name != 'workflow_dispatch' || github.event.inputs.sim_count != '0'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: rust-sim-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
-          restore-keys: |
-            rust-sim-${{ runner.os }}-
-            rust-${{ runner.os }}-
-      - name: Download gamedata
-        run: |
-          mkdir -p gamedata
-          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
-          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
-            curl -sSL "$BASE/$f" -o "gamedata/$f" || echo "WARN: $f"
-          done
-      - name: Build batch runner
-        run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_batch
-      - name: Run simulation
-        env:
-          STRATEGY_JSON_INPUT: ${{ github.event.inputs.strategy_json }}
-        run: |
-          # 策略来源优先级：dispatch strategy_json > rust/strategy_optimized.json（仓库内置优化参数）。
-          # 2026-09-17 修复：此前 push 触发时 RAMEN_STRATEGY 恒为空，simulate 一直跑出厂默认
-          # 参数（均分 57215 / 最高 63101），优化产物从未上过 CI 卷面。
-          # batch.rs 现已把 strategy_optimized.json 编译进二进制作基线（双保险），
-          # 这里显式导出是为了让「用了哪套参数」在日志可见、且可被 dispatch 覆盖。
-          STRATEGY_JSON="$STRATEGY_JSON_INPUT"
-          if [ -z "$STRATEGY_JSON" ] && [ -f "${{ github.workspace }}/rust/strategy_optimized.json" ]; then
-            STRATEGY_JSON="$(cat ${{ github.workspace }}/rust/strategy_optimized.json)"
-            echo "策略来源: rust/strategy_optimized.json（仓库内置优化参数）"
-          else
-            echo "策略来源: dispatch strategy_json / 二进制内置基线"
-          fi
-          export RAMEN_STRATEGY="$STRATEGY_JSON"
-          cd /tmp
-          cp -r ${{ github.workspace }}/gamedata .
-          cp -r ${{ github.workspace }}/rust .
-          N="${{ github.event.inputs.sim_count || '1000' }}"
-          cargo run --release --manifest-path rust/Cargo.toml --bin ramen_batch -- "$N" 2>&1 | tee /tmp/sim_output.txt || echo "SIM_FAILED" >> /tmp/sim_output.txt
-          cat /tmp/sim_output.txt >> "$GITHUB_STEP_SUMMARY"
-      - name: Run genome A/B
-        run: |
-          # GA 基因组三臂配对基准（同卷面同种子）：A=preset(9旋钮定稿) /
-          # B=best_genome 覆盖层 / C=ga_freeze（浮窗 fallback 实际启用的通道）。
-          # 配对均差 = 配置净效应，直接进 Step Summary 供决策。
-          cd /tmp
-          N="${{ github.event.inputs.sim_count || '1000' }}"
-          cargo run --release --manifest-path rust/Cargo.toml --bin ramen_batch_genome -- "$N" 2>&1 | tee /tmp/genome_output.txt || echo "GENOME_AB_FAILED" >> /tmp/genome_output.txt
-          cat /tmp/genome_output.txt >> "$GITHUB_STEP_SUMMARY"
-
-  optimize:
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.opt_mode != '' && github.event.inputs.opt_mode != '0'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: rust-opt-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
-          restore-keys: |
-            rust-opt-${{ runner.os }}-
-            rust-sim-${{ runner.os }}-
-            rust-${{ runner.os }}-
-      - name: Download gamedata
-        run: |
-          mkdir -p gamedata
-          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
-          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
-            curl -sSL "$BASE/$f" -o "gamedata/$f" || echo "WARN: $f"
-          done
-      - name: Build optimizer
-        run: cargo build --release --manifest-path rust/Cargo.toml --bin ramen_optimize
-      - name: Run optimization
-        env:
-          STRATEGY_IN: ${{ github.workspace }}/rust/strategy_optimized.json
-          STRATEGY_OUT: ${{ github.workspace }}/rust/strategy_optimized.json
-        run: |
-          cd /tmp
-          cp -r ${{ github.workspace }}/gamedata .
-          cp -r ${{ github.workspace }}/rust .
-          MODE="${{ github.event.inputs.opt_mode }}"
-          ARG1="${{ github.event.inputs.opt_arg1 || '10' }}"
-          ARG2="${{ github.event.inputs.opt_arg2 || '8' }}"
-          GAMES="${{ github.event.inputs.opt_games || '50' }}"
-          cargo run --release --manifest-path rust/Cargo.toml --bin ramen_optimize -- "$MODE" "$ARG1" "$ARG2" "$GAMES" 2>&1 | tee /tmp/opt_output.txt || echo "OPT_FAILED" >> /tmp/opt_output.txt
-          cat /tmp/opt_output.txt >> "$GITHUB_STEP_SUMMARY"
-      - name: Commit optimized strategy
-        run: |
-          cd ${{ github.workspace }}
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add rust/strategy_optimized.json || true
-          git commit -m "[skip ci] 优化策略参数 $(date -u '+%Y-%m-%d %H:%M')" || true
-          git push || true
-
-  android:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup JDK 17
-        uses: actions/setup-java@v4
+          python-version: '3.13'
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
+          java-version: '17.0.16+8'
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: android-actions/setup-android@v3
         with:
-          gradle-version: 8.5
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+          # The legacy 'tools' package is no longer available from sdkmanager.
+          packages: platform-tools
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: '1.97.1'
           targets: aarch64-linux-android
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked || true
-      - name: Find NDK
+      - name: Install pinned Android tools
+        # #385 复盘：裸 sdkmanager 在 runner 上 2 秒静默退出（无任何安装输出），
+        # NDK 没落地，build_android.py 才报"Install NDK"。改显式 --install +
+        # 刚下载的 cmdline-tools 绝对路径 + 装完自证，装不上当步就红。
         run: |
-          NDK_DIR=$(ls -d /usr/local/lib/android/sdk/ndk/*/ 2>/dev/null | head -1)
-          if [ -z "$NDK_DIR" ]; then
-            echo "No NDK found, installing..."
-            yes | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager "ndk;27.2.12479018" 2>/dev/null || true
-            NDK_DIR="/usr/local/lib/android/sdk/ndk/27.2.12479018/"
-          fi
-          NDK_DIR="${NDK_DIR%/}"
-          echo "NDK at: $NDK_DIR"
-          echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: cargo-android-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml') }}
-          restore-keys: cargo-android-${{ runner.os }}-
-      - name: Build native library
-        continue-on-error: true
+          SDKM="$ANDROID_HOME/cmdline-tools/16.0/bin/sdkmanager"
+          if [ ! -x "$SDKM" ]; then SDKM="$(command -v sdkmanager)"; fi
+          echo "using sdkmanager: $SDKM"
+          "$SDKM" --install 'platforms;android-34' 'build-tools;35.0.0' 'ndk;28.2.13676358'
+          ls "$ANDROID_HOME/ndk/"
+          test -d "$ANDROID_HOME/ndk/28.2.13676358"
+          # #386 复盘：NDK 目录在、ls 能列出，但 build_android.py 仍报找不到——
+          # 把 ANDROID_NDK_HOME 持久化到后续步骤（GITHUB_ENV），排除环境传递差异
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - name: NDK 自证（探测三要素：路径/目录/source.properties）
         run: |
-          cd rust
-          cargo ndk -t arm64-v8a build --release 2>&1 || echo "NATIVE_BUILD_FAILED"
-      - name: Copy .so to jniLibs
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-<未设>}"
+          ls "$ANDROID_HOME/ndk/" || true
+          cat "$ANDROID_HOME/ndk/28.2.13676358/source.properties" 2>/dev/null || echo "source.properties 不在"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
+          ndk = Path(os.environ.get("ANDROID_NDK_HOME", str(Path(sdk) / "ndk" / "28.2.13676358") if sdk else ""))
+          print("ndk path =", ndk)
+          print("is_dir =", ndk.is_dir())
+          p = ndk / "source.properties"
+          print("props exists =", p.exists())
+          if p.exists():
+              t = p.read_text()
+              print("props head =", repr(t[:200]))
+              print("version in props =", "28.2.13676358" in t)
+          PY
+      - name: Install pinned cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+      - name: Validate wrapper and packaging regression tests
         run: |
-          mkdir -p app/src/main/jniLibs/arm64-v8a
-          if [ -f rust/target/aarch64-linux-android/release/libuma_jni.so ]; then
-            cp rust/target/aarch64-linux-android/release/libuma_jni.so app/src/main/jniLibs/arm64-v8a/
-            echo "Native library copied"
-          else
-            echo "No .so — APK will use fallback TrainingEvaluator"
-          fi
-      - name: Download gamedata for APK
+          python -c "import hashlib,json,pathlib; p=pathlib.Path('.'); expected=json.loads((p/'toolchains.json').read_text())['gradle_wrapper_sha256']; assert hashlib.sha256((p/'gradle/wrapper/gradle-wrapper.jar').read_bytes()).hexdigest()==expected"
+          python -m unittest discover -s scripts/tests -v
+      - name: Reconstruct the reviewed engine source and exact data version
+        run: python scripts/prepare_engine.py --package-data
+      - name: Shared runtime and review tests
+        working-directory: .engine-source
+        run: cargo test --release --locked -p umaai_runtime -p umaai_review
+      - name: JNI tests
+        run: cargo test --release --locked --manifest-path rust/Cargo.toml
+      - name: Native build, Java tests and APK verification
+        run: python scripts/build_android.py --skip-prepare
+      - name: Collect immutable provenance
         run: |
-          mkdir -p app/src/main/assets/gamedata
-          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
-          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
-            curl -sSL "$BASE/$f" -o "app/src/main/assets/gamedata/$f" || echo "WARN: $f"
-          done
-      - name: Copy optimized strategy to assets
-        run: |
-          if [ -f rust/strategy_optimized.json ]; then
-            cp rust/strategy_optimized.json app/src/main/assets/strategy_optimized.json
-            echo "优化策略已打包进 APK（注意：当前无运行时消费者，仅存档）"
-          else
-            echo "无优化策略文件，APK 用默认参数"
-          fi
-      - name: Create local.properties
-        run: echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
-      - name: Build APK
-        run: gradle assembleDebug --no-daemon 2>&1
-      - name: Run tests
-        run: gradle test --no-daemon || true
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/*.apk dist/
+          cp app/src/main/assets/build-manifest.json dist/
+          cp engine/source-lock.json dist/
+          sha256sum dist/*.apk > dist/SHA256SUMS
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: uma-juece-ramen-apk
-          path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: warn
+          name: ramen-arm64-dev-verified
+          path: dist/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ramen-build-test-reports
+          path: app/build/reports/
+          if-no-files-found: ignore
