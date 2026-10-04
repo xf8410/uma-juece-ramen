@@ -32,12 +32,14 @@ public final class RecordsActivity extends Activity implements EngineClient.List
                 File legacy=new File(getFilesDir(),name);
                 if(legacy.isFile())runOnUiThread(()->button(name+" · 旧版记录缺少完整快照",()->{selected=legacy;export();}));
             }
-            if(runs==null||runs.length==0){show("尚无 V1 对局记录；连接采集端后开始记录。");return;}
+            if(runs==null||runs.length==0){show("尚无对局记录；连接采集端后开始记录。");return;}
             Arrays.sort(runs,(a,b)->Long.compare(b.lastModified(),a.lastModified()));
             for(File run:runs) {
                 try {
                     JSONObject meta=new JSONObject(PrivateFiles.read(new File(run,"meta.json"),1024*1024));
-                    String label=run.getName()+" · "+(meta.optBoolean("complete")?"完整":"未完成")+"\n"+meta.optInt("snapshots")+" 份快照 / "+meta.optInt("decision_rows")+" 条决策";
+                    JSONObject instances=meta.optJSONObject("collector_instances");
+                    String label=run.getName()+" · "+(meta.optBoolean("complete")?"完整":"未完成")+"\n"+meta.optInt("snapshots")+" 份快照 / "+meta.optInt("decision_rows")+" 条决策"
+                        +(instances!=null&&instances.length()>1?"\n含 "+instances.length()+" 个采集进程，运气按恢复段记录":"");
                     runOnUiThread(()->button(label,()->select(run)));
                 }catch(Exception error){runOnUiThread(()->button(run.getName()+" · 元信息损坏",()->select(run)));}
             }
@@ -62,7 +64,8 @@ public final class RecordsActivity extends Activity implements EngineClient.List
                         String type=event.optString("type");
                         if(type.equals("started")||type.equals("completed"))continue;
                         if(++rows>500){text.append("\n更多事件请查看导出的局包。");break;}
-                        text.append("快照 ").append(entry.optLong("snapshot_id")).append(" · ").append(type).append('\n');
+                        text.append("采集 ").append(entry.optString("collector_instance_id",SnapshotEnvelope.LEGACY_INSTANCE))
+                            .append(" / 快照 ").append(entry.optLong("snapshot_id")).append(" · ").append(type).append('\n');
                         JSONObject decision=event.optJSONObject("decision");
                         if(decision!=null) {
                             org.json.JSONArray candidates=decision.optJSONArray("candidate_descriptions");int selected=decision.optInt("action_index",-1);

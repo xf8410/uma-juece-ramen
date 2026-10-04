@@ -21,8 +21,14 @@ public final class EngineClient implements AutoCloseable {
     }
     public static final class Task extends LatestRequestQueue.Request {
         public final File input; public final boolean review;
+        public final String receiptId;
         public Task(long run, long sequence, String config, File input, boolean review) {
             super(run, sequence, UUID.randomUUID().toString(), config); this.input = input; this.review = review;
+            receiptId="";
+        }
+        public Task(SnapshotEnvelope snapshot,String config,File input,String receipt) {
+            super(snapshot.runId,snapshot.snapshotId,snapshot.schemaVersion,snapshot.collectorInstanceId,UUID.randomUUID().toString(),config);
+            this.input=input;review=false;receiptId=receipt;
         }
     }
     private final Context context; private final Listener listener; private final JSONObject options;
@@ -33,6 +39,9 @@ public final class EngineClient implements AutoCloseable {
     private final InitializationRetryBudget initialization=new InitializationRetryBudget();
     private Messenger remote; private ServiceConnection connection;
     private boolean bound, ready, closed; private int generation; private String engineVersion = "";
+    private String selectedInstance=SnapshotEnvelope.LEGACY_INSTANCE,acknowledgedInstance="";
+    private int selectedSchema=1;
+    private boolean selectingCollector;
     public EngineClient(Context context, JSONObject options, Listener listener) {
         this.context = context.getApplicationContext(); this.options = options; this.listener = listener;
     }
@@ -40,7 +49,23 @@ public final class EngineClient implements AutoCloseable {
     public void invalidate() {
         checkThread();
         Task task = queue.running(); if (task != null) listener.onDiscarded(task, "当前输入不能用于决策");
-        disconnect(); queue.clear();
+        disconnect(); queue.cancelTasks();
+    }
+    public boolean selectCollector(int schema,String instance) {
+        checkThread();Task previousPending=queue.pending();if(closed||!queue.confirmCollector(schema,instance))return false;
+        boolean changed=selectedSchema!=schema||!selectedInstance.equals(instance);
+        selectedSchema=schema;selectedInstance=instance;
+        if(changed) {
+            acknowledgedInstance="";
+            if(previousPending!=null)listener.onDiscarded(previousPending,"采集进程已切换");
+            Task running=queue.running();
+            if(running!=null) {
+                listener.onDiscarded(running,"采集进程已切换");
+                Bundle cancel=new Bundle();cancel.putString("request_id",running.requestId);send(EngineProtocol.CANCEL,cancel);
+                main.postDelayed(()->{if(!closed&&queue.running()==running)restart(false,"采集进程切换，旧任务已取消");},1000);
+            }
+        }
+        dispatch();return true;
     }
     public String configId() { return options.optString("config_id"); }
     public boolean submit(Task task) {
@@ -88,12 +113,19 @@ public final class EngineClient implements AutoCloseable {
             if (!configId().equals(body.getString("config_id"))) { failInitialization("初始化配置不一致"); return true; }
             engineVersion = body.getString("engine_version", ""); ready = true; listener.onStatus("本地引擎就绪"); dispatch(); return true;
         }
+        if(message.what==EngineProtocol.COLLECTOR_SELECTED) {
+            selectingCollector=false;
+            if(selectedSchema==body.getInt("schema_version")&&selectedInstance.equals(body.getString("collector_instance_id")))
+                acknowledgedInstance=selectedSchema+":"+selectedInstance;
+            dispatch();return true;
+        }
         Task task = queue.running();
         if (message.what == EngineProtocol.ERROR && body.getString("request_id", "").isEmpty()) {
             failInitialization(body.getString("error", "引擎初始化失败")); return true;
         }
         if (task == null || !task.requestId.equals(body.getString("request_id")) || task.runId != body.getLong("run_id")
-                || task.snapshotId != body.getLong("snapshot_id") || !task.configId.equals(body.getString("config_id"))
+                || task.snapshotId != body.getLong("snapshot_id") || task.schemaVersion!=body.getInt("schema_version",1)
+                || !task.collectorInstanceId.equals(body.getString("collector_instance_id",SnapshotEnvelope.LEGACY_INSTANCE))|| !task.configId.equals(body.getString("config_id"))
                 || !engineVersion.equals(body.getString("engine_version"))) return true;
         if (message.what == EngineProtocol.ERROR) {
             boolean current = queue.finish(task.requestId);
@@ -120,10 +152,19 @@ public final class EngineClient implements AutoCloseable {
     }
     private void dispatch() {
         if (closed || !ready) return;
+        if(queue.running()!=null)return;
+        if(!acknowledgedInstance.equals(selectedSchema+":"+selectedInstance)) {
+            if(selectingCollector)return;
+            selectingCollector=true;Bundle selection=new Bundle();selection.putInt("schema_version",selectedSchema);selection.putString("collector_instance_id",selectedInstance);
+            send(EngineProtocol.SELECT_COLLECTOR,selection);return;
+        }
         Task task = queue.startNext(); if (task == null) return;
         Bundle args = new Bundle(); args.putString("input", task.input.getAbsolutePath()); args.putString("request_id", task.requestId);
-        args.putString("config_id", task.configId); args.putString("options", options.toString());
+        args.putString("config_id", task.configId);
+        try { args.putString("options",new JSONObject(options.toString()).put("collector_instance_id",task.collectorInstanceId).toString()); }
+        catch(Exception error){queue.finish(task.requestId);listener.onFailure(task,"无法编码采集进程身份");return;}
         args.putLong("run_id", task.runId); args.putLong("snapshot_id", task.snapshotId);
+        args.putInt("schema_version",task.schemaVersion);args.putString("collector_instance_id",task.collectorInstanceId);
         send(task.review ? EngineProtocol.REVIEW : EngineProtocol.EVALUATE, args);
     }
     private void send(int what, Bundle args) {
@@ -139,7 +180,7 @@ public final class EngineClient implements AutoCloseable {
         if(crash&&!ready) { failInitialization("引擎初始化期间进程退出");return; }
         Task interrupted = queue.releaseRunning();
         if (interrupted != null && crash) {
-            String key = interrupted.runId + ":" + interrupted.snapshotId + ":" + interrupted.configId;
+            String key = interrupted.schemaVersion+":"+interrupted.collectorInstanceId+":"+interrupted.runId + ":" + interrupted.snapshotId + ":" + interrupted.configId;
             int count = crashes.containsKey(key) ? crashes.get(key) + 1 : 1; crashes.put(key, count);
             if (count < 2) queue.retry(interrupted);
             else if (queue.accepts(interrupted.requestId)) listener.onFailure(interrupted, "同一快照连续两次导致引擎退出，已停止自动重试");
@@ -159,7 +200,7 @@ public final class EngineClient implements AutoCloseable {
         listener.onFailure(task,error+"；初始化已失败两次，停止自动重试。请重新连接或修改配置");
     }
     private void disconnect() {
-        generation++; ready = false;
+        generation++; ready = false;acknowledgedInstance="";selectingCollector=false;
         if (remote != null) { try { remote.send(Message.obtain(null, EngineProtocol.SHUTDOWN)); } catch (RemoteException ignored) {} }
         if (bound && connection != null) context.unbindService(connection);
         bound = false; remote = null;

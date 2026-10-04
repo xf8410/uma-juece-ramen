@@ -15,6 +15,7 @@ public final class UmaNativeBridge {
     public static native String nativeInit(String dataDirectory, String optionsJson);
     public static native String nativeEvaluate(String snapshotPath, String optionsJson, String requestId, NativeEventListener listener);
     public static native void nativeCancel(String requestId);
+    public static native String nativeSelectCollectorInstance(String instance);
     public static native String nativeVersion();
     public static native String nativeReview(String runDirectory, String outputDirectory);
     private UmaNativeBridge() {}

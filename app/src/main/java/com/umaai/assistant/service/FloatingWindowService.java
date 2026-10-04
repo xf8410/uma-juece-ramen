@@ -29,7 +29,9 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
     private final ExecutorService io = Executors.newSingleThreadExecutor();
-    private final SnapshotOrderTracker inputOrder=new SnapshotOrderTracker();
+    private final CollectorConnection collector=new CollectorConnection();
+    private final IngressReceipts receipts=new IngressReceipts();
+    private final java.util.concurrent.atomic.AtomicBoolean probeScheduled=new java.util.concurrent.atomic.AtomicBoolean();
     private HttpDataService server;
     private EngineClient engine;
     private RunArchive archive;
@@ -39,7 +41,6 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private File latestFile;
     private JSONObject lastDecision;
     private volatile boolean destroyed, paused;
-    private volatile long lastPushAt;
     private volatile String status = "等待采集端连接";
     private String source = "";
     private WindowManager windows;
@@ -65,7 +66,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         try {
             JSONObject initialOptions = EngineSettings.read(this); createWindows();
             initializeEngine(initialOptions,0);
-            server = new HttpDataService(this, () -> status); server.startServer();
+            server = new HttpDataService(this,this::httpStatus); server.startServer();
             poller.scheduleWithFixedDelay(this::poll,0,2,TimeUnit.SECONDS);
         } catch (Exception error) { publish("启动失败：" + error.getMessage()); stopSelf(); }
     }
@@ -100,75 +101,105 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         getSharedPreferences("runtime_status",MODE_PRIVATE).edit().putBoolean("running",false).putString("status","已停止 · "+status).apply();
         super.onDestroy();
     }
-    @Override public void onDataReceived(String data) { lastPushAt=System.currentTimeMillis();consume(data,"实时推送"); }
-    private void consume(String data,String from) {
-        if(destroyed || data==null || data.length()>PrivateFiles.MAX_SNAPSHOT_BYTES) return;
-        io.execute(() -> {
+    @Override public JSONObject onDataReceived(String data) {
+        try {
+            JSONObject json=new JSONObject(data);int schema=json.optInt("schema_version",-1);
+            if(schema!=1&&schema!=2) {
+                JSONObject ack=receipts.receive(null,"legacy_summary_display_only");
+                consume(data,"旧版推送",ack.getString("receipt_id"));requestPoll();return ack;
+            }
+            SnapshotEnvelope snapshot;
+            try { snapshot=SnapshotEnvelope.parse(data); }
+            catch(Exception missing) {
+                JSONObject ack=schema==2&&json.has("run_id")&&json.isNull("run_id")
+                    ?receipts.receiveUnassigned(json,collector,android.os.SystemClock.elapsedRealtime(),options==null?"":options.optString("config_id"))
+                    :receipts.receive(null,SnapshotEnvelope.readinessProblem(json).isEmpty()?missing.getMessage():SnapshotEnvelope.readinessProblem(json));
+                consume(data,"不完整推送",ack.getString("receipt_id"));requestPoll();return ack;
+            }
+            String rejection=collector.rejection(snapshot,android.os.SystemClock.elapsedRealtime());
+            JSONObject ack=receipts.receive(snapshot,rejection,options==null?"":options.optString("config_id"));
+            if(rejection.isEmpty())consume(data,"实时推送",ack.getString("receipt_id"));
+            else requestPoll();
+            return ack;
+        }catch(Exception error) {
+            try{return receipts.receive(null,"invalid_json: "+error.getMessage());}
+            catch(Exception impossible){return new JSONObject();}
+        }
+    }
+    private JSONObject httpStatus() {
+        try {
+            return new JSONObject().put("message",status).put("paused",paused)
+                .put("collector",collector.status(android.os.SystemClock.elapsedRealtime())).put("ingress",receipts.status());
+        }catch(Exception error){return new JSONObject();}
+    }
+    private void consume(String data,String from,String receiptId) {
+        if(destroyed||data==null||data.length()>PrivateFiles.MAX_SNAPSHOT_BYTES)return;
+        io.execute(()-> {
             if(destroyed)return;
             try {
-                // Publication and consumption both happen on this IO queue. A new
-                // configuration is never visible before its provenance is registered.
                 final JSONObject captureOptions=options;
-                JSONObject json=new JSONObject(data);
-                if(json.optInt("schema_version",-1)!=1) {
-                    main.post(() -> {
-                        if(destroyed)return;
-                        latest=null; latestFile=null; lastDecision=null; source=from;
+                JSONObject json=new JSONObject(data);int schema=json.optInt("schema_version",-1);
+                if(schema!=1&&schema!=2) {
+                    main.post(()-> {
+                        if(destroyed||collector.schema()==2)return;
+                        latest=null;latestFile=null;lastDecision=null;source=from;
                         if(engine!=null)engine.invalidate();
-                        publish("旧版摘要仅供展示，请升级采集协议 V1");
-                        title.setText("拉面杯 · 旧版采集");
-                        stats.setText(legacySummary(json));
-                        recommendation.setText("尚无完整盘面，无法给出建议"); chart.clear();
-                    }); return;
+                        publish("旧版摘要仅供展示，等待支持的采集快照");
+                        title.setText("拉面杯 · 旧版采集");stats.setText(legacySummary(json));
+                        recommendation.setText("尚无完整盘面，无法给出建议");chart.clear();
+                    });return;
                 }
-                String readiness=SnapshotEnvelope.readinessProblem(json);
                 if(!SnapshotEnvelope.hasIdentity(json)) {
                     String digest=PrivateFiles.sha256(data.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                     PrivateFiles.write(new File(getFilesDir(),"unassigned-observations/"+digest+".json"),data);
+                    String missing=SnapshotEnvelope.readinessProblem(json);
+                    receipts.rejected(receiptId,missing.isEmpty()?"snapshot_identity_unavailable":missing);
+                    // Unknown or retired process data cannot clear a current decision.
+                    boolean trusted=schema==1?collector.schema()==1:
+                        SnapshotEnvelope.validCollectorInstance(json.optString("collector_instance_id"))&&json.optString("collector_instance_id").equals(collector.instance());
                     main.post(()-> {
-                        if(destroyed)return;
+                        if(destroyed||!trusted||schema!=collector.schema()
+                            ||(schema==2&&!json.optString("collector_instance_id").equals(collector.instance())))return;
                         if(engine!=null)engine.invalidate();latest=null;latestFile=null;lastDecision=null;source=from;
-                        publish(readiness.isEmpty()?"采集端尚未取得真实局与快照标识":readiness);
+                        publish(missing.isEmpty()?"等待真实局和完整盘面":missing);
                         title.setText("拉面杯 · 采集中");recommendation.setText(status);chart.clear();
-                        JSONObject display=json.optJSONObject("display_summary");stats.setText(display==null?"等待完整盘面":legacySummary(display));
-                        details.setText(status);
+                        JSONObject display=json.optJSONObject("display_summary");stats.setText(display==null?"等待完整盘面":legacySummary(display));details.setText(status);
                     });return;
                 }
                 SnapshotEnvelope snapshot=SnapshotEnvelope.parse(data);
+                String rejected=collector.accept(snapshot,android.os.SystemClock.elapsedRealtime());
+                if(!rejected.isEmpty()){receipts.rejected(receiptId,rejected);if(rejected.startsWith("collector_"))requestPoll();return;}
                 File file=archive.capture(snapshot,captureOptions);
-                main.post(() -> {
-                    if(destroyed)return;
-                    if(!inputOrder.observe(snapshot.runId,snapshot.snapshotId))return;
-                    if(latest!=null && latest.runId==snapshot.runId && snapshot.snapshotId<=latest.snapshotId)return;
-                    source=from;
-                    latest=snapshot; latestFile=file; lastDecision=null;
-                    // Queue also rejects a late message from a retired run.
-                    if(!snapshot.missingReason().isEmpty()) { if(engine!=null)engine.invalidate(); }
-                    else submit(snapshot,file);
-                    String missing=snapshot.missingReason();
-                    if(!missing.isEmpty())publish(missing);
+                String missing=snapshot.missingReason();
+                if(!missing.isEmpty())receipts.rejected(receiptId,missing);
+                main.post(()-> {
+                    if(destroyed||!collector.rejection(snapshot,android.os.SystemClock.elapsedRealtime()).isEmpty())return;
+                    if(latest!=null&&latest.sameIdentity(snapshot)){receipts.reuseOutcome(receiptId);return;}
+                    source=from;latest=snapshot;latestFile=file;lastDecision=null;
+                    if(!missing.isEmpty()){if(engine!=null)engine.invalidate();publish(missing);}
+                    else submit(snapshot,file,receiptId);
                     render();
                 });
-            } catch(Exception error) { main.post(() -> {
-                if(!destroyed) {
-                    if(engine!=null)engine.invalidate();latest=null;latestFile=null;lastDecision=null;
-                    publish("采集数据无法使用："+error.getMessage());render();
-                }
-            }); }
+            }catch(Exception error) {
+                receipts.rejected(receiptId,"snapshot_rejected: "+error.getMessage());
+                main.post(()->{if(!destroyed)publish("采集数据无法使用："+error.getMessage());});
+            }
         });
     }
-    private void submit(SnapshotEnvelope snapshot,File file) {
+    private void submit(SnapshotEnvelope snapshot,File file) { submit(snapshot,file,""); }
+    private void submit(SnapshotEnvelope snapshot,File file,String receiptId) {
         if(engine==null||paused||!snapshot.missingReason().isEmpty())return;
         final JSONObject configuration=options;
         io.execute(()-> {
             try {
                 archive.capture(snapshot,configuration);
                 main.post(()-> {
-                    if(destroyed||paused||engine==null||configuration!=options||latest==null
-                        ||latest.runId!=snapshot.runId||latest.snapshotId!=snapshot.snapshotId)return;
-                    engine.submit(new EngineClient.Task(snapshot.runId,snapshot.snapshotId,engine.configId(),file,false));
+                    if(destroyed||paused||engine==null||configuration!=options||latest==null||!latest.sameIdentity(snapshot)
+                        ||!collector.rejection(snapshot,android.os.SystemClock.elapsedRealtime()).isEmpty())return;
+                    if(!engine.selectCollector(snapshot.schemaVersion,snapshot.collectorInstanceId)){receipts.rejected(receiptId,"collector_instance_retired");return;}
+                    if(!engine.submit(new EngineClient.Task(snapshot,engine.configId(),file,receiptId)))receipts.reuseOutcome(receiptId);
                 });
-            }catch(Exception error){main.post(()->{if(!destroyed)publish("配置代记录失败："+error.getMessage());});}
+            }catch(Exception error){receipts.rejected(receiptId,error.getMessage());main.post(()->{if(!destroyed)publish("配置代记录失败："+error.getMessage());});}
         });
     }
     private void initializeEngine(JSONObject configuration,long delay) {
@@ -181,7 +212,9 @@ public final class FloatingWindowService extends Service implements HttpDataServ
                 options=configuration;
                 main.postDelayed(()-> {
                     if(destroyed||paused||configuration!=options||configuration!=requestedOptions)return;
-                    engine=new EngineClient(this,configuration,this);engine.start();
+                    engine=new EngineClient(this,configuration,this);
+                    if(collector.instance()!=null)engine.selectCollector(collector.schema(),collector.instance());
+                    engine.start();
                     if(latest!=null&&latestFile!=null)submit(latest,latestFile);
                 },delay);
             }catch(Exception error){main.post(()->{if(!destroyed)publish("版本信息无法登记："+error.getMessage());});}
@@ -205,30 +238,66 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         }catch(Exception error){android.util.Log.w("RamenArchive","版本来源尚未取得",error);}
         archive.registerConfiguration(configuration,versions);
     }
-    private void poll() {
-        if(destroyed||System.currentTimeMillis()-lastPushAt<5000)return;
-        String value=get("http://127.0.0.1:18765/api/ai/ramen/v1/snapshot");
-        if(value!=null)consume(value,"本机采集");
-        else {
-            String legacy=get("http://127.0.0.1:18765/summary");
-            if(legacy!=null)consume(legacy,"旧版采集");
-            else main.post(() -> {
-                if(!destroyed&&System.currentTimeMillis()-lastPushAt>=5000) {
-                    if(engine!=null)engine.invalidate();latest=null;latestFile=null;lastDecision=null;
-                    publish("采集连接中断；等待本机 18765 端口");render();
-                }
-            });
-        }
+    private void requestPoll() {
+        if(destroyed||!probeScheduled.compareAndSet(false,true))return;
+        try{poller.execute(()->{try{poll();}finally{probeScheduled.set(false);}});}
+        catch(RejectedExecutionException stopped){probeScheduled.set(false);}
     }
-    private static String get(String address) {
+    private void poll() {
+        if(destroyed)return;
+        HttpReply capability=get("http://127.0.0.1:18765/api/ai/ramen/capabilities");
+        if(capability.code==200) {
+            final JSONObject document;
+            try{document=new JSONObject(capability.body);}
+            catch(Exception invalid){unavailable("采集能力响应无法解析");return;}
+            try {
+                boolean changed=collector.confirm(document,android.os.SystemClock.elapsedRealtime());
+                if(changed)main.post(()-> {
+                    if(destroyed)return;
+                    latest=null;latestFile=null;lastDecision=null;
+                    if(engine!=null)engine.selectCollector(collector.schema(),collector.instance());
+                    publish("采集进程已确认，等待当前完整盘面");render();
+                });
+            }catch(Exception invalid){unavailable("采集握手被拒绝："+invalid.getMessage());return;}
+            HttpReply snapshot=get("http://127.0.0.1:18765/api/ai/ramen/v2/snapshot");
+            if(snapshot.code==200) {
+                try {
+                    if(!CollectorConnection.matchesPull(document,new JSONObject(snapshot.body))){unavailable("快照采集进程与本次握手不一致，等待重新确认");return;}
+                    consume(snapshot.body,"本机 V2 采集","");
+                }catch(Exception error){unavailable("V2 快照响应无效："+error.getMessage());}
+            }
+            else unavailable("V2 快照暂不可用（HTTP "+snapshot.code+"）");
+            return;
+        }
+        if(capability.code==404||capability.code==501) {
+            if(collector.schema()==2){unavailable("当前采集端未提供 V2 能力；保留旧进程屏障");return;}
+            collector.confirmLegacy(android.os.SystemClock.elapsedRealtime());
+            HttpReply snapshot=get("http://127.0.0.1:18765/api/ai/ramen/v1/snapshot");
+            if(snapshot.code==200){consume(snapshot.body,"本机 V1 采集","");return;}
+            HttpReply legacy=get("http://127.0.0.1:18765/summary");
+            if(legacy.code==200){consume(legacy.body,"旧版采集","");return;}
+        }
+        unavailable("采集连接中断，等待游戏和本机 18765 端口");
+    }
+    private void unavailable(String reason) {
+        main.post(()-> {
+            if(destroyed)return;
+            if(engine!=null)engine.invalidate();latest=null;latestFile=null;lastDecision=null;
+            publish(reason);render();
+        });
+    }
+    private static final class HttpReply {
+        final int code;final String body;
+        HttpReply(int code,String body){this.code=code;this.body=body;}
+    }
+    private static HttpReply get(String address) {
         HttpURLConnection connection=null;
         try {
-            connection=(HttpURLConnection)new URL(address).openConnection();
-            connection.setConnectTimeout(1000);connection.setReadTimeout(1500);
-            if(connection.getResponseCode()!=200)return null;
-            try(InputStream in=connection.getInputStream()) { return PrivateFiles.read(in,PrivateFiles.MAX_SNAPSHOT_BYTES); }
-        } catch(Exception error) { return null; }
-        finally { if(connection!=null)connection.disconnect(); }
+            connection=(HttpURLConnection)new URL(address).openConnection();connection.setConnectTimeout(1000);connection.setReadTimeout(1500);
+            int code=connection.getResponseCode();if(code!=200)return new HttpReply(code,"");
+            try(InputStream in=connection.getInputStream()){return new HttpReply(code,PrivateFiles.read(in,PrivateFiles.MAX_SNAPSHOT_BYTES));}
+        }catch(Exception error){return new HttpReply(0,"");}
+        finally{if(connection!=null)connection.disconnect();}
     }
     @Override public void onStatus(String message) { if(!destroyed)publish(message); }
     @Override public void onEvent(EngineClient.Task task,JSONObject event) {
@@ -236,24 +305,29 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         if(body==null)body=event;
         final JSONObject payload=body;
         record(() -> archive.event(task,payload,event.optInt("event_seq",0)));
+        if("started".equals(payload.optString("type")))receipts.outcome(task,"validated",null,false);
         if(!current(task))return;
         applyEvent(payload);render();
     }
     @Override public void onResult(EngineClient.Task task,JSONObject result) {
         record(() -> archive.result(task,result));
         if(!current(task))return;
-        if(result.has("ok")&&!result.optBoolean("ok")) { publish("计算失败："+result.optString("error"));lastDecision=null;render();return; }
+        if(result.has("ok")&&!result.optBoolean("ok")) { receipts.outcome(task,"rejected",result.optString("error"),false);publish("计算失败："+result.optString("error"));lastDecision=null;render();return; }
         JSONObject evaluation=result.optJSONObject("evaluation");
         if(evaluation==null)evaluation=result;
         JSONArray events=evaluation.optJSONArray("events");
         if(events!=null)for(int i=0;i<events.length();i++) { JSONObject event=events.optJSONObject(i);if(event!=null)applyEvent(event); }
+        receipts.outcome(task,"validated",null,lastDecision!=null);
         publish(lastDecision==null?"本阶段暂无可执行建议":"计算完成");render();
     }
     @Override public void onFailure(EngineClient.Task task,String error) {
+        if(task!=null)receipts.outcome(task,"rejected",error,false);
         if(task!=null)record(() -> archive.event(task,new JSONObject().put("type","failed").put("error",error)));
+        if(task!=null&&!current(task))return;
         lastDecision=null;publish(error);render();
     }
     @Override public void onDiscarded(EngineClient.Task task,String reason) {
+        receipts.outcome(task,"rejected",reason,false);
         record(() -> archive.event(task,new JSONObject().put("type","cancelled").put("reason",reason)));
     }
     private void applyEvent(JSONObject event) {
@@ -265,6 +339,8 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     }
     private boolean current(EngineClient.Task task) {
         return !destroyed&&!paused&&latest!=null&&latest.runId==task.runId&&latest.snapshotId==task.snapshotId
+            &&latest.schemaVersion==task.schemaVersion&&latest.collectorInstanceId.equals(task.collectorInstanceId)
+            &&task.collectorInstanceId.equals(collector.instance())&&task.schemaVersion==collector.schema()
             &&engine!=null&&engine.configId().equals(task.configId);
     }
     private interface DiskAction { void run() throws Exception; }

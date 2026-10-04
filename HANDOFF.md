@@ -1,4 +1,18 @@
-# 仓库作者交接报告：Android 拉面杯客户端
+# 历史交接报告：Android 拉面杯客户端（2026-09-29）
+
+> **恢复候选请先读 [docs/RECOVERY_HANDOFF.md](docs/RECOVERY_HANDOFF.md)。** 下文保留 2026-09-29 交接时的分支、远端 CI、旧 mirror 补丁和构建哈希，仅供追溯，不是 2026-10-04 恢复候选的安装或补丁指引。新候选基于 Android `d221cc1`、真正的 `hlpatch@fa2c820`、独立 SnapshotV2 和 179 文件公共引擎锁。**同路径 collector bundle 已更换为经过独立应用验证的 hlpatch 恢复候选；不能按下文的 `so-history-backup@721c086` 命令应用。** 新补丁基线、摘要及操作步骤以恢复交接文档为准。当前同路径 bundle 已同步 SO 已提交的 CI 修复 `2037c5f35d032eab76015536d2e9596f5aca7e6a`：102 个文件，补丁 SHA256 `795f98d8520be125810be823beddc58f6c52b8b52a4238a89d2d44429a5ab0c2`，已通过独立 Windows clone 的检查、应用和文件哈希验证。该提交只比 `6d0c1bf` 增加 6 行 CI 依赖预取。旧 `.3` SO／ZIP／manifest 仍来自 `6d0c1bf` 冻结树；新 CI 构建不能沿用其 `c400…` 指纹。旧包与日志全部保留，公共引擎锁未改。
+
+**2026-10-04 更新：** SO `3.28.2-recovery.2` 修正了旧 `/summary` 对回合语义的错误声明：拉面 `turn/year` 设为 `null`，保留 `raw_total_turn_num`、字段来源及 `raw_field_mapping=unverified`。旧拉面 heuristic 入口返回结构化 `unavailable`，直接调用也拒绝；没有引入新的回合公式或零分建议，非拉面公式保持原样。V2 的 `display_summary.turn_observation` 保留取证信息，但不把原始值导入 `state.baseGame.turn`，也不提高 `ready`。当前 V2 仍缺真实局号、完整阶段与 `state+continuation`，不能驱动真实整局决策。
+
+SO `3.28.2-recovery.3` 进一步修正发布锁边界：Publisher 由唯一采样 worker 持有，共享状态保存不可变 Arc；JSON 转换、深比较、字段检查、深复制和旧大对象最终析构在共享锁外进行，锁内整组交换快照、摘要与状态。进入 `booting` 时撤销当前采样的外发资格；恢复进入 `capturing` 后，在新采样完成前，HTTP、summary 和 push 不会重新暴露 boot 前的旧快照。`current()` 仅保留历史诊断用途。同内容采样仍保留编号、捕获时间和同一 Arc；ACK 仍绑定实际发送的快照。这是确定性宿主回归证实的实现缺口，不是对作者现场故障根因的认定，也没有补齐真实盘面或验证游戏安全采样边界。
+
+SO `.3` 聚焦 Release 验证为 SO bridge 13 项、portable observation 13 项通过。三项新增 bridge 回归在旧源码上均失败；线程本地分配/释放探针确认转换、读取深复制和两个指定旧缓冲区最终释放时可取得共享锁，通道阻塞测试确认 boot 恢复窗口不外发旧状态。新增 portable 回归确认相同发布复用 Arc、旧读者快照不变及迟到 ticket 拒绝。使用合成数据和宿主线程，没有运行游戏 Hook；未用耗时阈值代替锁边界证据。 `.3` 本轮统一检查为 14 项基础设施、19 个宿主测试入口及 13 项 portable 测试通过；bridge 内层 13 项不与包装入口重复相加。`.3` ARM64 完整 Release 构建通过，保留 107 项警告，不代表原生安全性验收。
+
+原 8 + 1 项 JNI 测试是直接 Rust 宿主调用。新增真实 JVM → JNI 验证：Windows x64、Temurin JDK 17.0.16+8，直接编译未修改的 `UmaNativeBridge.java`，再由 `java -Xcheck:jni` 加载该类和匹配当前 `9e15404+ca0286e64426` 引擎的宿主 DLL。13 项断言通过，收到 `started/decision/completed` 共 3 次真实 Java 回调；覆盖中文及空格路径、初始化、实例确认、缺失/不完整输入拒绝、提前取消、合成 MCTS 搜索与复盘版本拒绝。未出现 `-Xcheck:jni` 警告或 fatal 诊断。证据位于本地 ignored `.tools/jvm-jni-smoke-20261004/` 的 `README.txt`、`commands.jsonl`、`smoke.log`、`result.json`、`provenance.json`；此目录不代表已进入 Git 或已分发。仅使用合成状态和 MCTS（`onnx=false`），不代表 Android ART、ARM64、Binder、浮窗或真机验收。原 Java 类、引擎锁和 APK 哈希均未变化。
+
+仍需完成实际采集代码，而非只补配置：完整盘面生产与桥接、真实局号及续养字段来源、经过验证的游戏线程/生命周期安全观察边界均未完成。worker 的 IL2CPP attach 和自身读锁不证明盘面原子性。`verified_profiles()` 为空、typed native thunk 尚未实现，授权接线仍未提供实际 `BuildIdentity`；取得目标游戏、Unity、Hachimi 身份和原生 ABI 证据后，还需实现 thunk 与 identity plumbing，并由作者在设备上验证原调用及宿主 Hook 共存。
+
+以下继续保留历史交接正文。
 
 交接日期：2026-09-29。分支：`workbench/android-runtime-handoff-20260929`。
 
