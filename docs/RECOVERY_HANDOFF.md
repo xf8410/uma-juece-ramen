@@ -4,13 +4,13 @@
 
 恢复分支为 `workbench/ramen-recovery-20261004`，Android 起点是已合入 PR #27 的 `d221cc1c896c035c73a10da3baa085f10e9af8b5`。本页构建记录对应提交前冻结的工作树；分支提交、推送和远端 CI 状态以关联 PR 为准。其他维护者取得分支后，应核对源码锁并自行构建。
 
-提交边界说明：现有 `.gitattributes` 将两份 JSON 锁文件规范化为 LF。Git 中 `engine/source-lock.json` 的字节 SHA256 为 `fa0afa40f88f62b3bbbe84aa3c9b9afb825ca205983131975a1724c3771d1f7a`，`docs/handoff/collector-source-lock.json` 为 `4134ded561bb2ecc719e1467ee196becb8f7e19664cd7e76ff90003afc75070f`。下文及已有诊断包中的 APK／manifest／JVM 证据仍对应原 Windows 工作树的 CRLF 字节，不作为新 Git 提交产物的逐字节证明；JSON 内容、引擎补丁与采集补丁未因此改变。CI 或本地从本提交重新构建时必须重新生成 manifest 和 APK，不复制旧 manifest，也不放宽字节哈希校验。
+提交边界说明：现有 `.gitattributes` 将两份 JSON 锁文件规范化为 LF。Git 中 `engine/source-lock.json` 的字节 SHA256 仍为 `fa0afa40f88f62b3bbbe84aa3c9b9afb825ca205983131975a1724c3771d1f7a`；本次 `docs/handoff/collector-source-lock.json` 显式以 LF 保存，实际字节 SHA256 为 `516641458b39d43304363ccca12fd22c1d4131930709be64d2b4cd367f5921c9`。采集锁新增 `source_revision`，对应 SO 已提交的 CI 修复。已有诊断包中的 APK／manifest／JVM 证据仍对应提交前 Windows 工作树的 CRLF 字节；旧采集锁的 `36a50d0a…`（工作树）及 `4134ded5…`（首次 Git LF 规范化）仅属于该历史冻结材料。CI 或本地从新提交重新构建时必须重新生成 manifest 和产物，不复制旧 manifest，也不放宽字节哈希校验。公共引擎补丁与引擎锁内容未改变。
 
 SO `3.28.2-recovery.2` 修正了旧 `/summary` 对回合语义的错误声明：拉面 `turn/year` 设为 `null`，保留 `raw_total_turn_num`、字段来源及 `raw_field_mapping=unverified`。旧拉面 heuristic 入口返回结构化 `unavailable`，直接调用也拒绝；没有引入新的回合公式或零分建议，非拉面公式保持原样。V2 的 `display_summary.turn_observation` 保留取证信息，但不把原始值导入 `state.baseGame.turn`，也不提高 `ready`。当前 V2 仍缺真实局号、完整阶段与 `state+continuation`，不能驱动真实整局决策。
 
 SO `3.28.2-recovery.3` 进一步修正发布锁边界：Publisher 由唯一采样 worker 持有，共享状态保存不可变 Arc；JSON 转换、深比较、字段检查、深复制和旧大对象最终析构在共享锁外进行，锁内整组交换快照、摘要与状态。进入 `booting` 时撤销当前采样的外发资格；恢复进入 `capturing` 后，在新采样完成前，HTTP、summary 和 push 不会重新暴露 boot 前的旧快照。`current()` 仅保留历史诊断用途。同内容采样仍保留编号、捕获时间和同一 Arc；ACK 仍绑定实际发送的快照。这是确定性宿主回归证实的实现缺口，不是对作者现场故障根因的认定，也没有补齐真实盘面或验证游戏安全采样边界。
 
-**SO `.3` 构建与 collector bundle 已同步并独立验证。** 本页以下补丁、SO 和符号标识均对应 `3.28.2-recovery.3`。此前 `.2` 交接包、补丁副本和独立验证目录保留为历史，不与本候选混用。Android APK 与公共引擎锁未改变。
+**collector 已同步 SO 提交 `2037c5f` 并独立验证；旧 `.3` 本地产物保持冻结。** 新提交相对 `6d0c1bf` 仅增加 CI 中两个锁定 manifest 的依赖预取，共 6 行 workflow，未修改 SO 生产源码或版本。下文 `c400…` 指纹、SO／符号哈希与旧 `.3` ZIP 对应 `6d0c1bf` 所记录的冻结源码树，不是 `2037c5f` 新 CI 构建的身份；新 CI 产物须以对应提交的构建清单另行记录。此前交接包、补丁副本和独立验证目录均保留，Android APK 与公共引擎锁未重新构建或改写。
 
 本候选的来源必须分开核对：
 
@@ -18,9 +18,9 @@ SO `3.28.2-recovery.3` 进一步修正发布锁边界：Publisher 由唯一采�
 - SO：真正的 `xf8410/hlpatch` 恢复工作树以 `fa2c820f4847f4e7b377e846ade958e0be19e98d` 为起点。该仓 `recovery/baseline-source-lock.json` 固定 43 项输入，重放 v3.28.2 的实际生成链。历史原始输入中出现 `721c086`，不等于本候选使用旧 `so-history-backup` 交接仓。
 - 基线生成文本的规范 LF SHA256 为 `67f1cb0ef8d0319e4c9f7e3ea026d5938b7f7833d14304594111ac414e6e76c9`。它是生成源码的对应证据，不是现代工具链构建与历史发布 SO 逐字节相同的证明。设备上实际加载的 SO 必须另记 SHA256、Build ID 和对应构建清单。
 
-[collector.patch](handoff/collector.patch) 和 [collector-source-lock.json](handoff/collector-source-lock.json) 已按 `.3` 冻结的 hlpatch 恢复工作树生成，包含 102 个受影响文件。补丁 SHA256 为 `49a1f16b9cc5f6fd1f874fb121bda8e62e11c984be43122559ea525a7b0b1b52`，锁文件使用 schema 1，逐项记录原始基线 Git blob 哈希和规范 LF 的前后文件哈希。生成时使用临时 `GIT_INDEX_FILE`，SO 真实 index 前后字节哈希相同；旧 mirror 工作区及材料没有被改写。
+[collector.patch](handoff/collector.patch) 和 [collector-source-lock.json](handoff/collector-source-lock.json) 直接从 Git 提交树 `fa2c820f4847f4e7b377e846ade958e0be19e98d..2037c5f35d032eab76015536d2e9596f5aca7e6a` 生成，包含 102 个受影响文件。补丁 SHA256 为 `795f98d8520be125810be823beddc58f6c52b8b52a4238a89d2d44429a5ab0c2`；schema 1 锁文件的 `source_revision` 固定为 `2037c5f35d032eab76015536d2e9596f5aca7e6a`，逐项记录原始基线 Git blob 哈希和规范 LF 的前后文件哈希。现有应用工具兼容此新增元信息。相对上一份冻结 bundle，只有 `.github/workflows/recovery-candidate.yml` 的 after hash 改变；生成过程只读取提交树，未修改 SO 真实 index、旧 mirror 或已有产物。
 
-独立验证使用本地无 hardlink clone，明确启用普通 Windows `core.autocrlf=true`，检出 `fa2c820f4847f4e7b377e846ade958e0be19e98d` 后直接运行现有应用工具。`--check` 通过，`--apply` 后 102 个文件哈希全部匹配；没有私下预规范化检出目录。验证 clone 和日志保留在本地 ignored cache：`.tools/collector-bundle-recovery3.log` 与 `.tools/collector-final-20261003T202048788147Z/verification.json`，不属于已经推送的证明。使用其他来源 bundle 时仍应核对锁文件；旧 `so-history-backup/721c086` bundle 不能代替本候选。
+独立验证使用本地无 hardlink clone，明确启用普通 Windows `core.autocrlf=true`，检出 `fa2c820f4847f4e7b377e846ade958e0be19e98d` 后直接运行现有应用工具。`--check` 通过，`--apply` 后 102 个文件哈希全部匹配；没有私下预规范化检出目录。验证 clone 和日志保留在本地 ignored cache：`.tools/collector-bundle-ci2037c5f-verified.log` 与 `.tools/collector-commit-2037c5f-20261004T062350930893Z/verification.json`，不属于已经推送的证明。使用其他来源 bundle 时仍应核对锁文件；旧 `so-history-backup/721c086` bundle 不能代替本候选。
 
 从 Android 仓根目录应用到一个干净、独立的 hlpatch clone：
 
@@ -31,7 +31,7 @@ python scripts/apply_collector_handoff.py --checkout ../hlpatch-recovery-handoff
 python scripts/apply_collector_handoff.py --checkout ../hlpatch-recovery-handoff --apply
 ```
 
-不要在日常脏工作区应用。该工具不提交或推送，且拒绝错误基线、已有改动和哈希不符。随后按采集仓的恢复构建说明操作。SO `3.28.2-recovery.3` 构建输入指纹为 `c4001711dd8fba47aefd1f999aaf62cbf769c822afea286b8d56903751aa15a5`，候选 SO SHA256 为 `f4de9af7745c625acce0a15ee2395403c9c84d25f99b3b27b62b835677f8b5cc`，Build ID 为 `9f02c12b3a649322cf5f393c38b4449497711801`。部署前仍须对照同目录的构建清单、符号文件和实际装载文件，不能只看版本字符串。
+不要在日常脏工作区应用。该工具不提交或推送，且拒绝错误基线、已有改动和哈希不符。随后按采集仓的恢复构建说明操作。旧本地 SO `3.28.2-recovery.3`（`6d0c1bf` 冻结树）的构建输入指纹为 `c4001711dd8fba47aefd1f999aaf62cbf769c822afea286b8d56903751aa15a5`，候选 SO SHA256 为 `f4de9af7745c625acce0a15ee2395403c9c84d25f99b3b27b62b835677f8b5cc`，Build ID 为 `9f02c12b3a649322cf5f393c38b4449497711801`。部署前仍须对照同目录的构建清单、符号文件和实际装载文件，不能只看版本字符串。
 
 新版流程先读取 `/api/ai/ramen/capabilities`，再确认 `collector_instance_id` 并读取 `/api/ai/ramen/v2/snapshot`。V2 的身份为 `(run_id, collector_instance_id, snapshot_id)`：游戏进程重启产生新实例；对于已获得完整真实局标识的 V2 输入，继续同一育成时必须保留真实局号。**当前 legacy 适配的 `run_id` 仍为 null，不能据此宣称已实现真实局号采集。** 只有完成新实例握手，才能接受从 1 开始的序号。旧实例回调不能重新激活。V1 仍兼容原序号语义，不把低序号猜成重启。
 
@@ -54,9 +54,9 @@ Android 保留每次实例的原始 envelope，标准状态文件与 CSV 使用�
 
 新增真实 JVM → JNI 验证：Windows x64、Temurin JDK 17.0.16+8，直接编译未修改的 `UmaNativeBridge.java`，再由 `java -Xcheck:jni` 加载该类和匹配当前 `9e15404+ca0286e64426` 引擎的宿主 DLL。13 项断言通过，收到 `started/decision/completed` 共 3 次真实 Java 回调；覆盖中文及空格路径、初始化、实例确认、缺失/不完整输入拒绝、提前取消、合成 MCTS 搜索与复盘版本拒绝。未出现 `-Xcheck:jni` 警告或 fatal 诊断。证据位于本地 ignored `.tools/jvm-jni-smoke-20261004/` 的 `README.txt`、`commands.jsonl`、`smoke.log`、`result.json`、`provenance.json`；此目录不代表已进入 Git 或已分发。仅使用合成状态和 MCTS（`onnx=false`），不代表 Android ART、ARM64、Binder、浮窗或真机验收。原 Java 类、引擎锁和 APK 哈希均未变化。
 
-最终开发产物位于 `app/build/outputs/apk/debug/app-debug.apk`，大小 28,513,923 字节，SHA256 为 `94ec61fea906751831d3dd5d3c724b66f5ecb42cb4d666b91e5f35dbd9d8a121`。包内 ARM64 `libuma_jni.so` SHA256 为 `7a80874d640f1e8a118edb3436e813256c7beb5a4cf1546c85524c1962533062`；引擎锁文件 SHA256 为 `50281bfc1558cd49d3d43f055558a5486e3c6ee4b08aa2f900913942ff1657e1`。clean 重打包清除了旧增量包中未被 ZIP 条目引用的空洞，898 个条目的解压字节保持一致；旧 `f25b2a84…` 包仅保留为中间历史。当前 APK 仍是未提交工作树的本地产物；后续源码或锁改变后必须重新构建并重新记录摘要，不能沿用旧 APK 的证明。
+最终开发产物位于 `app/build/outputs/apk/debug/app-debug.apk`，大小 28,513,923 字节，SHA256 为 `94ec61fea906751831d3dd5d3c724b66f5ecb42cb4d666b91e5f35dbd9d8a121`。包内 ARM64 `libuma_jni.so` SHA256 为 `7a80874d640f1e8a118edb3436e813256c7beb5a4cf1546c85524c1962533062`；引擎锁文件 SHA256 为 `50281bfc1558cd49d3d43f055558a5486e3c6ee4b08aa2f900913942ff1657e1`。clean 重打包清除了旧增量包中未被 ZIP 条目引用的空洞，898 个条目的解压字节保持一致；旧 `f25b2a84…` 包仅保留为中间历史。所列 APK 来自提交前冻结工作树；后续源码或锁改变后必须重新构建并重新记录摘要，不能沿用旧 APK 的证明。
 
-`.3` 配套 stripped SO 为 5,143,320 字节；符号 SO 为 54,866,616 字节，SHA256 为 `abf788ff3d1d03121bd57246f2636e0c9552c4cbc41da4f2fb800bcfcd5f6bc6`。二者的 Build ID 都是 `9f02c12b3a649322cf5f393c38b4449497711801`，必须配套保留，不能使用此前中间候选的符号解析当前崩溃。
+旧本地 `.3`（`6d0c1bf` 冻结树）配套 stripped SO 为 5,143,320 字节；符号 SO 为 54,866,616 字节，SHA256 为 `abf788ff3d1d03121bd57246f2636e0c9552c4cbc41da4f2fb800bcfcd5f6bc6`。二者的 Build ID 都是 `9f02c12b3a649322cf5f393c38b4449497711801`，必须配套保留，不能使用此前中间候选的符号解析当前崩溃。
 
 复现时使用 [toolchains.json](../toolchains.json) 的固定版本：Rust 1.97.1、cargo-ndk 4.1.2、JDK 17.0.16+8、NDK 28.2.13676358、Gradle 8.11.1、AGP 8.9.2、SDK 34、Build-Tools 35.0.0。Windows 宿主测试需要正确的 MSVC 子进程环境。仅在当前命令进程设置 JDK/SDK 和已安装 cargo-ndk 的 PATH，不修改系统配置。
 

@@ -425,10 +425,10 @@ index 79c0f8d47aa77258a38a745d21bc9f4536948bc8..0627535d883d0731ed2023ca083069f4
        - uses: actions/checkout@v4
 diff --git a/.github/workflows/recovery-candidate.yml b/.github/workflows/recovery-candidate.yml
 new file mode 100644
-index 0000000000000000000000000000000000000000..7daddaf238ad17d50ec4ea265c5c85f59d709b47
+index 0000000000000000000000000000000000000000..267a7083805a03410b86587501cffb08cd1ba361
 --- /dev/null
 +++ b/.github/workflows/recovery-candidate.yml
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,62 @@
 +name: Recovery candidate and pinned source baseline
 +
 +on:
@@ -465,6 +465,12 @@ index 0000000000000000000000000000000000000000..7daddaf238ad17d50ec4ea265c5c85f5
 +          rustup toolchain install 1.97.1 --profile minimal --target aarch64-linux-android
 +          cargo +1.97.1 install cargo-ndk --version 4.1.2 --locked
 +          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;28.2.13676358"
++      - name: Fetch locked dependencies before offline production harnesses
++        shell: bash
++        run: |
++          set -euo pipefail
++          cargo +1.97.1 fetch --locked --manifest-path hachimi_ura_plugin/Cargo.toml
++          cargo +1.97.1 fetch --locked --manifest-path ramen_observation/Cargo.toml
 +      - name: Check provenance, production policies and portable contracts
 +        run: python scripts/recovery/run_checks.py
 +      - name: Build direct candidate or isolated historical baseline

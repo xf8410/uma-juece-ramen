@@ -1,6 +1,6 @@
 # 历史交接报告：Android 拉面杯客户端（2026-09-29）
 
-> **恢复候选请先读 [docs/RECOVERY_HANDOFF.md](docs/RECOVERY_HANDOFF.md)。** 下文保留 2026-09-29 交接时的分支、远端 CI、旧 mirror 补丁和构建哈希，仅供追溯，不是 2026-10-04 恢复候选的安装或补丁指引。新候选基于 Android `d221cc1`、真正的 `hlpatch@fa2c820`、独立 SnapshotV2 和 179 文件公共引擎锁。**同路径 collector bundle 已更换为经过独立应用验证的 hlpatch 恢复候选；不能按下文的 `so-history-backup@721c086` 命令应用。** 新补丁基线、摘要及操作步骤以恢复交接文档为准。当前同路径 bundle 已同步 `.3`：102 个文件，补丁 SHA256 `49a1f16b9cc5f6fd1f874fb121bda8e62e11c984be43122559ea525a7b0b1b52`，已通过独立 Windows clone 的检查、应用和文件哈希验证。此前 `.1`、`.2` 包与日志保留为历史。
+> **恢复候选请先读 [docs/RECOVERY_HANDOFF.md](docs/RECOVERY_HANDOFF.md)。** 下文保留 2026-09-29 交接时的分支、远端 CI、旧 mirror 补丁和构建哈希，仅供追溯，不是 2026-10-04 恢复候选的安装或补丁指引。新候选基于 Android `d221cc1`、真正的 `hlpatch@fa2c820`、独立 SnapshotV2 和 179 文件公共引擎锁。**同路径 collector bundle 已更换为经过独立应用验证的 hlpatch 恢复候选；不能按下文的 `so-history-backup@721c086` 命令应用。** 新补丁基线、摘要及操作步骤以恢复交接文档为准。当前同路径 bundle 已同步 SO 已提交的 CI 修复 `2037c5f35d032eab76015536d2e9596f5aca7e6a`：102 个文件，补丁 SHA256 `795f98d8520be125810be823beddc58f6c52b8b52a4238a89d2d44429a5ab0c2`，已通过独立 Windows clone 的检查、应用和文件哈希验证。该提交只比 `6d0c1bf` 增加 6 行 CI 依赖预取。旧 `.3` SO／ZIP／manifest 仍来自 `6d0c1bf` 冻结树；新 CI 构建不能沿用其 `c400…` 指纹。旧包与日志全部保留，公共引擎锁未改。
 
 **2026-10-04 更新：** SO `3.28.2-recovery.2` 修正了旧 `/summary` 对回合语义的错误声明：拉面 `turn/year` 设为 `null`，保留 `raw_total_turn_num`、字段来源及 `raw_field_mapping=unverified`。旧拉面 heuristic 入口返回结构化 `unavailable`，直接调用也拒绝；没有引入新的回合公式或零分建议，非拉面公式保持原样。V2 的 `display_summary.turn_observation` 保留取证信息，但不把原始值导入 `state.baseGame.turn`，也不提高 `ready`。当前 V2 仍缺真实局号、完整阶段与 `state+continuation`，不能驱动真实整局决策。
 

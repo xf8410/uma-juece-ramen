@@ -38,9 +38,9 @@ SO `3.28.2-recovery.3` 进一步修正发布锁边界：Publisher 由唯一采�
 4. **正式签名和发布未执行。** 开发包使用 `.dev` 后缀。不得卸载旧应用来绕过签名或数据迁移问题。
 5. **原生 ABI 尚未获得目标游戏证据。** 采集端 `verified_profiles()` 当前为空；涉及托管方法的 Hook 默认拒绝安装并返回 `unsupported_native_abi`。新候选是诊断和恢复机制交付，不代表完整嗅探已恢复。仍需完成实际采集代码，而非只补配置：完整盘面生产与桥接、真实局号及续养字段来源、经过验证的游戏线程/生命周期安全观察边界均未完成。worker 的 IL2CPP attach 和自身读锁不证明盘面原子性。`verified_profiles()` 为空、typed native thunk 尚未实现，授权接线仍未提供实际 `BuildIdentity`；取得目标游戏、Unity、Hachimi 身份和原生 ABI 证据后，还需实现 thunk 与 identity plumbing，并由作者在设备上验证原调用及宿主 Hook 共存。
 
-**SO `.3` 构建与 collector bundle 已同步并独立验证。** 以下补丁及配套产物包含锁边界和 boot 屏障修复；此前 `.2` 包、补丁副本与验证目录保留为历史，不与 `.3` 混用。
+**collector 已同步 SO 提交 `2037c5f` 的 CI 修复并独立验证。** 相对 `6d0c1bf`，该提交仅增加两个锁定 manifest 的依赖预取，共 6 行 workflow。SO 生产源码和版本未变，但新 CI 构建输入不是旧 `c400…` 指纹；旧 `.3` SO、符号、ZIP 和 build manifest 仍对应 `6d0c1bf` 冻结树，全部保留，新 CI 产物另行记录。
 
-采集配套补丁已按真正的 `hlpatch@fa2c820f4847f4e7b377e846ade958e0be19e98d` 重新生成：102 个受影响文件，补丁 SHA256 `49a1f16b9cc5f6fd1f874fb121bda8e62e11c984be43122559ea525a7b0b1b52`。在启用 `core.autocrlf=true` 的独立 Windows clone 中通过现有工具的 `--check`、`--apply` 及逐文件哈希验证，未改 SO 真实 index。恢复构建直接使用受检源码，不在构建阶段运行旧累计生成器；不能用旧 mirror 的 `721c086` 应用命令安装这个新 bundle。最终候选 SO 的哈希及来源以配套构建清单为准。
+采集配套补丁从真正的 `hlpatch@fa2c820f4847f4e7b377e846ade958e0be19e98d` 到提交 `2037c5f35d032eab76015536d2e9596f5aca7e6a` 生成，schema 1 锁以 LF 保存并记录 `source_revision`：102 个受影响文件，补丁 SHA256 `795f98d8520be125810be823beddc58f6c52b8b52a4238a89d2d44429a5ab0c2`。在启用 `core.autocrlf=true` 的独立 Windows clone 中通过现有工具的 `--check`、`--apply` 及逐文件哈希验证，未改 SO 真实 index。恢复构建直接使用受检源码，不在构建阶段运行旧累计生成器；不能用旧 mirror 的 `721c086` 应用命令安装这个新 bundle。最终候选 SO 的哈希及来源以配套构建清单为准。
 
 ## 恢复候选的已执行验证
 
@@ -49,7 +49,7 @@ SO `3.28.2-recovery.3` 进一步修正发布锁边界：Publisher 由唯一采�
 - SO `.3` 聚焦 Release 验证为 SO bridge 13 项、portable observation 13 项通过。三项新增 bridge 回归在旧源码上均失败；线程本地分配/释放探针确认转换、读取深复制和两个指定旧缓冲区最终释放时可取得共享锁，通道阻塞测试确认 boot 恢复窗口不外发旧状态。新增 portable 回归确认相同发布复用 Arc、旧读者快照不变及迟到 ticket 拒绝。使用合成数据和宿主线程，没有运行游戏 Hook；未用耗时阈值代替锁边界证据。
 - SO `.3` 的 `run_checks` 通过 14 项基础设施测试、19 个生产函数／模块宿主测试入口和 13 项 portable 测试，包含 summary/heuristic、锁边界和 boot 屏障回归。bridge 的 13 项内层测试已包含在对应宿主入口中，不重复相加。SO `.3` ARM64 完整 Release 构建通过；保留 107 项编译警告，限制见配套构建日志，不能当作原生安全性验收。
 - 严格 ARM64 JNI 与 APK 构建通过，1 个 ELF、8 份数据及 ELF/ZIP 16 KB 对齐和源码对应关系校验通过。最终清理 App 构建输出后重新运行严格构建，Java 单元测试实际执行 78 项、0 失败。此前增量构建复用缓存的记录属于中间验证。
-- 最终本地开发 APK 为 28,513,923 字节，SHA256：`94ec61fea906751831d3dd5d3c724b66f5ecb42cb4d666b91e5f35dbd9d8a121`。这是当前未提交恢复工作树的产物；不是远端发布或作者已经安装的证明。
+- 最终本地开发 APK 为 28,513,923 字节，SHA256：`94ec61fea906751831d3dd5d3c724b66f5ecb42cb4d666b91e5f35dbd9d8a121`。这是提交前冻结恢复工作树的产物；不是远端发布或作者已经安装的证明。
 
 新增真实 JVM → JNI 验证：Windows x64、Temurin JDK 17.0.16+8，直接编译未修改的 `UmaNativeBridge.java`，再由 `java -Xcheck:jni` 加载该类和匹配当前 `9e15404+ca0286e64426` 引擎的宿主 DLL。13 项断言通过，收到 `started/decision/completed` 共 3 次真实 Java 回调；覆盖中文及空格路径、初始化、实例确认、缺失/不完整输入拒绝、提前取消、合成 MCTS 搜索与复盘版本拒绝。未出现 `-Xcheck:jni` 警告或 fatal 诊断。证据位于本地 ignored `.tools/jvm-jni-smoke-20261004/` 的 `README.txt`、`commands.jsonl`、`smoke.log`、`result.json`、`provenance.json`；此目录不代表已进入 Git 或已分发。仅使用合成状态和 MCTS（`onnx=false`），不代表 Android ART、ARM64、Binder、浮窗或真机验收。原 Java 类、引擎锁和 APK 哈希均未变化。
 

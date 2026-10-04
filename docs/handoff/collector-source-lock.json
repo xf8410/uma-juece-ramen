@@ -2,8 +2,9 @@
   "schema_version": 1,
   "repository": "https://github.com/xf8410/hlpatch.git",
   "baseline_revision": "fa2c820f4847f4e7b377e846ade958e0be19e98d",
-  "patch_sha256": "49a1f16b9cc5f6fd1f874fb121bda8e62e11c984be43122559ea525a7b0b1b52",
-  "patch_format": "git diff --cached --binary --full-index --no-renames from raw baseline blobs using an isolated GIT_INDEX_FILE",
+  "source_revision": "2037c5f35d032eab76015536d2e9596f5aca7e6a",
+  "patch_sha256": "795f98d8520be125810be823beddc58f6c52b8b52a4238a89d2d44429a5ab0c2",
+  "patch_format": "git diff --binary --full-index --no-renames --no-ext-diff baseline_revision source_revision from committed Git trees",
   "hash_encoding": "SHA256 of UTF-8 bytes with CRLF normalized to LF; raw Git baseline hash recorded separately",
   "source_replay_lock": "recovery/baseline-source-lock.json",
   "affected_files": {
@@ -221,7 +222,7 @@
       "change": "added",
       "before_sha256_lf": null,
       "before_git_blob_sha256": null,
-      "after_sha256_lf": "6cfe0ab66b92665fbf059f14abae748a95bf02390a559c2e24e1f825ac2a9308"
+      "after_sha256_lf": "4b4a91eea5ea29582cae0324b6050a15c54b68495124f713922121f7bc358be0"
     },
     ".github/workflows/release-ura.yml": {
       "change": "modified",
