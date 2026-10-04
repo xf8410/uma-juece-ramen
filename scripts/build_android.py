@@ -94,7 +94,8 @@ def main() -> None:
     shutil.copyfile(library, destination)
     package_data(lock)
     assets = ROOT / "app/src/main/assets"
-    manifest = {"schema_version": 1, "protocol_version": 1,
+    manifest = {"schema_version": 1, "protocol_version": 2,
+                "supported_snapshot_schema_versions": [1, 2],
                 "android_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                 "android_source_fingerprint": build_source_fingerprint,
                 "engine_revision": f"{lock['base_revision']}+{lock['patch_sha256'][:12]}",

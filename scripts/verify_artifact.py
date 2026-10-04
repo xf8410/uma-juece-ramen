@@ -59,6 +59,14 @@ def source_fingerprint() -> str:
     return sha(json.dumps(files, sort_keys=True, separators=(",", ":")).encode())
 
 
+def verify_protocol_manifest(manifest: dict) -> None:
+    # Manifest format and snapshot protocol versions are separate contracts.
+    if manifest.get("schema_version") != 1:
+        raise ValueError("Unsupported build manifest format")
+    if manifest.get("protocol_version") != 2 or manifest.get("supported_snapshot_schema_versions") != [1, 2]:
+        raise ValueError("Build manifest must declare V2 snapshots and V1 compatibility")
+
+
 def verify_inputs(abi: str = "arm64-v8a") -> dict:
     assets = ROOT / "app/src/main/assets"
     data_manifest = json.loads((assets / "gamedata/manifest.json").read_text(encoding="utf-8"))
@@ -73,6 +81,7 @@ def verify_inputs(abi: str = "arm64-v8a") -> dict:
         if checksum != lock["files"][f"gamedata/{name}"]:
             raise ValueError(f"Gamedata differs from the locked engine: {name}")
     manifest = json.loads((assets / "build-manifest.json").read_text(encoding="utf-8"))
+    verify_protocol_manifest(manifest)
     if manifest["abi"] != abi:
         raise ValueError(f"Build manifest ABI {manifest['abi']} does not match requested {abi}")
     if manifest["android_source_fingerprint"] != source_fingerprint():

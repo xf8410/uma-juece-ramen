@@ -16,6 +16,8 @@ public final class EngineService extends Service {
     private final Messenger inbox = new Messenger(new Handler(Looper.getMainLooper(), this::receive));
     private volatile String activeRequest = "", configId = "", engineVersion = "";
     private volatile boolean ready, initializing;
+    private volatile String collectorInstance=SnapshotEnvelope.LEGACY_INSTANCE;
+    private volatile int collectorSchema=1;
     @Override public IBinder onBind(Intent intent) { return inbox.getBinder(); }
     private boolean receive(Message message) {
         Bundle args = message.getData(); Messenger destination = message.replyTo;
@@ -51,10 +53,27 @@ public final class EngineService extends Service {
             });
             return true;
         }
+        if(message.what==EngineProtocol.SELECT_COLLECTOR) {
+            String instance=args.getString("collector_instance_id","");int schema=args.getInt("schema_version",-1);
+            if(!ready||!activeRequest.isEmpty()) { sendError(destination,args,"引擎尚未空闲，无法切换采集进程");return true; }
+            if((schema!=1&&schema!=2)||(schema==2&&!SnapshotEnvelope.validCollectorInstance(instance))
+                ||(schema==1&&!SnapshotEnvelope.LEGACY_INSTANCE.equals(instance))) {sendError(destination,args,"无效采集进程身份");return true;}
+            worker.execute(()-> {
+                try {
+                    JSONObject result=new JSONObject(UmaNativeBridge.nativeSelectCollectorInstance(instance));
+                    if(!result.optBoolean("ok"))throw new IllegalStateException(result.optString("error","采集进程切换失败"));
+                    collectorInstance=instance;collectorSchema=schema;
+                    Bundle reply=new Bundle();reply.putString("collector_instance_id",instance);reply.putInt("schema_version",schema);
+                    send(destination,EngineProtocol.COLLECTOR_SELECTED,reply);
+                }catch(Throwable error){sendError(destination,args,detail(error));}
+            });return true;
+        }
         if (message.what != EngineProtocol.EVALUATE && message.what != EngineProtocol.REVIEW) return false;
         if (!ready) { sendError(destination, args, "引擎尚未就绪"); return true; }
         if (!activeRequest.isEmpty()) { sendError(destination, args, "已有计算任务"); return true; }
         if (!configId.equals(args.getString("config_id"))) { sendError(destination, args, "引擎配置已变化，请重启计算"); return true; }
+        if(message.what==EngineProtocol.EVALUATE&&(collectorSchema!=args.getInt("schema_version",1)
+            ||!collectorInstance.equals(args.getString("collector_instance_id",SnapshotEnvelope.LEGACY_INSTANCE)))) {sendError(destination,args,"采集进程未握手或已切换");return true;}
         String request = args.getString("request_id", "");
         if (!request.matches("[a-zA-Z0-9-]{1,100}")) { sendError(destination, args, "无效请求标识"); return true; }
         activeRequest = request;
@@ -83,7 +102,9 @@ public final class EngineService extends Service {
         Bundle response = new Bundle();
         response.putString("request_id", request.getString("request_id", "")); response.putString("config_id", configId);
         response.putString("engine_version", engineVersion); response.putLong("run_id", request.getLong("run_id"));
-        response.putLong("snapshot_id", request.getLong("snapshot_id")); return response;
+        response.putLong("snapshot_id", request.getLong("snapshot_id"));
+        response.putInt("schema_version",request.getInt("schema_version",1));
+        response.putString("collector_instance_id",request.getString("collector_instance_id",SnapshotEnvelope.LEGACY_INSTANCE));return response;
     }
     private void sendError(Messenger destination, Bundle request, String error) {
         Bundle response = responseIdentity(request); response.putString("error", error); send(destination, EngineProtocol.ERROR, response);

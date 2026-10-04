@@ -23,6 +23,23 @@ def elf(alignment=16384, machine=183):
     return bytes(content)
 
 
+class ProtocolManifestTests(unittest.TestCase):
+    def test_snapshot_protocol_is_separate_from_manifest_format(self):
+        verify.verify_protocol_manifest({"schema_version": 1, "protocol_version": 2,
+                                         "supported_snapshot_schema_versions": [1, 2]})
+
+    def test_rejects_missing_or_stale_snapshot_protocol(self):
+        for fields in ({}, {"protocol_version": 1},
+                       {"protocol_version": 2, "supported_snapshot_schema_versions": [1]}):
+            with self.subTest(fields=fields), self.assertRaisesRegex(ValueError, "V2 snapshots"):
+                verify.verify_protocol_manifest({"schema_version": 1, **fields})
+
+    def test_rejects_confusing_snapshot_version_with_manifest_format(self):
+        with self.assertRaisesRegex(ValueError, "manifest format"):
+            verify.verify_protocol_manifest({"schema_version": 2, "protocol_version": 2,
+                                             "supported_snapshot_schema_versions": [1, 2]})
+
+
 class NativeGateTests(unittest.TestCase):
     def test_valid_arm64_16kb(self):
         verify.check_elf(elf(), "arm64-v8a", "valid.so")

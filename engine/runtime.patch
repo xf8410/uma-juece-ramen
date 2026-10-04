@@ -598,7 +598,7 @@ index a39db17..e35e0ef 100644
  /// 数值 → CSV 列（`None`/NaN/Inf → 空串；f64 保留两位小数）
  pub fn num_col(v: Option<f64>) -> String {
 diff --git a/crates/umaai/src/main.rs b/crates/umaai/src/main.rs
-index 50be5f4..2b4b02b 100644
+index 50be5f4..cf29626 100644
 --- a/crates/umaai/src/main.rs
 +++ b/crates/umaai/src/main.rs
 @@ -15,7 +15,8 @@ use anyhow::Result;
@@ -607,11 +607,11 @@ index 50be5f4..2b4b02b 100644
  use log::info;
 -use rand::{SeedableRng, rngs::StdRng};
 +use rand::{RngCore, SeedableRng, rngs::StdRng};
-+use umaai_runtime::{CancellationToken, RamenSession, RamenSnapshotV1, RuntimeEvent};
++use umaai_runtime::{CancellationToken, RamenSession, SnapshotEnvelope, RuntimeEvent};
  use serde::Serialize;
  use text_to_ascii_art::to_art;
  use umasim::{
-@@ -252,11 +253,40 @@ async fn main_guard() -> Result<()> {
+@@ -252,11 +253,56 @@ async fn main_guard() -> Result<()> {
  
      // watch 循环包进闭包：无论是正常退出还是出错返回，都要收尾当前局
      // （meta.json 结束时间 / end_reason），避免 Ctrl-C 丢局尾数据行。
@@ -619,16 +619,32 @@ index 50be5f4..2b4b02b 100644
      let watch_result: Result<()> = (|| {
          loop {
              let contents = watcher.watch("thisTurn.json")?;
++            // Transport-confirmed process selection is an explicit control message, never a sequence heuristic.
++            if let Ok(control) = serde_json::from_str::<serde_json::Value>(&contents) {
++                if control["control"] == "select_collector_instance" {
++                    let result: Result<()> = (|| {
++                        let instance = control["collector_instance_id"].as_str().ok_or_else(|| anyhow::anyhow!("collector_instance_id missing"))?;
++                        if strict_session.is_none() { strict_session = Some(RamenSession::new(game_config.clone())?); }
++                        strict_session.as_mut().ok_or_else(|| anyhow::anyhow!("session construction failed"))?.select_collector_instance(instance)
++                    })();
++                    match result { Ok(()) => emit_info("collector_selected"), Err(error) => emit_error(&format!("collector control: {error:#}")) }
++                    continue;
++                }
++            }
              // 收到一份新 JSON：通知 AIRed "开始计算本回合"
              emit_info("compute_start");
 +            // Versioned snapshots share exactly the native session, including event/super-ramen stages.
 +            if serde_json::from_str::<serde_json::Value>(&contents).ok().is_some_and(|v| v.get("schema_version").is_some()) {
 +                let result: Result<()> = (|| {
-+                    let snapshot = RamenSnapshotV1::parse(&contents)?;
++                    let envelope = SnapshotEnvelope::parse(&contents)?;
++                    let snapshot = envelope.snapshot();
 +                    if strict_session.is_none() { strict_session = Some(RamenSession::new(game_config.clone())?); }
 +                    let mut state_json = serde_json::to_value(&snapshot.state)?;
 +                    state_json["runtime_stage"] = snapshot.stage.clone().into();
 +                    state_json["runtime_continuation"] = serde_json::to_value(&snapshot.continuation)?;
++                    state_json["runtime_schema_version"] = envelope.schema_version().into();
++                    state_json["runtime_collector_instance_id"] = envelope.collector_instance_id().into();
++                    state_json["runtime_snapshot_id"] = snapshot.snapshot_id.into();
 +                    let raw_state = serde_json::to_string(&state_json)?;
 +                    record::on_snapshot(&record::SnapMeta::normal(snapshot.run_id, snapshot.state.base_game.turn as u32, snapshot.stage.clone()).with_max_turn(78), &raw_state);
 +                    let session = strict_session.as_mut().ok_or_else(|| anyhow::anyhow!("session construction failed"))?;
@@ -644,7 +660,7 @@ index 50be5f4..2b4b02b 100644
 +                    Ok(())
 +                })();
 +                if let Err(error) = result {
-+                    emit_error(&format!("SnapshotV1: {error:#}"));
++                    emit_error(&format!("Snapshot: {error:#}"));
 +                    emit_info("compute_done");
 +                }
 +                continue;
@@ -652,6 +668,13 @@ index 50be5f4..2b4b02b 100644
              // 按 baseGame.scenarioId 分发（12=温泉 / 14=拉面）到对应场景模块
              match crate::protocol::parse_game_by_scenario(&contents) {
                  Ok(crate::protocol::ParsedGame::Onsen(game)) => {
+@@ -438,4 +484,4 @@ mod tests {
+             }
+         }
+     }
+-}
+\ No newline at end of file
++}
 diff --git a/crates/umaai/src/plot/svg.rs b/crates/umaai/src/plot/svg.rs
 index 8b3232f..74ac06f 100644
 --- a/crates/umaai/src/plot/svg.rs
@@ -3710,6 +3733,18 @@ index cc2e071..afc748b 100644
 +umaai_runtime.workspace = true
 +umasim = { version = "0.14.0", path = "../umasim", default-features = false }
  zip.workspace = true
+diff --git a/crates/umaai_review/src/brief.rs b/crates/umaai_review/src/brief.rs
+index cc36219..150350f 100644
+--- a/crates/umaai_review/src/brief.rs
++++ b/crates/umaai_review/src/brief.rs
+@@ -781,6 +781,7 @@ mod tests {
+ 
+     fn empty_digest() -> Digest {
+         Digest {
++            recovery: None,
+             meta: meta(),
+             timeline: vec![],
+             decisions: vec![],
 diff --git a/crates/umaai_review/src/clones.rs b/crates/umaai_review/src/clones.rs
 index db6bc7f..5024075 100644
 --- a/crates/umaai_review/src/clones.rs
@@ -3724,9 +3759,18 @@ index db6bc7f..5024075 100644
  use crate::{checks::SUPER_RAMEN_START, execution::ExecutionResult, pack::SnapEntry};
  
 diff --git a/crates/umaai_review/src/decisions.rs b/crates/umaai_review/src/decisions.rs
-index 3657688..d53aa2e 100644
+index 3657688..fa8bc83 100644
 --- a/crates/umaai_review/src/decisions.rs
 +++ b/crates/umaai_review/src/decisions.rs
+@@ -263,7 +263,7 @@ pub fn parse(csv_text: Option<&str>) -> Result<DecisionsResult> {
+ }
+ 
+ /// luck 块聚合（§6.2：回合合计为基本观察单位）
+-fn build_luck(rows: &[DecRow]) -> LuckBlock {
++pub(crate) fn build_luck(rows: &[DecRow]) -> LuckBlock {
+     // series：每条带 total_luck 的决策行
+     let series = rows
+         .iter()
 @@ -317,7 +317,7 @@ mod tests {
      /// 构造测试 CSV：真实表头（record::detail_header 同序）+ 按名填列
      fn make_csv(rows: &[(&str, &str, &str, &str, &str, &str, &str, &str, &str, &str)]) -> String {
@@ -3737,10 +3781,10 @@ index 3657688..d53aa2e 100644
          out.push('\n');
          for (file, turn, seq, stage, outcome, reason, kind, c1s, total, delta) in rows {
 diff --git a/crates/umaai_review/src/digest.rs b/crates/umaai_review/src/digest.rs
-index cb71aa0..78ebfec 100644
+index cb71aa0..ea7c185 100644
 --- a/crates/umaai_review/src/digest.rs
 +++ b/crates/umaai_review/src/digest.rs
-@@ -10,7 +10,7 @@ use serde::Serialize;
+@@ -10,12 +10,15 @@ use serde::Serialize;
  use umasim::{gamedata::UmaData, global, gamedata::ramen::RAMENDATA, game::SupportCard};
  
  use crate::{decisions::DecisionsResult, pack::Pack, schedule::Schedule, timeline::TimelineResult};
@@ -3749,7 +3793,15 @@ index cb71aa0..78ebfec 100644
  use umasim::gamedata::GAMEDATA;
  
  /// digest 顶层
-@@ -139,7 +139,7 @@ pub fn build(inputs: &Inputs) -> Digest {
+ #[derive(Debug, Serialize)]
+ pub struct Digest {
++    /// Native archive/source identity map and independent recovery baselines.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub recovery: Option<crate::recovery::RecoveryHistory>,
+     pub meta: Meta,
+     pub timeline: Vec<crate::timeline::TimelineRow>,
+     pub decisions: Vec<crate::decisions::DecRow>,
+@@ -139,7 +142,7 @@ pub fn build(inputs: &Inputs) -> Digest {
  
      // 终局评分 + 等级（末份快照；gamedata 缺失 → None + 注记）
      let (final_score, rank) = match (tl.last_status.as_ref().map(|s| &s.base_game), inputs.gamedata_ok) {
@@ -3758,6 +3810,14 @@ index cb71aa0..78ebfec 100644
              let score = crate::score::final_score(base);
              (Some(score), Some(crate::score::rank_name(score)))
          }
+@@ -244,6 +247,7 @@ pub fn build(inputs: &Inputs) -> Digest {
+     findings.extend(inputs.extra_findings.clone());
+ 
+     Digest {
++        recovery: None,
+         meta,
+         timeline: tl.rows.clone(),
+         decisions: dec.rows.clone(),
 diff --git a/crates/umaai_review/src/gdata.rs b/crates/umaai_review/src/gdata.rs
 index 9c1f311..621012b 100644
 --- a/crates/umaai_review/src/gdata.rs
@@ -3805,22 +3865,37 @@ index 9c1f311..621012b 100644
  
  /// 把相对路径绝对化（chdir 前调用；已绝对则原样返回）
 diff --git a/crates/umaai_review/src/lib.rs b/crates/umaai_review/src/lib.rs
-index 51681d1..192195d 100644
+index 51681d1..e8a61ab 100644
 --- a/crates/umaai_review/src/lib.rs
 +++ b/crates/umaai_review/src/lib.rs
-@@ -39,3 +39,6 @@ pub mod report;
+@@ -39,3 +39,7 @@ pub mod report;
  pub mod schedule;
  pub mod score;
  pub mod timeline;
 +
 +pub mod native;
++pub mod recovery;
 +pub use native::analyze_pack;
+diff --git a/crates/umaai_review/src/main.rs b/crates/umaai_review/src/main.rs
+index b4e1035..12b4343 100644
+--- a/crates/umaai_review/src/main.rs
++++ b/crates/umaai_review/src/main.rs
+@@ -222,7 +222,8 @@ fn run() -> Result<()> {
+         extra_findings: extra_findings.clone(),
+         gamedata_bundled,
+     };
+-    let d = digest::build(&inputs);
++    let mut d = digest::build(&inputs);
++    umaai_review::recovery::apply(&mut d, &p)?;
+     let digest_path = digest::write_json(&d, &out_dir)?;
+     // brief.md（LLM 复盘简报：六问事实预答，SKILL 层一次 Read 即可动笔）
+     let brief_path = brief::render(&d, &out_dir)?;
 diff --git a/crates/umaai_review/src/native.rs b/crates/umaai_review/src/native.rs
 new file mode 100644
-index 0000000..de17dfd
+index 0000000..3a69122
 --- /dev/null
 +++ b/crates/umaai_review/src/native.rs
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,242 @@
 +//! Native review entry point; all analysis and narrative stay on the device.
 +use std::path::{Path, PathBuf};
 +use anyhow::{Context, Result, ensure};
@@ -3917,6 +3992,7 @@ index 0000000..de17dfd
 +        gamedata_bundled,
 +    };
 +    let mut d = digest::build(&inputs);
++    crate::recovery::apply(&mut d, &p)?;
 +    d.context.criteria.push(inheritance_source.into());
 +    if p.meta.as_ref().is_none_or(|m| m.engine_revision.is_none() || m.data_version.is_none() || m.config.is_none()) {
 +        d.context.criteria.push("局包缺引擎、数据或配置版本；本报告版本一致性未经确认，原生宿主应拒绝跨版本复盘。".into());
@@ -3936,7 +4012,7 @@ index 0000000..de17dfd
 +    report::render_embedded(&d, out_dir, &narrative)
 +}
 +
-+/// V1 inheritance belongs to the observed run, never to the currently selected deck/config.
++/// Versioned inheritance belongs to the observed run, never to the currently selected deck/config.
 +fn observed_inheritance(pack: &pack::Pack) -> Result<(Option<i32>, &'static str)> {
 +    let mut has_v1 = false;
 +    let mut observed: Option<[i32; 6]> = None;
@@ -3951,7 +4027,7 @@ index 0000000..de17dfd
 +        observed = Some(extras);
 +    }
 +    if has_v1 {
-+        if missing || observed.is_none() { return Ok((None, "V1局包缺少完整runtime_continuation继承观察值，继承参考分缺失，不读取当前配置补造。")); }
++        if missing || observed.is_none() { return Ok((None, "版本化局包缺少完整runtime_continuation继承观察值，继承参考分缺失，不读取当前配置补造。")); }
 +        let extras = observed.context("inheritance observation missing")?;
 +        let sum = extras[..5].iter().try_fold(126i32, |sum, value| sum.checked_add(*value)).context("inheritance reference overflow")?;
 +        return Ok((Some(sum), "继承参考分来源：本局runtime_continuation.inherit_extra_count的前五项之和加126。"));
@@ -3967,7 +4043,8 @@ index 0000000..de17dfd
 +    let matched = d.execution.iter().filter(|r| r.matches == Some(true)).count();
 +    report::Narrative {
 +        overview: format!("<p>本局记录 {} 份快照，覆盖至内部回合 {}。{}。数据不足处以缺失处理。</p>", d.timeline.len(), end, score),
-+        luck_trend: format!("<p>共有 {} 条决策记录。运气图按同一引擎的候选终局分计算；网络策略未提供搜索分的决策不作为零分计入。</p>", d.decisions.len()),
++        luck_trend: format!("<p>共有 {} 条决策记录。运气图按同一引擎的候选终局分计算；网络策略未提供搜索分的决策不作为零分计入。{}</p>", d.decisions.len(),
++            if d.recovery.as_ref().is_some_and(|r| !r.history_complete) { "恢复后的曲线使用独立基线，不能视为整局累计运气。" } else { "" }),
 +        findings: format!("<p>规则检查产生 {} 条发现。可比较动作 {} 次，其中 {} 次与推荐一致；未观察到的动作不判为偏离。</p>", d.findings.len(), comparable, matched),
 +        summary: "<p>本报告完全本地生成。图表和规则发现描述已记录事实；没有完整快照的阶段不能用于还原真实操作或推断因果。</p>".into(),
 +    }
@@ -4020,6 +4097,41 @@ index 0000000..de17dfd
 +        analyze_pack(&dir, &dir.join("missing-inheritance"), &root.join("gamedata"))?;
 +        let partial: serde_json::Value = serde_json::from_slice(&fs::read(dir.join("missing-inheritance/digest.json"))?)?;
 +        ensure!(partial["inherit"]["reference_value"].is_null(), "missing V1 inheritance silently used current config");
++        // A restarted collector reuses source sequence 1, while durable archive IDs remain 1 and 2.
++        state["runtime_schema_version"] = serde_json::json!(2);
++        state["runtime_collector_instance_id"] = "boot-a".into();
++        state["runtime_snapshot_id"] = serde_json::json!(1);
++        state["baseGame"]["single_mode_chara_id"] = serde_json::json!(991);
++        state["runtime_continuation"] = serde_json::json!({"inherit_extra_count":[10,20,30,40,50,60]});
++        let a = serde_json::to_vec(&state)?;
++        state["runtime_collector_instance_id"] = "boot-b".into();
++        let b = serde_json::to_vec(&state)?;
++        let second_name = "game991_turn71_2.json";
++        fs::write(dir.join(name), &a)?;
++        fs::write(dir.join(second_name), &b)?;
++        let csv = "file,turn,seq,outcome,snapshot_schema_version,collector_instance_id,snapshot_id,config_id,luck_segment_start_snapshot_id,history_complete,total_luck\ngame991_turn71_1.json,71,1,calc,2,boot-a,1,cfg,1,false,100\ngame991_turn71_2.json,71,2,calc,2,boot-b,1,cfg,1,false,0\n";
++        fs::write(dir.join("decisions.csv"), csv)?;
++        fs::create_dir_all(dir.join("envelopes/boot-a"))?;
++        fs::write(dir.join("envelopes/boot-a/meta.json"), br#"{"game":777,"complete":true}"#)?;
++        let multi_zip = dir.join("recovery.zip");
++        let mut zip = ZipWriter::new(fs::File::create(&multi_zip)?);
++        for (file, bytes) in [(name, a.as_slice()), (second_name, b.as_slice()), ("decisions.csv", csv.as_bytes()), ("meta.json", meta.as_slice()),
++            ("envelopes/boot-a/meta.json", br#"{"game":777,"complete":true}"#.as_slice())] {
++            zip.start_file(file, SimpleFileOptions::default())?; zip.write_all(bytes)?;
++        }
++        zip.finish()?;
++        let recovered_html = analyze_pack(&dir, &dir.join("recovered-directory"), &root.join("gamedata"))?;
++        analyze_pack(&multi_zip, &dir.join("recovered-zip"), &root.join("gamedata"))?;
++        let recovered_bytes = fs::read(dir.join("recovered-directory/digest.json"))?;
++        ensure!(recovered_bytes == fs::read(dir.join("recovered-zip/digest.json"))?, "V2 directory/ZIP facts diverged");
++        let recovered: serde_json::Value = serde_json::from_slice(&recovered_bytes)?;
++        ensure!(recovered["recovery"]["luck_segments"].as_array().is_some_and(|s| s.len() == 2), "distinct process baselines were merged");
++        ensure!(recovered["meta"]["total_luck_end"].is_null(), "recovery segment mislabeled as whole-run luck");
++        ensure!(recovered["meta"]["game"] == 991, "nested envelope shadowed canonical metadata");
++        let recovered_report = fs::read_to_string(recovered_html)?;
++        ensure!(recovered_report.contains("独立运气段 2") && recovered_report.contains("本段运气分"), "segmented HTML chart missing");
++        fs::write(dir.join("decisions.csv"), csv.replace(",2,boot-b,1,", ",2,boot-x,1,"))?;
++        ensure!(analyze_pack(&dir, &dir.join("invalid-identity"), &root.join("gamedata")).is_err(), "CSV/epoch identity mismatch reached review");
 +        let legacy = dir.join("decision_log.jsonl"); fs::write(&legacy, "{}")?;
 +        ensure!(analyze_pack(&legacy, &dir.join("legacy"), &root.join("gamedata")).is_err(), "legacy summary accepted as complete history");
 +        println!("[OK] native directory/ZIP parity, explicit stage, local narrative, cwd isolation, legacy rejection; evidence {}", dir.display());
@@ -4027,13 +4139,17 @@ index 0000000..de17dfd
 +    }
 +}
 diff --git a/crates/umaai_review/src/pack.rs b/crates/umaai_review/src/pack.rs
-index ef0166d..0cb51fd 100644
+index ef0166d..86f7659 100644
 --- a/crates/umaai_review/src/pack.rs
 +++ b/crates/umaai_review/src/pack.rs
-@@ -40,6 +40,14 @@ pub struct SnapEntry {
+@@ -40,6 +40,18 @@ pub struct SnapEntry {
  #[derive(Debug, Clone, Default, Deserialize)]
  #[serde(default)]
  pub struct PackMeta {
++    /// Collector epochs observed by the native recorder; legacy packs omit this field.
++    pub collector_instances: Option<serde_json::Value>,
++    /// Recorded live-luck baseline declarations; validated CSV identity remains authoritative.
++    pub luck_segments: Option<serde_json::Value>,
 +    /// Explicit completion evidence; false means an interrupted/native partial run.
 +    pub complete: Option<bool>,
 +    /// Engine source generation, checked by native host before analyzing old runs.
@@ -4045,7 +4161,17 @@ index ef0166d..0cb51fd 100644
      /// 局号（`single_mode_chara_id`）
      pub game: u64,
      /// 马娘 ID
-@@ -213,6 +221,63 @@ pub fn open_zip(path: &Path) -> Result<Pack> {
+@@ -169,6 +181,9 @@ pub fn open_zip(path: &Path) -> Result<Pack> {
+             continue; // 外壳目录（旧布局），忽略层级
+         }
+         let name = entry.name().replace('\\', "/");
++        // New native packs retain epoch-scoped wire envelopes/results as evidence. They must
++        // never shadow the canonical top-level state, metadata or decisions during basename matching.
++        if name.split('/').any(|part| matches!(part, "envelopes" | "results" | "review")) { continue; }
+         let basename = name.rsplit('/').next().unwrap_or_default().to_string();
+         let mut bytes = Vec::new();
+         Read::read_to_end(&mut entry, &mut bytes)
+@@ -213,6 +228,63 @@ pub fn open_zip(path: &Path) -> Result<Pack> {
      Ok(Pack { game, snaps, unparsed, decisions_csv, meta, luck_trend_svg, ignored })
  }
  
@@ -4109,8 +4235,346 @@ index ef0166d..0cb51fd 100644
  impl Pack {
      /// 快照回合覆盖范围（无快照时 `None`）
      pub fn turn_range(&self) -> Option<(u32, u32)> {
+diff --git a/crates/umaai_review/src/recovery.rs b/crates/umaai_review/src/recovery.rs
+new file mode 100644
+index 0000000..c2b5dbf
+--- /dev/null
++++ b/crates/umaai_review/src/recovery.rs
+@@ -0,0 +1,332 @@
++//! Process-aware archive identity and luck segments. Legacy PC packs remain readable.
++use std::collections::{BTreeMap, HashMap, HashSet};
++use anyhow::{Context, Result, ensure};
++use serde::Serialize;
++use serde_json::Value;
++use umaai_runtime::{LEGACY_COLLECTOR_INSTANCE, validate_collector_instance_id};
++use crate::{decisions::{self, DecRow, LuckBlock}, digest::Digest, pack::Pack};
++
++/// Explicit mapping from the durable archive key to the collector's wire identity.
++#[derive(Debug, Clone, Serialize)]
++pub struct SnapshotLink {
++    pub file: String,
++    pub run_id: u64,
++    pub turn: u32,
++    pub archive_seq: u32,
++    pub schema_version: u32,
++    pub collector_instance_id: String,
++    pub snapshot_id: Option<u64>,
++}
++
++/// Exact binding for one decision row; several requests may evaluate the same immutable capture.
++#[derive(Debug, Clone, Serialize)]
++pub struct DecisionLink {
++    pub decision_index: usize,
++    pub capture: SnapshotLink,
++    pub request_id: Option<String>,
++    pub config_id: String,
++    pub start_snapshot_id: Option<u64>,
++    pub history_complete: Option<bool>,
++}
++
++/// Independent live-computation baseline. Values from separate segments cannot be accumulated.
++#[derive(Debug, Serialize)]
++pub struct LuckSegment {
++    pub collector_instance_id: String,
++    pub start_snapshot_id: Option<u64>,
++    pub config_id: String,
++    pub history_complete: Option<bool>,
++    pub first_archive_seq: u32,
++    pub files: Vec<String>,
++    /// Ordinals into digest.decisions, independent of a potentially repeated source filename.
++    pub decision_indices: Vec<usize>,
++    /// Rendering uses only this segment's exact rows, not a filename join across configurations.
++    #[serde(skip)]
++    pub decision_rows: Vec<DecRow>,
++    pub luck: LuckBlock,
++}
++
++/// Identity evidence retained in digest.json, including unverified historical continuity.
++#[derive(Debug, Default, Serialize)]
++pub struct RecoveryHistory {
++    pub snapshots: Vec<SnapshotLink>,
++    pub luck_segments: Vec<LuckSegment>,
++    pub history_complete: bool,
++    pub boundary_turns: Vec<u32>,
++    pub csv_identity_from_legacy_filename: bool,
++    pub decisions: Vec<DecisionLink>,
++}
++
++/// Parse the new native archive extensions and verify CSV-to-snapshot joins before analysis.
++pub fn analyze(pack: &Pack, decisions: &[DecRow]) -> Result<Option<RecoveryHistory>> {
++    let mut links = Vec::new();
++    let mut modern = false;
++    for snap in &pack.snaps {
++        let Ok(raw) = serde_json::from_slice::<Value>(&snap.bytes) else { continue; };
++        let version = match raw.get("runtime_schema_version") {
++            Some(value) => value.as_u64().context("invalid archived snapshot version")?,
++            None => 1,
++        };
++        ensure!(version == 1 || version == 2, "unsupported archived snapshot version");
++        modern |= raw.get("runtime_schema_version").is_some();
++        let instance = if version == 2 {
++            let id = raw["runtime_collector_instance_id"].as_str().context("archive collector instance missing")?;
++            validate_collector_instance_id(id)?;
++            id.to_string()
++        } else { LEGACY_COLLECTOR_INSTANCE.into() };
++        let source_id = raw["runtime_snapshot_id"].as_u64();
++        if version == 2 {
++            ensure!(source_id.is_some_and(|n| n > 0), "archive source snapshot identity missing");
++            ensure!(raw["baseGame"]["single_mode_chara_id"].as_u64() == Some(snap.game), "archive run identity mismatch");
++        }
++        links.push(SnapshotLink { file: snap.file.clone(), run_id: snap.game, turn: snap.turn, archive_seq: snap.seq,
++            schema_version: version as u32, collector_instance_id: instance, snapshot_id: source_id });
++    }
++    if !modern { return Ok(None); }
++    let mut archive_keys = HashSet::new();
++    let mut wire_keys = HashSet::new();
++    let mut watermarks = HashMap::new();
++    let mut retired = HashSet::new();
++    let mut current: Option<&str> = None;
++    let mut previous_turn: Option<u32> = None;
++    let mut boundary_turns = Vec::new();
++    for link in &links {
++        ensure!(link.run_id == pack.game || pack.game == 0, "mixed runs in native archive");
++        ensure!(archive_keys.insert((link.turn, link.archive_seq)), "archive key collision: turn={} seq={}", link.turn, link.archive_seq);
++        if let Some(source) = link.snapshot_id {
++            ensure!(wire_keys.insert((link.run_id, link.collector_instance_id.clone(), source)), "duplicate source snapshot in archive");
++            let key = (link.run_id, link.collector_instance_id.clone());
++            ensure!(watermarks.get(&key).is_none_or(|&previous| source > previous), "source sequence regressed within collector epoch");
++            if watermarks.get(&key).is_some_and(|&previous| source.checked_sub(previous) != Some(1)) { boundary_turns.push(link.turn); }
++            watermarks.insert(key, source);
++        }
++        if current != Some(link.collector_instance_id.as_str()) {
++            ensure!(!retired.contains(link.collector_instance_id.as_str()), "retired collector epoch reappears in archive");
++            if let Some(old) = current { retired.insert(old); boundary_turns.push(link.turn); }
++            current = Some(&link.collector_instance_id);
++        }
++        if previous_turn.is_some_and(|turn| link.turn > turn.saturating_add(1)) { boundary_turns.push(link.turn); }
++        previous_turn = Some(link.turn);
++    }
++    let by_file: HashMap<&str, &SnapshotLink> = links.iter().map(|link| (link.file.as_str(), link)).collect();
++    // Bind calc rows by CSV ordinal and request identity. A filename denotes a capture, not a computation.
++    let mut bindings: Vec<Option<DecisionLink>> = Vec::new();
++    let mut requests: HashMap<String, (String, String, Option<u64>, Option<bool>)> = HashMap::new();
++    let mut csv_identity_from_legacy_filename = false;
++    if let Some(csv) = &pack.decisions_csv {
++        let mut reader = csv::Reader::from_reader(csv.as_bytes());
++        let headers = reader.headers()?.clone();
++        for row in reader.records() {
++            let row = row?;
++            let get = |name: &str| headers.iter().position(|h| h == name).and_then(|i| row.get(i)).filter(|v| !v.is_empty());
++            let file = get("file").unwrap_or_default();
++            let is_decision = get("outcome") == Some("calc");
++            let Some(link) = by_file.get(file) else {
++                ensure!(get("snapshot_schema_version") != Some("2"), "V2 decision references missing canonical snapshot: {file}");
++                if is_decision { bindings.push(None); }
++                continue;
++            };
++            if link.schema_version == 2 {
++                ensure!(get("seq").and_then(|s| s.parse::<u32>().ok()) == Some(link.archive_seq)
++                    && get("turn").and_then(|s| s.parse::<u32>().ok()) == Some(link.turn), "decision/archive identity mismatch: {file}");
++                if headers.iter().any(|name| matches!(name, "snapshot_schema_version" | "collector_instance_id" | "snapshot_id")) {
++                    ensure!(get("snapshot_schema_version") == Some("2")
++                        && get("collector_instance_id") == Some(link.collector_instance_id.as_str())
++                        && get("snapshot_id").and_then(|s| s.parse::<u64>().ok()) == link.snapshot_id, "decision/archive identity mismatch: {file}");
++                } else {
++                    // Historical PC recorders key CSV by filename/(turn,seq). The unique canonical
++                    // state carries V2 identity; record the fallback rather than inventing CSV fields.
++                    csv_identity_from_legacy_filename = true;
++                }
++            }
++            // A terminal/cancellation/skip row has no scoring baseline; it still passed identity validation above.
++            if !is_decision { continue; }
++            let start = get("luck_segment_start_snapshot_id").map(str::parse::<u64>).transpose().context("invalid luck baseline identity")?;
++            let complete = get("history_complete").map(str::parse::<bool>).transpose().context("invalid history_complete")?;
++            let config = get("config_id").unwrap_or_default().to_string();
++            let request = get("request_id").map(str::to_string);
++            if let (Some(start), Some(source)) = (start, link.snapshot_id) {
++                ensure!((link.schema_version == 1 || start > 0) && start <= source, "invalid future luck baseline");
++            }
++            if let Some(request) = &request {
++                let identity = (file.to_string(), config.clone(), start, complete);
++                if let Some(old) = requests.insert(request.clone(), identity.clone()) {
++                    ensure!(old == identity, "request identity or chained decision baseline mismatch");
++                }
++            }
++            bindings.push(Some(DecisionLink { decision_index: bindings.len(), capture: (*link).clone(), request_id: request,
++                config_id: config, start_snapshot_id: start, history_complete: complete }));
++        }
++    }
++    ensure!(bindings.len() == decisions.len(), "decision CSV ordinal mismatch");
++    let mut grouped: BTreeMap<(String, Option<u64>, String, String), (Option<bool>, Vec<(usize, DecRow)>)> = BTreeMap::new();
++    for (index, row) in decisions.iter().enumerate() {
++        let Some(binding) = &bindings[index] else { continue; };
++        let link = &binding.capture;
++        ensure!(row.file == link.file && row.turn == link.turn && row.seq == link.archive_seq, "decision row differs from its capture binding");
++        let (instance, start, config, complete) = (link.collector_instance_id.clone(), binding.start_snapshot_id,
++            binding.config_id.clone(), binding.history_complete);
++        // A policy/session change splits luck but does not invent a gap in observed game history.
++        // Missing baseline metadata cannot prove that two decisions share a live session.
++        let unknown_key = if start.is_none() { binding.request_id.clone().unwrap_or_else(|| format!("row-{index}")) } else { String::new() };
++        let segment = grouped.entry((instance, start, config, unknown_key)).or_insert_with(|| (complete, Vec::new()));
++        if segment.0 != complete { segment.0 = None; }
++        segment.1.push((index, row.clone()));
++    }
++    let mut segments: Vec<_> = grouped.into_iter().map(|((instance, start, config, _), (complete, entries))| {
++        let (indices, rows): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
++        LuckSegment {
++            collector_instance_id: instance, start_snapshot_id: start, config_id: config,
++            history_complete: complete, first_archive_seq: rows.iter().map(|r| r.seq).min().unwrap_or(0),
++            files: rows.iter().map(|r| r.file.clone()).collect(), luck: decisions::build_luck(&rows),
++            decision_indices: indices, decision_rows: rows,
++        }
++    }).collect();
++    segments.sort_by_key(|segment| segment.first_archive_seq);
++    boundary_turns.sort_unstable(); boundary_turns.dedup();
++    let complete = boundary_turns.is_empty() && links.first().is_some_and(|link| link.turn == 0)
++        && segments.len() == 1 && segments[0].start_snapshot_id.is_some() && segments[0].history_complete == Some(true);
++    Ok(Some(RecoveryHistory { snapshots: links, luck_segments: segments, history_complete: complete, boundary_turns,
++        csv_identity_from_legacy_filename, decisions: bindings.into_iter().flatten().collect() }))
++}
++
++/// Native review needs version evidence for every configuration that produced a decision row.
++pub fn recorded_configuration_ids(csv: &str) -> Result<HashSet<String>> {
++    let mut reader = csv::Reader::from_reader(csv.as_bytes());
++    let headers = reader.headers()?.clone();
++    let outcome = headers.iter().position(|name| name == "outcome");
++    let config = headers.iter().position(|name| name == "config_id");
++    let mut result = HashSet::new();
++    for row in reader.records() {
++        let row = row?;
++        if outcome.and_then(|index| row.get(index)) != Some("calc") { continue; }
++        let id = config.and_then(|index| row.get(index)).filter(|id| !id.is_empty()).context("review_decision_configuration_missing")?;
++        result.insert(id.to_string());
++    }
++    Ok(result)
++}
++
++/// Apply recovery limitations consistently to native and PC review outputs.
++pub fn apply(digest: &mut Digest, pack: &Pack) -> Result<()> {
++    let Some(mut history) = analyze(pack, &digest.decisions)? else { return Ok(()); };
++    for segment in &mut history.luck_segments {
++        segment.luck.flagged_turns = digest.luck.flagged_turns.clone();
++    }
++    if history.csv_identity_from_legacy_filename {
++        digest.context.criteria.push("旧CSV缺采集身份列，已按唯一标准快照文件名及归档序号关联；没有补造原始序号或运气基线。".into());
++    }
++    if !history.history_complete {
++        digest.meta.total_luck_end = None;
++        // Keep individual segment curves below; a single joined curve invents continuity across resets.
++        digest.luck = LuckBlock::default();
++        digest.context.criteria.push("采集或计算恢复后的运气分按独立基线分段，不代表整局累计；缺少前史不会阻止完整当前快照继续决策。".into());
++    }
++    if !history.boundary_turns.is_empty() {
++        let uncertain = |turn: u32| history.boundary_turns.iter().any(|&boundary| turn == boundary || turn.saturating_add(1) == boundary);
++        digest.execution.retain(|row| !uncertain(row.turn));
++        digest.findings.retain(|row| !uncertain(row.turn));
++        // These legacy aggregates assume one uninterrupted stream. Preserve source snapshots and mark unavailable.
++        digest.inherit = None;
++        digest.clones = None;
++        digest.context.criteria.push("记录存在恢复边界；边界附近不推断真实操作，本报告不生成依赖连续历史的继承及分身汇总。".into());
++    }
++    digest.recovery = Some(history);
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++    use crate::pack::SnapEntry;
++
++    /// One observed capture may have several computation attempts; source identity stays immutable.
++    fn one_capture(csv: &str) -> Pack {
++        Pack { game: 991, snaps: vec![SnapEntry { file: "game991_turn10_1.json".into(), game: 991, turn: 10, seq: 1,
++            bytes: json!({"runtime_schema_version":2,"runtime_collector_instance_id":"boot-a","runtime_snapshot_id":1,
++                "baseGame":{"single_mode_chara_id":991}}).to_string().into_bytes() }], decisions_csv: Some(csv.into()), ..Default::default() }
++    }
++
++    /// Cancellation rows carry capture identity but do not carry a new luck baseline.
++    #[test]
++    fn skip_after_streamed_decision_does_not_reset_baseline() -> Result<()> {
++        let pack = one_capture("file,turn,seq,outcome,snapshot_schema_version,collector_instance_id,snapshot_id,request_id,config_id,luck_segment_start_snapshot_id,history_complete,total_luck\ngame991_turn10_1.json,10,1,calc,2,boot-a,1,req-a,cfg-a,1,false,100\ngame991_turn10_1.json,10,1,skip,2,boot-a,1,req-a,cfg-a,,,\n");
++        let parsed = decisions::parse(pack.decisions_csv.as_deref())?;
++        let history = analyze(&pack, &parsed.rows)?.context("missing history")?;
++        ensure!(history.luck_segments.len() == 1 && history.luck_segments[0].start_snapshot_id == Some(1), "skip changed decision baseline");
++        Ok(())
++    }
++
++    /// Re-evaluating one capture after a setting change must preserve both recorded generations.
++    #[test]
++    fn same_capture_allows_distinct_requests_and_configurations() -> Result<()> {
++        let pack = one_capture("file,turn,seq,outcome,snapshot_schema_version,collector_instance_id,snapshot_id,request_id,config_id,luck_segment_start_snapshot_id,history_complete,total_luck\ngame991_turn10_1.json,10,1,calc,2,boot-a,1,req-a,cfg-a,1,false,100\ngame991_turn10_1.json,10,1,calc,2,boot-a,1,req-b,cfg-b,1,false,200\n");
++        let parsed = decisions::parse(pack.decisions_csv.as_deref())?;
++        let history = analyze(&pack, &parsed.rows)?.context("missing history")?;
++        ensure!(history.luck_segments.len() == 2, "distinct configurations were merged");
++        ensure!(history.boundary_turns.is_empty(), "configuration comparison was mislabeled as missing game history");
++        ensure!(history.luck_segments.iter().all(|segment| segment.luck.series.len() == 1), "a segment contains another request's scores");
++        ensure!(history.decisions.len() == 2 && history.decisions[0].config_id == "cfg-a" && history.decisions[1].config_id == "cfg-b", "decision/config mapping lost");
++        ensure!(history.luck_segments.iter().all(|segment| segment.decision_rows.len() == 1 && segment.decision_indices.len() == 1), "renderer would mix requests sharing one file");
++        Ok(())
++    }
++
++    /// Reusing a request ID for a different computation generation is invalid even on the same capture.
++    #[test]
++    fn request_id_cannot_change_configuration_and_native_versions_require_all_ids() -> Result<()> {
++        let csv = "file,turn,seq,outcome,snapshot_schema_version,collector_instance_id,snapshot_id,request_id,config_id,luck_segment_start_snapshot_id,history_complete,total_luck\ngame991_turn10_1.json,10,1,calc,2,boot-a,1,req-a,cfg-a,1,false,100\ngame991_turn10_1.json,10,1,calc,2,boot-a,1,req-a,cfg-b,1,false,200\n";
++        let pack = one_capture(csv);
++        let parsed = decisions::parse(pack.decisions_csv.as_deref())?;
++        ensure!(analyze(&pack, &parsed.rows).is_err(), "request ID was silently rebound");
++        ensure!(recorded_configuration_ids(csv)?.len() == 2, "historical configurations were collapsed");
++        ensure!(recorded_configuration_ids("outcome,config_id\ncalc,\n").is_err(), "missing generation accepted");
++        ensure!(recorded_configuration_ids("outcome,config_id\nskip,\n")?.is_empty(), "skip invented a computation generation");
++        Ok(())
++    }
++
++    /// The original V1 protocol permits sequence zero; V2's positive-sequence rule must not leak into it.
++    #[test]
++    fn legacy_v1_zero_sequence_baseline_remains_valid() -> Result<()> {
++        let mut pack = one_capture("file,turn,seq,outcome,snapshot_schema_version,collector_instance_id,snapshot_id,request_id,config_id,luck_segment_start_snapshot_id,history_complete,total_luck\ngame991_turn10_1.json,10,1,calc,1,legacy-v1,0,req-a,cfg-a,0,false,100\n");
++        let mut state: Value = serde_json::from_slice(&pack.snaps[0].bytes)?;
++        state["runtime_schema_version"] = json!(1); state["runtime_collector_instance_id"] = json!(LEGACY_COLLECTOR_INSTANCE); state["runtime_snapshot_id"] = json!(0);
++        pack.snaps[0].bytes = serde_json::to_vec(&state)?;
++        let parsed = decisions::parse(pack.decisions_csv.as_deref())?;
++        let history = analyze(&pack, &parsed.rows)?.context("missing history")?;
++        ensure!(history.luck_segments[0].start_snapshot_id == Some(0), "V1 zero baseline rejected or normalized");
++        Ok(())
++    }
++
++    /// A same-turn source sequence gap is missing observation history, not a reason to merge luck baselines.
++    #[test]
++    fn same_epoch_sequence_gap_is_a_recovery_boundary() -> Result<()> {
++        let mut pack = one_capture("file,turn,seq,outcome,snapshot_schema_version,collector_instance_id,snapshot_id,request_id,config_id,luck_segment_start_snapshot_id,history_complete,total_luck\ngame991_turn10_1.json,10,1,calc,2,boot-a,1,req-a,cfg-a,1,false,100\ngame991_turn10_2.json,10,2,calc,2,boot-a,3,req-b,cfg-a,3,false,0\n");
++        let mut second = pack.snaps[0].clone(); second.seq = 2; second.file = "game991_turn10_2.json".into();
++        let mut state: Value = serde_json::from_slice(&second.bytes)?; state["runtime_snapshot_id"] = json!(3); second.bytes = serde_json::to_vec(&state)?;
++        pack.snaps.push(second);
++        let parsed = decisions::parse(pack.decisions_csv.as_deref())?;
++        let history = analyze(&pack, &parsed.rows)?.context("missing history")?;
++        ensure!(history.boundary_turns == [10] && history.luck_segments.len() == 2 && !history.history_complete, "same-turn missing observation was hidden");
++        Ok(())
++    }
++
++    /// Same source sequence in two epochs is safe only with distinct durable archive identities.
++    #[test]
++    fn same_sequence_across_epochs_joins_by_archive_key() -> Result<()> {
++        let snap = |instance: &str, archive_seq: u32| SnapEntry { file: format!("game991_turn10_{archive_seq}.json"), game: 991, turn: 10, seq: archive_seq,
++            bytes: json!({"runtime_schema_version":2,"runtime_collector_instance_id":instance,"runtime_snapshot_id":1,
++                "baseGame":{"single_mode_chara_id":991}}).to_string().into_bytes() };
++        let mut pack = Pack { snaps: vec![snap("boot-a", 1), snap("boot-b", 2)], ..Default::default() };
++        pack.decisions_csv = Some("file,turn,seq,outcome,snapshot_schema_version,collector_instance_id,snapshot_id,config_id,luck_segment_start_snapshot_id,history_complete,total_luck\ngame991_turn10_1.json,10,1,calc,2,boot-a,1,cfg,1,false,100\ngame991_turn10_2.json,10,2,calc,2,boot-b,1,cfg,1,false,0\n".into());
++        let parsed = decisions::parse(pack.decisions_csv.as_deref())?;
++        let history = analyze(&pack, &parsed.rows)?.context("recovery history missing")?;
++        ensure!(history.luck_segments.len() == 2 && !history.history_complete, "epochs were merged into one luck baseline");
++        pack.snaps[1].seq = 1;
++        ensure!(analyze(&pack, &parsed.rows).is_err(), "archive key collision was accepted");
++        pack.snaps[1].seq = 2;
++        pack.decisions_csv = pack.decisions_csv.map(|text| text.replace(",2,boot-b,1,", ",2,boot-a,1,"));
++        ensure!(analyze(&pack, &parsed.rows).is_err(), "CSV epoch mismatch was accepted");
++        println!("[OK] distinct archive identity, segmented luck, collision and CSV mismatch rejection");
++        Ok(())
++    }
++}
 diff --git a/crates/umaai_review/src/report.rs b/crates/umaai_review/src/report.rs
-index 4fbf74c..d21508b 100644
+index 4fbf74c..65316ff 100644
 --- a/crates/umaai_review/src/report.rs
 +++ b/crates/umaai_review/src/report.rs
 @@ -1,6 +1,6 @@
@@ -4130,7 +4594,24 @@ index 4fbf74c..d21508b 100644
  
  use crate::{
      decisions::{DecRow, LuckBlock},
-@@ -132,6 +132,16 @@ pub fn render_with_template(
+@@ -104,7 +104,15 @@ pub fn parse_narrative(text: &str) -> Narrative {
+ pub fn build_charts(digest: &Digest) -> Charts {
+     Charts {
+         status: chart_status(&digest.timeline),
+-        luck: chart_luck(&digest.luck, &digest.decisions),
++        luck: if let Some(history) = &digest.recovery {
++            if !history.history_complete {
++                history.luck_segments.iter().enumerate().map(|(i, segment)| {
++                    format!("<h3>独立运气段 {}（{}，起始快照 {}）</h3>{}", i + 1,
++                        segment.collector_instance_id, segment.start_snapshot_id.map(|v| v.to_string()).unwrap_or_else(|| "未记录".into()),
++                        chart_luck(&segment.luck, &segment.decision_rows).replace("累计运气分", "本段运气分"))
++                }).collect::<Vec<_>>().join("\n")
++            } else { chart_luck(&digest.luck, &digest.decisions) }
++        } else { chart_luck(&digest.luck, &digest.decisions) },
+         actions: chart_actions(&digest.execution)
+     }
+ }
+@@ -132,6 +140,16 @@ pub fn render_with_template(
  ) -> Result<PathBuf> {
      let source = fs::read_to_string(tpl_path)
          .with_context(|| format!("读取模板失败: {}", tpl_path.display()))?;
@@ -4147,6 +4628,14 @@ index 4fbf74c..d21508b 100644
      let charts = build_charts(digest);
      let last = digest.timeline.last();
      let match_rate = if digest.execution.is_empty() {
+@@ -595,6 +613,7 @@ mod tests {
+             evidence: Default::default(),
+         }];
+         Digest {
++            recovery: None,
+             meta: Meta {
+                 game: 6234,
+                 uma_id: 112402,
 diff --git a/crates/umaai_review/src/score.rs b/crates/umaai_review/src/score.rs
 index f194ec2..7c2e456 100644
 --- a/crates/umaai_review/src/score.rs
@@ -4230,10 +4719,10 @@ index 0000000..1e0167c
 +umasim = { version = "0.14.0", path = "../umasim", default-features = false }
 diff --git a/crates/umaai_runtime/README.md b/crates/umaai_runtime/README.md
 new file mode 100644
-index 0000000..2594385
+index 0000000..d1b9d40
 --- /dev/null
 +++ b/crates/umaai_runtime/README.md
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,83 @@
 +# 拉面杯公共运行层
 +
 +`umaai_runtime` 为 PC 与 Android 提供同一个协议导入、策略装配和决策会话。默认不启用 `umasim/cli`；`onnx` feature 复用现有 tract 后端。文件监听、JNI、UI 线程及局包存储由宿主负责。
@@ -4263,9 +4752,25 @@ index 0000000..2594385
 +
 +不通过 `newgame` 或重放猜测缺失历史。严格导入用观测值覆盖旧协议的 RMJ 全成功假设、新年 PT 推定；材料获得顺序也从快照恢复。地区下标按当前加载数据检查。错误应作为采集不足展示，不能降级成虚构盘面的推荐。
 +
++## SnapshotV2 与重连
++
++V2 是独立 envelope：顶层 `schema_version=2`，增加必填 `collector_instance_id`；其余状态与 V1 的严格完整性要求相同。实例名为 1–128 字节 ASCII 字母、数字、点、下划线或连字符，排除 `.`、`..` 与保留值 `legacy-v1`。`snapshot_id` 为正数，在 `(run_id, collector_instance_id)` 内递增。新的采集进程可以从 1 开始；局号仍来自真实育成身份。
++
++`SnapshotEnvelope::parse` 分派 V1/V2，`RamenSnapshotV1::parse` 仍只接受版本 1。V1 内部身份固定为 `legacy-v1`，低序号不会被解释为进程重启。V2 宿主先从独立 capabilities 接口确认进程身份，取消并排空旧任务，再调用 `select_collector_instance(id)`。未握手、与已选实例不符、重复序号或退役实例回流都拒绝；切换以后不能再次选择已退役实例。
++
++PC watcher 接收显式控制 JSON `{"control":"select_collector_instance","collector_instance_id":"已确认实例"}`，随后才处理该实例的 V2。CLI 的第五个位置参数显式传入已确认实例，不从输入文件自选：
++
++```powershell
++cargo run --release --locked -p umaai_runtime --bin ramen_runtime -- <gamedata目录> <V2快照.json> 42 4 <已确认实例>
++```
++
++JNI 控制函数为 `nativeSelectCollectorInstance(String)->String`；每次 evaluate 的 options 另带 `collector_instance_id` 作绑定校验，该字段不改变引擎配置世代。宿主应在 capabilities 返回另一实例时重新握手，不能只看到低序号就换代。
++
++每条 decision 的 `scenario_extra` 含 `schema_version`、`collector_instance_id`、`history_complete`、`luck_scope` 与 `luck_segment_start_snapshot_id`。采集实例切换、计算会话中途接管或观察到跳回合时建立独立运气基线。完整当前 `state+continuation` 可继续计算；缺少前史不补造，也不能把恢复段叫作整局运气。
++
 +## 结果和连续动作
 +
-+`Evaluation` 带 `schema_version/run_id/snapshot_id/warnings/events`。事件 `type` 为 `started/decision/next_step/skipped/completed`。`decision` 同时带 `DecisionInfo`、`GameView`、结构化 `RamenAction`（事件选项为 null）。取消或错误由宿主发送终止通知。
++`Evaluation` 带 `schema_version/collector_instance_id/run_id/snapshot_id/warnings/events`。事件 `type` 为 `started/decision/next_step/skipped/completed`。`decision` 同时带 `DecisionInfo`、`GameView`、结构化 `RamenAction`（事件选项为 null）。取消或错误由宿主发送终止通知。
 +
 +严格模式仅把“不吃面”这个无需真实操作的选择继续到训练。真实训练、事件、地区或吃面操作之后等待新观测；不把随机预演当作真实结果。旧 PC 的 turn1 跨回合预演只留在旧格式兼容路径。
 +
@@ -4276,6 +4781,10 @@ index 0000000..2594385
 +`umaai_review::analyze_pack(input, out, data_dir)` 接受标准 ZIP 或 Android 私有局目录，输出 `digest.json` 和内置模板的 `report.html`。默认叙述是本地规则生成的事实说明，不调用远程 LLM。
 +
 +标准目录顶层保存 `game{id}_turn{turn}_{seq}.json`、`decisions.csv`、`meta.json`。快照仍是 `baseGame/ramen`，追加 `runtime_stage` 保留 V1 明确阶段；完整 envelope 和原始采集证据可放在子目录。复盘不会将旧 `decision_log.jsonl` 当作完整局包。目录读取不递归、不跟随符号链接。
++
++Android V2 将顶层文件名/CSV 的 `seq` 用作持久化 `archive_seq`，与采集器的 `snapshot_id` 分开。标准状态追加 `runtime_schema_version/runtime_collector_instance_id/runtime_snapshot_id/runtime_continuation`；CSV 追加 `snapshot_schema_version,collector_instance_id,snapshot_id,request_id,config_id,luck_segment_start_snapshot_id,history_complete,luck_scope`。原始 envelope 与结果按实例保存在子目录，ZIP 读取同样跳过这些证据目录，防止覆盖标准角色。
++
++复盘校验归档键、源身份和 CSV 关联，`digest.recovery` 保存完整映射与独立运气段。相同源序号跨实例不碰撞；重复归档键、同实例序号倒退或身份列矛盾会报错。旧 PC CSV 没有身份列时，可由唯一标准文件名/归档序号关联，但显式记录回退来源，未知运气基线不合并。恢复边界附近不推断真实操作；依赖连续记录的旧继承/分身汇总暂不生成。旧包不要求新元字段。
 +
 +## 验证命令与边界
 +
@@ -4299,11 +4808,11 @@ index 0000000..2594385
 +ONNX 路由回归采用 `testsupport/onnx_fixture.rs` 生成合成图，源代码导出必须保留此文件。合成图可验证网络动作、参考模式不扰动 MCTS 及整局阶段闭环；不能证明真实训练模型的质量或适用卡组。
 diff --git a/crates/umaai_runtime/src/bin/ramen_runtime.rs b/crates/umaai_runtime/src/bin/ramen_runtime.rs
 new file mode 100644
-index 0000000..212b36f
+index 0000000..8d32b25
 --- /dev/null
 +++ b/crates/umaai_runtime/src/bin/ramen_runtime.rs
-@@ -0,0 +1,38 @@
-+//! Portable replay CLI: ramen_runtime <gamedata-dir> <snapshot.json> [seed] [threads].
+@@ -0,0 +1,39 @@
++//! Portable replay CLI: ramen_runtime <gamedata-dir> <snapshot.json> [seed] [threads] [confirmed-instance].
 +use std::{env, fs, path::PathBuf, process::ExitCode};
 +use anyhow::{Context, Result, ensure};
 +use umaai_runtime::{CancellationToken, RamenSession, initialize, load_config};
@@ -4311,7 +4820,7 @@ index 0000000..212b36f
 +/// Run a strict snapshot with explicit data path and reproducible seed.
 +fn run() -> Result<()> {
 +    let args: Vec<_> = env::args_os().skip(1).collect();
-+    ensure!((2..=4).contains(&args.len()), "usage: ramen_runtime <gamedata-dir> <snapshot.json> [seed] [threads]");
++    ensure!((2..=5).contains(&args.len()), "usage: ramen_runtime <gamedata-dir> <snapshot.json> [seed] [threads] [confirmed-collector-instance]");
 +    let data = PathBuf::from(&args[0]);
 +    let snapshot = fs::read_to_string(PathBuf::from(&args[1]))?;
 +    let seed = args.get(2).map(|s| s.to_string_lossy().parse::<u64>()).transpose()?.unwrap_or(42);
@@ -4322,6 +4831,7 @@ index 0000000..212b36f
 +    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
 +    initialize(&data, &config)?;
 +    let mut session = RamenSession::new(config)?;
++    if let Some(instance) = args.get(4) { session.select_collector_instance(&instance.to_string_lossy())?; }
 +    let mut write_failed = false;
 +    let result = pool.install(|| session.evaluate_json_with_sink(&snapshot, seed, CancellationToken::new(), &mut |event| {
 +        match serde_json::to_string(event) {
@@ -4797,7 +5307,7 @@ index 0000000..a7ee630
 \ No newline at end of file
 diff --git a/crates/umaai_runtime/src/lib.rs b/crates/umaai_runtime/src/lib.rs
 new file mode 100644
-index 0000000..27c0c4f
+index 0000000..051597b
 --- /dev/null
 +++ b/crates/umaai_runtime/src/lib.rs
 @@ -0,0 +1,17 @@
@@ -4808,7 +5318,7 @@ index 0000000..27c0c4f
 +pub mod ramen_nn;
 +
 +pub mod session;
-+pub use session::{initialize, Continuation, Evaluation, RamenSession, RamenSnapshotV1, RuntimeEvent};
++pub use session::{initialize, Continuation, Evaluation, RamenSession, RamenSnapshotV1, RamenSnapshotV2, SnapshotEnvelope, RuntimeEvent, LEGACY_COLLECTOR_INSTANCE, validate_collector_instance_id};
 +pub use umasim::search::CancellationToken;
 +
 +pub mod svg;
@@ -7759,12 +8269,12 @@ index 0000000..58ada95
 +
 diff --git a/crates/umaai_runtime/src/session.rs b/crates/umaai_runtime/src/session.rs
 new file mode 100644
-index 0000000..08b3159
+index 0000000..39ea25b
 --- /dev/null
 +++ b/crates/umaai_runtime/src/session.rs
-@@ -0,0 +1,491 @@
+@@ -0,0 +1,693 @@
 +//! Strict, observable-state-only native API. No synthetic replay and no filesystem reads per request.
-+use std::{path::Path, sync::{Arc, Mutex}};
++use std::{collections::{HashMap, HashSet}, path::Path, sync::{Arc, Mutex}};
 +use anyhow::{Context, Result, ensure};
 +use rand::{SeedableRng, rngs::StdRng};
 +use serde::{Deserialize, Serialize};
@@ -7867,6 +8377,96 @@ index 0000000..08b3159
 +fn require_keys(value: &Value, keys: &[&str], path: &str, missing: &mut Vec<String>) {
 +    for key in keys {
 +        if value.get(*key).is_none() { missing.push(format!("{path}.{key}")); }
++    }
++}
++
++/// Reserved identity for unversioned collector processes using the original V1 semantics.
++pub const LEGACY_COLLECTOR_INSTANCE: &str = "legacy-v1";
++
++/// Validate a V2 process identity before using it in transport bindings or archive paths.
++pub fn validate_collector_instance_id(id: &str) -> Result<()> {
++    ensure!(!id.is_empty() && id.len() <= 128 && !matches!(id, "." | ".." | LEGACY_COLLECTOR_INSTANCE)
++        && id.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)), "invalid_collector_instance_id");
++    Ok(())
++}
++
++/// V2 is a separate wire envelope. Its observed simulation payload has exactly V1's completeness rules.
++#[derive(Debug, Clone)]
++pub struct RamenSnapshotV2 {
++    /// Identity independently confirmed through the collector capabilities endpoint.
++    pub collector_instance_id: String,
++    /// Shared observed payload, internally normalized to V1 for the common importer.
++    pub snapshot: RamenSnapshotV1,
++}
++
++impl RamenSnapshotV2 {
++    /// Parse only V2. Never let the original V1 parser silently acquire epoch reset semantics.
++    pub fn parse(raw: &str) -> Result<Self> {
++        let mut value: Value = serde_json::from_str(raw).context("snapshot JSON")?;
++        ensure!(value["schema_version"] == 2, "unsupported schema_version: expected V2");
++        let instance = value["collector_instance_id"].as_str().context("collector_instance_id missing")?.to_string();
++        validate_collector_instance_id(&instance)?;
++        ensure!(value["snapshot_id"].as_u64().is_some_and(|n| n > 0), "snapshot_id must be positive in V2");
++        value["schema_version"] = json!(1);
++        let snapshot = RamenSnapshotV1::parse(&value.to_string())?;
++        Ok(Self { collector_instance_id: instance, snapshot })
++    }
++}
++
++/// Version-dispatched envelope shared by PC, JNI and offline replay.
++#[derive(Debug, Clone)]
++pub enum SnapshotEnvelope { V1(RamenSnapshotV1), V2(RamenSnapshotV2) }
++
++impl SnapshotEnvelope {
++    /// Parse the explicit wire version; no field-shape or low-sequence heuristic.
++    pub fn parse(raw: &str) -> Result<Self> {
++        let value: Value = serde_json::from_str(raw).context("snapshot JSON")?;
++        match value["schema_version"].as_u64() {
++            Some(1) => Ok(Self::V1(RamenSnapshotV1::parse(raw)?)),
++            Some(2) => Ok(Self::V2(RamenSnapshotV2::parse(raw)?)),
++            _ => anyhow::bail!("unsupported schema_version"),
++        }
++    }
++    /// Original protocol version for response correlation.
++    pub fn schema_version(&self) -> u32 { match self { Self::V1(_) => 1, Self::V2(_) => 2 } }
++    /// Epoch identity; V1 always retains its reserved legacy identity.
++    pub fn collector_instance_id(&self) -> &str {
++        match self { Self::V1(_) => LEGACY_COLLECTOR_INSTANCE, Self::V2(v) => &v.collector_instance_id }
++    }
++    /// Complete observed state imported by the single simulation implementation.
++    pub fn snapshot(&self) -> &RamenSnapshotV1 { match self { Self::V1(v) => v, Self::V2(v) => &v.snapshot } }
++}
++
++/// Explicit handshake gate. Selecting an epoch retires the preceding epoch permanently.
++#[derive(Default)]
++struct CollectorGate {
++    selected: Option<String>,
++    retired: HashSet<String>,
++    watermarks: HashMap<(u64, String), u64>,
++}
++
++impl CollectorGate {
++    /// Caller has independently confirmed capabilities; evaluation itself never calls this.
++    fn select(&mut self, instance: &str) -> Result<bool> {
++        if instance != LEGACY_COLLECTOR_INSTANCE { validate_collector_instance_id(instance)?; }
++        ensure!(!self.retired.contains(instance), "retired_collector_instance");
++        if self.selected.as_deref() == Some(instance) { return Ok(false); }
++        if let Some(previous) = self.selected.replace(instance.into()) { self.retired.insert(previous); }
++        Ok(true)
++    }
++    /// Reject unsolicited epochs and out-of-order snapshots without changing the watermark.
++    fn check(&self, run: u64, instance: &str, seq: u64) -> Result<()> {
++        ensure!(!self.retired.contains(instance), "retired_collector_instance");
++        ensure!(self.selected.as_deref() == Some(instance)
++            || (self.selected.is_none() && instance == LEGACY_COLLECTOR_INSTANCE), "collector_handshake_required");
++        ensure!(self.watermarks.get(&(run, instance.into())).is_none_or(|old| seq > *old),
++            "stale_snapshot: sequence must increase within the confirmed run and collector instance");
++        Ok(())
++    }
++    /// Commit only a fully completed evaluation, after cancellation checks.
++    fn commit(&mut self, run: u64, instance: &str, seq: u64) {
++        if self.selected.is_none() { self.selected = Some(instance.into()); }
++        self.watermarks.insert((run, instance.into()), seq);
 +    }
 +}
 +
@@ -8018,6 +8618,8 @@ index 0000000..08b3159
 +pub struct Evaluation {
 +    /// Protocol version.
 +    pub schema_version: u32,
++    /// Confirmed collector epoch, or legacy-v1 for original inputs.
++    pub collector_instance_id: String,
 +    /// Game identity.
 +    pub run_id: u64,
 +    /// Input sequence.
@@ -8034,6 +8636,10 @@ index 0000000..08b3159
 +    reasons: Arc<LastReasonSink>,
 +    luck: LuckScoreTracker,
 +    previous: Option<(u64, u64)>,
++    collector: CollectorGate,
++    recovery_baseline: bool,
++    luck_start: Option<(u64, u64)>,
++    previous_turn: Option<i32>,
 +}
 +
 +/// Capture enriched metadata without tying the core to stdout or JNI.
@@ -8055,7 +8661,22 @@ index 0000000..08b3159
 +            .with_stages(RamenSearchStages::parse(&config.mcts.ramen_search_stages)?)
 +            .with_friend_complete_required(config.friend_complete_required)
 +            .verbose(false).with_reason_sink(reasons.clone());
-+        Ok(Self { trainer: build_client_trainer(&config, trainer)?, reasons, luck: LuckScoreTracker::new(), previous: None })
++        Ok(Self { trainer: build_client_trainer(&config, trainer)?, reasons, luck: LuckScoreTracker::new(), previous: None,
++            collector: CollectorGate::default(), recovery_baseline: false, luck_start: None, previous_turn: None })
++    }
++
++    /// Select only a process identity confirmed through an independent capabilities/control handshake.
++    /// A new epoch resets the live luck baseline, never the old epoch's sequence watermarks.
++    pub fn select_collector_instance(&mut self, instance: &str) -> Result<()> {
++        let was_selected = self.collector.selected.is_some();
++        if self.collector.select(instance)? {
++            self.recovery_baseline = was_selected;
++            self.luck = LuckScoreTracker::new();
++            self.previous = None;
++            self.luck_start = None;
++            self.previous_turn = None;
++        }
++        Ok(())
 +    }
 +
 +    /// Evaluate a strict snapshot, retaining an ordered response.
@@ -8066,19 +8687,42 @@ index 0000000..08b3159
 +    /// Evaluate and publish each decision before computing the next substep.
 +    pub fn evaluate_json_with_sink(&mut self, raw: &str, seed: u64, cancel: CancellationToken, sink: &mut dyn FnMut(&RuntimeEvent)) -> Result<Evaluation> {
 +        cancel.check()?;
-+        let snapshot = RamenSnapshotV1::parse(raw)?;
-+        if let Some((run, seq)) = self.previous {
-+            ensure!(run != snapshot.run_id || snapshot.snapshot_id > seq, "stale_snapshot: sequence must increase within a run");
-+        }
++        let envelope = SnapshotEnvelope::parse(raw)?;
++        let snapshot = envelope.snapshot();
++        let instance = envelope.collector_instance_id();
++        self.collector.check(snapshot.run_id, instance, snapshot.snapshot_id)?;
 +        let mut game = snapshot.into_game()?;
 +        game.set_rule_master(seed);
 +        let mut rng = StdRng::seed_from_u64(seed);
 +        self.trainer.set_cancellation(cancel.clone());
-+        let mut next_luck = self.luck.clone();
-+        let mut response = Evaluation { schema_version: 1, run_id: snapshot.run_id, snapshot_id: snapshot.snapshot_id, warnings: Vec::new(), events: Vec::new() };
++        let same_run = self.previous.is_some_and(|(run, _)| run == snapshot.run_id);
++        // Epoch selection clears `previous`; the source counter is meaningful only inside that confirmed epoch.
++        let sequence_gap = self.previous.is_some_and(|(run, seq)| run == snapshot.run_id
++            && snapshot.snapshot_id.checked_sub(seq) != Some(1));
++        let turn_gap = same_run && self.previous_turn.is_some_and(|turn| snapshot.state.base_game.turn > turn + 1);
++        let history_gap = turn_gap || sequence_gap;
++        let mut next_luck = if history_gap { LuckScoreTracker::new() } else { self.luck.clone() };
++        let partial_history = if same_run { self.recovery_baseline || history_gap } else {
++            snapshot.state.base_game.turn > 0 || (self.previous.is_none() && self.recovery_baseline)
++        };
++        let luck_start = self.luck_start.filter(|(run, _)| *run == snapshot.run_id && !history_gap).map(|(_, seq)| seq).unwrap_or(snapshot.snapshot_id);
++        let mut response = Evaluation { schema_version: envelope.schema_version(), collector_instance_id: instance.into(),
++            run_id: snapshot.run_id, snapshot_id: snapshot.snapshot_id, warnings: Vec::new(), events: Vec::new() };
++        if partial_history { response.warnings.push("luck_baseline_at_recovery: earlier history is not part of this session".into()); }
++        if sequence_gap { response.warnings.push("snapshot_sequence_gap: intermediate observations were not accepted; luck baseline restarted at current complete state".into()); }
 +        if snapshot.game_version.as_deref().is_none_or(str::is_empty) { response.warnings.push("game_version_unverified".into()); }
 +        if snapshot.collector_version.as_deref().is_none_or(str::is_empty) { response.warnings.push("collector_version_unverified".into()); }
-+        let mut emit = |event: RuntimeEvent| { sink(&event); response.events.push(event); };
++        let mut emit = |mut event: RuntimeEvent| {
++            if let RuntimeEvent::Decision { decision, .. } = &mut event {
++                let extra = decision.scenario_extra.get_or_insert_with(|| json!({}));
++                extra["schema_version"] = json!(envelope.schema_version());
++                extra["collector_instance_id"] = json!(instance);
++                extra["history_complete"] = json!(!partial_history);
++                extra["luck_scope"] = json!(if partial_history { "recovery_segment" } else { "observed_session" });
++                extra["luck_segment_start_snapshot_id"] = json!(luck_start);
++            }
++            sink(&event); response.events.push(event);
++        };
 +        emit(RuntimeEvent::Started);
 +        if snapshot.stage == "settlement" {
 +            emit(RuntimeEvent::Skipped { reason: "settlement_wait_for_observation".into() });
@@ -8124,6 +8768,10 @@ index 0000000..08b3159
 +        emit(RuntimeEvent::Completed);
 +        self.luck = next_luck;
 +        self.previous = Some((snapshot.run_id, snapshot.snapshot_id));
++        self.recovery_baseline = partial_history;
++        self.luck_start = Some((snapshot.run_id, luck_start));
++        self.previous_turn = Some(snapshot.state.base_game.turn);
++        self.collector.commit(snapshot.run_id, instance, snapshot.snapshot_id);
 +        Ok(response)
 +    }
 +}
@@ -8133,6 +8781,41 @@ index 0000000..08b3159
 +    use super::*;
 +    use umasim::{gamedata::{ActionValue, EventChoice}, utils::get_workspace_root};
 +    use crate::{protocol::GameStatusBase, test_utils::Checks};
++
++    /// Recovery needs an explicit handshake and can never reactivate a retired epoch.
++    #[test]
++    fn collector_reconnect_keeps_v1_watermark_and_rejects_epoch_replay() -> Result<()> {
++        let mut checks = Checks::new();
++        let mut gate = CollectorGate::default();
++        gate.check(991, LEGACY_COLLECTOR_INSTANCE, 42)?;
++        gate.commit(991, LEGACY_COLLECTOR_INSTANCE, 42);
++        checks.check(gate.check(991, LEGACY_COLLECTOR_INSTANCE, 1).is_err(), "V1 low sequence remains stale");
++        checks.check(gate.check(991, "boot-a", 1).is_err(), "snapshot cannot implicitly handshake");
++        gate.select("boot-a")?; gate.check(991, "boot-a", 1)?; gate.commit(991, "boot-a", 1);
++        gate.select("boot-b")?; gate.check(991, "boot-b", 1)?; gate.commit(991, "boot-b", 1);
++        checks.check(gate.check(991, "boot-a", 999).is_err(), "high old epoch sequence remains retired");
++        checks.check(gate.select("boot-a").is_err(), "old epoch cannot handshake back");
++        checks.check(gate.check(991, "boot-b", 1).is_err(), "duplicate inside new epoch remains stale");
++        checks.finish()
++    }
++
++    /// V2 adds identity without weakening the original payload completeness boundary.
++    #[test]
++    fn v2_is_separate_and_rejects_incomplete_or_unsafe_identity() -> Result<()> {
++        let mut checks = Checks::new();
++        let mut value = serde_json::to_value(snapshot())?;
++        value["schema_version"] = json!(2); value["collector_instance_id"] = json!("boot-a");
++        checks.check(RamenSnapshotV1::parse(&value.to_string()).is_err(), "V1 parser does not acquire V2 semantics");
++        let parsed = SnapshotEnvelope::parse(&value.to_string())?;
++        checks.check(parsed.schema_version() == 2 && parsed.collector_instance_id() == "boot-a", "V2 identity preserved");
++        for invalid in ["", ".", "..", "a/b", "legacy-v1", "中文"] {
++            value["collector_instance_id"] = json!(invalid);
++            checks.check(SnapshotEnvelope::parse(&value.to_string()).is_err(), "unsafe identity rejected");
++        }
++        value["collector_instance_id"] = json!("boot-a"); value["ready"] = json!(false);
++        checks.check(SnapshotEnvelope::parse(&value.to_string()).is_err(), "V2 does not bypass producer veto");
++        checks.finish()
++    }
 +
 +    /// A deliberately explicit synthetic fixture; never a substitute for collector observations.
 +    fn snapshot() -> RamenSnapshotV1 {
@@ -8246,11 +8929,40 @@ index 0000000..08b3159
 +        });
 +        checks.check(search_result.is_err(), "cancellation inside rollout invalidates entire search group");
 +        // Cancel during a real search. Every rollout checks the shared handle.
-+        let mut cancelled = RamenSession::new(config)?;
++        let mut cancelled = RamenSession::new(config.clone())?;
 +        let token = CancellationToken::new();
 +        let other = token.clone();
 +        let outcome = cancelled.evaluate_json_with_sink(&raw, 42, token, &mut |event| { if matches!(event, RuntimeEvent::Started) { other.cancel(); } });
 +        checks.check(outcome.is_err(), "stream-start cancellation suppresses all decisions");
++        let mut recovery = RamenSession::new(config.clone())?;
++        let mut recovered = serde_json::to_value(snapshot())?;
++        recovered["schema_version"] = json!(2); recovered["collector_instance_id"] = json!("boot-a");
++        checks.check(recovery.evaluate_json(&recovered.to_string(), 42, CancellationToken::new()).is_err(), "V2 runtime requires handshake before search");
++        recovery.select_collector_instance("boot-a")?;
++        let first = recovery.evaluate_json(&recovered.to_string(), 42, CancellationToken::new())?;
++        recovery.select_collector_instance("boot-b")?;
++        recovered["collector_instance_id"] = json!("boot-b");
++        let resumed = recovery.evaluate_json(&recovered.to_string(), 42, CancellationToken::new())?;
++        checks.check(first.snapshot_id == resumed.snapshot_id && first.collector_instance_id != resumed.collector_instance_id, "same-run same-sequence restart accepted only after explicit new epoch");
++        checks.check(resumed.warnings.iter().any(|v| v.starts_with("luck_baseline_at_recovery")), "new baseline never presented as uninterrupted history");
++        recovered["collector_instance_id"] = json!("boot-a"); recovered["snapshot_id"] = json!(999);
++        checks.check(recovery.evaluate_json(&recovered.to_string(), 42, CancellationToken::new()).is_err(), "late old epoch is rejected by actual evaluation");
++        let mut continuity = RamenSession::new(config.clone())?;
++        continuity.select_collector_instance("continuous")?;
++        let mut observed = serde_json::to_value(snapshot())?;
++        observed["schema_version"] = json!(2); observed["collector_instance_id"] = json!("continuous");
++        continuity.evaluate_json(&observed.to_string(), 42, CancellationToken::new())?;
++        observed["snapshot_id"] = json!(2); observed["ready"] = json!(false);
++        checks.check(continuity.evaluate_json(&observed.to_string(), 42, CancellationToken::new()).is_err(), "incomplete intermediate snapshot does not commit a watermark");
++        observed["snapshot_id"] = json!(3); observed["ready"] = json!(true);
++        let gap = continuity.evaluate_json(&observed.to_string(), 42, CancellationToken::new())?;
++        checks.check(gap.warnings.iter().any(|w| w.starts_with("snapshot_sequence_gap")), "same-turn sequence gap has explicit history warning");
++        checks.check(gap.events.iter().any(|event| matches!(event, RuntimeEvent::Decision { decision, .. }
++            if decision.scenario_extra.as_ref().is_some_and(|extra| extra["history_complete"] == false && extra["luck_segment_start_snapshot_id"] == 3))),
++            "complete current state still computes with a new luck baseline after gap");
++        let mut recompute = RamenSession::new(config)?; recompute.select_collector_instance("continuous")?;
++        let fresh = recompute.evaluate_json(&observed.to_string(), 42, CancellationToken::new())?;
++        checks.check(!fresh.warnings.iter().any(|w| w.starts_with("snapshot_sequence_gap")), "new configuration/session recomputation has no invented previous sequence");
 +        checks.finish()
 +    }
 +}

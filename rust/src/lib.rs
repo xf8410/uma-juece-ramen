@@ -27,12 +27,14 @@ pub struct EngineOptions {
     pub model_path: Option<String>,
     pub deadline_ms: u64,
     pub config_id: String,
+    /// Independently confirmed process identity; never inferred from the snapshot payload.
+    pub collector_instance_id: Option<String>,
 }
 
 impl Default for EngineOptions {
     fn default() -> Self {
         Self { policy: "mcts".into(), search_n: 8192, threads: 4, seed: 61444,
-            model_path: None, deadline_ms: 0, config_id: "upstream-aligned-v1".into() }
+            model_path: None, deadline_ms: 0, config_id: "upstream-aligned-v1".into(), collector_instance_id: None }
     }
 }
 
@@ -45,6 +47,9 @@ impl EngineOptions {
         ensure!((1..=32).contains(&options.threads), "threads must be 1..32");
         ensure!(!options.config_id.is_empty() && options.config_id.len() <= 256, "invalid config_id");
         ensure!(options.deadline_ms <= 86_400_000, "deadline exceeds one day");
+        if let Some(instance) = &options.collector_instance_id {
+            if instance != umaai_runtime::LEGACY_COLLECTOR_INSTANCE { umaai_runtime::validate_collector_instance_id(instance)?; }
+        }
         if options.policy != "mcts" {
             ensure!(options.model_path.as_ref().is_some_and(|x| !x.trim().is_empty()), "selected NN mode requires a model");
         }
@@ -110,9 +115,25 @@ pub fn version() -> Value {
     let patch = lock["patch_sha256"].as_str().unwrap_or("unknown");
     let revision = option_env!("UMAAI_ENGINE_REVISION").map(String::from)
         .unwrap_or_else(|| format!("{base}+{}", &patch[..patch.len().min(12)]));
-    json!({"ok":true,"bridge_version":env!("CARGO_PKG_VERSION"),"schema_version":1,
+    json!({"ok":true,"bridge_version":env!("CARGO_PKG_VERSION"),"schema_version":1,"snapshot_schema_versions":[1,2],
         "engine_revision":revision,"onnx":cfg!(feature="onnx"),"strict_snapshots":true,
         "policies":if cfg!(feature="onnx") { vec!["mcts","mcts_nn_hint","nn"] } else { vec!["mcts"] }})
+}
+
+/// Apply the caller's capabilities handshake. This never runs implicitly during evaluate.
+/// The Java host cancels/drains the previous task before sending this control request.
+pub fn select_collector_instance(instance: &str) -> Result<Value> {
+    let mut engine = ENGINE.get_or_init(Default::default).lock().map_err(|_| anyhow!("engine lock poisoned"))?;
+    let engine = engine.as_mut().ok_or_else(|| anyhow!("engine_not_initialized"))?;
+    engine.session.select_collector_instance(instance)?;
+    Ok(json!({"ok":true,"collector_instance_id":instance,"control":"collector_selected"}))
+}
+
+/// Options bind the independently confirmed epoch; the snapshot cannot select itself.
+fn validate_request_instance(input: &umaai_runtime::SnapshotEnvelope, options: &EngineOptions) -> Result<()> {
+    let confirmed = options.collector_instance_id.as_deref().unwrap_or(umaai_runtime::LEGACY_COLLECTOR_INSTANCE);
+    ensure!(input.collector_instance_id() == confirmed, "collector_instance_mismatch: repeat capabilities handshake");
+    Ok(())
 }
 
 /// Initialize exactly one data/config generation. Changes require :engine restart.
@@ -154,7 +175,9 @@ pub fn evaluate_file(path: &Path, raw_options: &str, request_id: &str, sink: &mu
     ensure!(metadata.is_file() && metadata.len() <= MAX_SNAPSHOT_BYTES, "snapshot exceeds 8 MiB or is not a file");
     let raw = fs::read_to_string(path).context("snapshot is not UTF-8")?;
     // Parse before acquiring/initializing the simulator; incomplete input never searches.
-    let input = umaai_runtime::RamenSnapshotV1::parse(&raw)?;
+    let envelope = umaai_runtime::SnapshotEnvelope::parse(&raw)?;
+    validate_request_instance(&envelope, &options)?;
+    let input = envelope.snapshot();
     let mut guard = ENGINE.get_or_init(Default::default).lock().map_err(|_| anyhow!("engine lock poisoned"))?;
     let engine = guard.as_mut().ok_or_else(|| anyhow!("engine_not_initialized"))?;
     ensure!(engine.generation == options.generation(), "config_generation_changed: restart engine process");
@@ -174,12 +197,14 @@ pub fn evaluate_file(path: &Path, raw_options: &str, request_id: &str, sink: &mu
         }));
         for (index, event) in receiver.into_iter().enumerate() {
             sink(json!({"request_id":request_id,"run_id":input.run_id,"snapshot_id":input.snapshot_id,
+                "schema_version":envelope.schema_version(),"collector_instance_id":envelope.collector_instance_id(),
                 "config_id":options.config_id,"event_seq":index + 1,"event":event}));
         }
         worker.join().map_err(|_| anyhow!("evaluation worker panicked"))?
     })?;
     token.check()?;
     Ok(json!({"ok":true,"request_id":request_id,"config_id":options.config_id,
+        "schema_version":envelope.schema_version(),"collector_instance_id":envelope.collector_instance_id(),
         "engine_revision":version()["engine_revision"],"elapsed_ms":started.elapsed().as_millis(),
         "evaluation":evaluation}))
 }
@@ -194,6 +219,8 @@ pub fn review_run(input: &Path, output: &Path) -> Result<Value> {
     let data_manifest = fs::read(engine.data_dir.join("manifest.json")).context("active_data_manifest_missing")?;
     let actual_version = version();
     validate_review_versions(&metadata, &data_manifest, actual_version["engine_revision"].as_str().unwrap_or("unknown"))?;
+    let csv = input.join("decisions.csv");
+    if csv.is_file() { validate_review_decision_configurations(&metadata, &fs::read_to_string(csv)?)?; }
     let report = umaai_review::analyze_pack(input, output, &engine.data_dir)?;
     Ok(json!({"ok":true,"report_path":report,"digest_path":output.join("digest.json")}))
 }
@@ -208,6 +235,35 @@ fn validate_review_versions(metadata: &Value, manifest_bytes: &[u8], engine_revi
     let actual_data = sha256_hex(manifest_bytes);
     ensure!(recorded_data == actual_data,
         "review_data_version_mismatch: historical data is preserved; select the matching app/data version");
+    let history = metadata["config_history"].as_object().filter(|history| !history.is_empty())
+        .context("review_configuration_history_missing: complete review requires recorded generation versions")?;
+    let active = metadata["active_config_id"].as_str().context("review_active_configuration_missing")?;
+    ensure!(history.contains_key(active), "review_active_configuration_unrecorded");
+    for (id, generation) in history {
+        let options = generation["options"].as_object().context("review_historical_options_missing")?;
+        ensure!(options.get("config_id").and_then(Value::as_str) == Some(id.as_str()), "review_historical_configuration_identity_mismatch: {id}");
+        let versions = generation["versions"].as_object().context("review_historical_versions_missing: complete review cannot invent old provenance")?;
+        let old_engine = versions.get("engine_revision").and_then(Value::as_str).context("review_historical_engine_version_missing")?;
+        let old_data = versions.get("data_version").and_then(Value::as_str).context("review_historical_data_version_missing")?;
+        let model = versions.get("model_version").and_then(Value::as_str).context("review_historical_model_version_missing")?;
+        ensure!(old_engine == engine_revision, "review_historical_engine_version_mismatch: {id}; select the matching engine for this generation");
+        ensure!(old_data == actual_data, "review_historical_data_version_mismatch: {id}; select the matching data for this generation");
+        match options.get("policy").and_then(Value::as_str) {
+            Some("mcts") => ensure!(model == "not_used", "review_historical_model_provenance_invalid: {id}"),
+            Some("mcts_nn_hint" | "nn") => ensure!(model.len() == 64 && model.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "review_historical_model_hash_missing: {id}"),
+            _ => anyhow::bail!("review_historical_policy_missing: {id}"),
+        }
+    }
+    Ok(())
+}
+
+/// The latest metadata entry cannot cover an unrecorded historical decision configuration.
+fn validate_review_decision_configurations(metadata: &Value, csv: &str) -> Result<()> {
+    let history = metadata["config_history"].as_object().context("review_configuration_history_missing")?;
+    for id in umaai_review::recovery::recorded_configuration_ids(csv)? {
+        ensure!(history.contains_key(&id), "review_decision_configuration_unrecorded: {id}");
+    }
     Ok(())
 }
 
@@ -244,6 +300,13 @@ mod native {
         }
     }
 
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_umaai_assistant_service_UmaNativeBridge_nativeSelectCollectorInstance(
+        mut env: JNIEnv, _class: JClass, instance: JString,
+    ) -> jstring {
+        let value = guarded(|| select_collector_instance(&string(&mut env, &instance)?));
+        output(&env, value)
+    }
     #[unsafe(no_mangle)]
     pub extern "system" fn Java_com_umaai_assistant_service_UmaNativeBridge_nativeInit(
         mut env: JNIEnv, _class: JClass, data: JString, options: JString,
@@ -320,6 +383,8 @@ mod tests {
     fn seed_does_not_change_configuration_generation() {
         let a = EngineOptions::default(); let mut b = a.clone(); b.seed += 1;
         assert_eq!(a.generation(), b.generation());
+        b.collector_instance_id = Some("boot-b".into());
+        assert_eq!(a.generation(), b.generation());
         b.search_n /= 2; assert_ne!(a.generation(), b.generation());
     }
     #[test]
@@ -333,11 +398,47 @@ mod tests {
     #[test]
     fn historical_review_requires_matching_code_and_data() {
         let manifest = br#"{"engine_revision":"engine-a","files":{}}"#;
-        let meta = json!({"engine_revision":"engine-a","data_version":sha256_hex(manifest)});
+        let meta = json!({"engine_revision":"engine-a","data_version":sha256_hex(manifest),"active_config_id":"cfg",
+            "config_history":{"cfg":{"options":{"config_id":"cfg","policy":"mcts"},
+                "versions":{"engine_revision":"engine-a","data_version":sha256_hex(manifest),"model_version":"not_used"}}}});
         assert!(validate_review_versions(&meta, manifest, "engine-a").is_ok());
         assert!(validate_review_versions(&meta, manifest, "engine-b").is_err());
         let changed = br#"{"engine_revision":"engine-a","files":{"a":"changed"}}"#;
         assert!(validate_review_versions(&meta, changed, "engine-a").is_err());
         assert!(validate_review_versions(&json!({}), manifest, "engine-a").is_err());
+    }
+
+    #[test]
+    fn historical_review_checks_every_generation() {
+        let manifest = br#"{"engine_revision":"engine-a","files":{}}"#;
+        let data = sha256_hex(manifest);
+        let mut meta = json!({"engine_revision":"engine-a","data_version":data,"active_config_id":"new",
+            "config_history":{
+                "old":{"options":{"config_id":"old","policy":"mcts"},"versions":{"engine_revision":"engine-old","data_version":data,"model_version":"not_used"}},
+                "new":{"options":{"config_id":"new","policy":"mcts"},"versions":{"engine_revision":"engine-a","data_version":data,"model_version":"not_used"}}
+            }});
+        assert!(validate_review_versions(&meta, manifest, "engine-a").is_err(), "latest matching metadata must not conceal an older engine generation");
+        meta["config_history"]["old"]["versions"]["engine_revision"] = json!("engine-a");
+        meta["config_history"]["old"]["versions"]["data_version"] = json!("older-data");
+        assert!(validate_review_versions(&meta, manifest, "engine-a").is_err());
+        meta["config_history"]["old"]["versions"]["data_version"] = json!(data);
+        assert!(validate_review_versions(&meta, manifest, "engine-a").is_ok());
+        assert!(validate_review_decision_configurations(&meta,"outcome,config_id\ncalc,old\ncalc,new\n").is_ok());
+        assert!(validate_review_decision_configurations(&meta,"outcome,config_id\ncalc,unrecorded\n").is_err());
+        assert!(validate_review_decision_configurations(&meta,"outcome,config_id\ncalc,\n").is_err());
+        meta["config_history"]["old"]["options"]["policy"] = json!("nn");
+        assert!(validate_review_versions(&meta, manifest, "engine-a").is_err());
+        meta["config_history"]["old"]["versions"]["model_version"] = json!("a".repeat(64));
+        assert!(validate_review_versions(&meta, manifest, "engine-a").is_ok());
+    }
+
+    #[test]
+    fn historical_review_requires_complete_generation_provenance() {
+        let manifest = br#"{"engine_revision":"engine-a","files":{}}"#;
+        let mut meta = json!({"engine_revision":"engine-a","data_version":sha256_hex(manifest)});
+        assert!(validate_review_versions(&meta, manifest, "engine-a").is_err(), "missing historical versions must not be invented");
+        meta["active_config_id"] = json!("new");
+        meta["config_history"] = json!({"new":{"options":{"config_id":"new","policy":"mcts"}}});
+        assert!(validate_review_versions(&meta, manifest, "engine-a").is_err(), "history entries require explicit versions");
     }
 }

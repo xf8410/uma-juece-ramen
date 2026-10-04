@@ -1,7 +1,7 @@
 //! Host-side native integration. Synthetic state verifies wiring, not game capture.
 use std::{fs, path::PathBuf};
 use serde_json::{Value, json};
-use uma_jni::{cancel_request, evaluate_file, initialize_engine, version};
+use uma_jni::{cancel_request, evaluate_file, initialize_engine, select_collector_instance, version};
 use umaai_runtime::protocol::{GameStatusBase, GameStatusRamen};
 
 fn fixture() -> Value {
@@ -53,6 +53,27 @@ fn shared_engine_file_stream_cancel_and_generation() -> anyhow::Result<()> {
     let changed = json!({"search_n":4,"threads":1,"config_id":"new-generation"}).to_string();
     assert!(initialize_engine(&data, &changed).is_err());
     assert!(version()["engine_revision"].as_str().unwrap().contains('+'));
+    let mut v2 = fixture(); v2["schema_version"] = json!(2); v2["collector_instance_id"] = json!("collector-a");
+    fs::write(&snapshot, serde_json::to_vec(&v2)?)?;
+    let mut selected_options: Value = serde_json::from_str(&options)?;
+    selected_options["collector_instance_id"] = json!("collector-a");
+    assert!(evaluate_file(&snapshot, &options, "no-confirmed-option", &mut |_| {}).is_err());
+    assert!(evaluate_file(&snapshot, &selected_options.to_string(), "no-handshake", &mut |_| {}).is_err());
+    select_collector_instance("collector-a")?;
+    let mut events_a = Vec::new();
+    let a = evaluate_file(&snapshot, &selected_options.to_string(), "epoch-a", &mut |event| events_a.push(event))?;
+    assert_eq!(a["collector_instance_id"], "collector-a"); assert_eq!(a["schema_version"], 2);
+    assert!(events_a.iter().all(|event| event["collector_instance_id"] == "collector-a" && event["schema_version"] == 2));
+    v2["collector_instance_id"] = json!("collector-b");
+    fs::write(&snapshot, serde_json::to_vec(&v2)?)?;
+    assert!(evaluate_file(&snapshot, &selected_options.to_string(), "wrong-confirmed-option", &mut |_| {}).is_err());
+    selected_options["collector_instance_id"] = json!("collector-b");
+    select_collector_instance("collector-b")?;
+    let b = evaluate_file(&snapshot, &selected_options.to_string(), "epoch-b", &mut |_| {})?;
+    assert_eq!(a["evaluation"]["snapshot_id"], b["evaluation"]["snapshot_id"]);
+    assert!(b["evaluation"]["warnings"].as_array().unwrap().iter().any(|v| v.as_str().is_some_and(|s| s.starts_with("luck_baseline_at_recovery"))));
+    assert!(select_collector_instance("collector-a").is_err());
+    assert!(evaluate_file(&snapshot, &selected_options.to_string(), "epoch-b-duplicate", &mut |_| {}).is_err());
     println!("Synthetic file→shared runtime→stream: {} events; stale/cancel/config guard verified", events.len());
     Ok(())
 }

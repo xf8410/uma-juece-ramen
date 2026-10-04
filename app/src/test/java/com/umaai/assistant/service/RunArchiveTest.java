@@ -86,6 +86,6 @@ public class RunArchiveTest {
     private static String[] csvRow(File run,int line)throws Exception {
         String row=PrivateFiles.read(new File(run,"decisions.csv"),65536).split("\n")[line];
         // These fixtures deliberately contain no commas or escaped quotes in names.
-        String[] columns=row.substring(1,row.length()-1).split("\",\"",-1);assertEquals(35,columns.length);return columns;
+        String[] columns=row.substring(1,row.length()-1).split("\",\"",-1);assertEquals(43,columns.length);return columns;
     }
 }
