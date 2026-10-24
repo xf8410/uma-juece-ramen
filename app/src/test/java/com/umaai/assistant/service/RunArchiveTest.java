@@ -1,5 +1,6 @@
 package com.umaai.assistant.service;
 import java.io.*;
+import java.util.*;
 import org.json.*;
 import org.junit.*;
 import org.junit.rules.TemporaryFolder;
@@ -82,6 +83,28 @@ public class RunArchiveTest {
         JSONObject after=new JSONObject(PrivateFiles.read(new File(archive.run(9),"meta.json"),65536));
         assertEquals(2,after.getInt("snapshots"));assertEquals("b",after.getString("active_config_id"));
         assertEquals("verified-model-b",after.getJSONObject("config_history").getJSONObject("b").getJSONObject("versions").getString("model_version"));
+    }
+    @Test public void completedRunIsAnnouncedExactlyOnceForIngestion()throws Exception {
+        RunArchive archive=new RunArchive(temp.getRoot());JSONObject config=new JSONObject();
+        archive.registerConfiguration(config,new JSONObject());
+        List<Long> complete=new ArrayList<>(),incomplete=new ArrayList<>();
+        archive.setRunFinishedListener((directory,runId,done) -> (done?complete:incomplete).add(runId));
+        String settlement="{\"schema_version\":1,\"run_id\":9,\"snapshot_id\":%d,\"stage\":\"settlement\",\"game_complete\":true,"
+            +"\"state\":{\"baseGame\":{\"turn\":77,\"umaId\":123},\"ramen\":{}}}";
+        archive.capture(SnapshotEnvelope.parse(String.format(settlement,10)),config);
+        archive.capture(SnapshotEnvelope.parse(String.format(settlement,11)),config);
+        assertEquals(Collections.singletonList(9L),complete);
+        assertTrue(incomplete.isEmpty());
+    }
+    @Test public void unfinishedRunIsAnnouncedWhenClosedForIngestion()throws Exception {
+        RunArchive archive=new RunArchive(temp.getRoot());JSONObject config=new JSONObject();
+        archive.registerConfiguration(config,new JSONObject());
+        List<Long> complete=new ArrayList<>(),incomplete=new ArrayList<>();
+        archive.setRunFinishedListener((directory,runId,done) -> (done?complete:incomplete).add(runId));
+        archive.capture(snapshot(10),config);
+        archive.finish("switch");archive.finish("switch");
+        assertEquals(Collections.singletonList(9L),incomplete);
+        assertTrue(complete.isEmpty());
     }
     private static String[] csvRow(File run,int line)throws Exception {
         String row=PrivateFiles.read(new File(run,"decisions.csv"),65536).split("\n")[line];

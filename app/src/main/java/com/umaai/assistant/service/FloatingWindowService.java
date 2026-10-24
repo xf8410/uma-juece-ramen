@@ -9,6 +9,7 @@ import android.provider.Settings;
 import android.view.*;
 import android.widget.TextView;
 import androidx.core.app.NotificationCompat;
+import com.umaai.assistant.BuildConfig;
 import com.umaai.assistant.MainActivity;
 import com.umaai.assistant.R;
 import org.json.JSONArray;
@@ -33,6 +34,7 @@ public final class FloatingWindowService extends Service implements HttpDataServ
     private HttpDataService server;
     private EngineClient engine;
     private RunArchive archive;
+    private RunUploader uploader;
     private volatile JSONObject options;
     private volatile JSONObject requestedOptions;
     private SnapshotEnvelope latest;
@@ -61,6 +63,9 @@ public final class FloatingWindowService extends Service implements HttpDataServ
         startForeground(NOTIFICATION, notification("等待采集端连接"));
         if (!Settings.canDrawOverlays(this)) { publish("尚未授予悬浮窗权限"); stopSelf(); return; }
         archive = new RunArchive(getFilesDir());
+        uploader = new RunUploader(getFilesDir(),BuildConfig.UPLOAD_TOKEN);
+        archive.setRunFinishedListener((directory,runId,complete) -> uploader.enqueue(directory,runId));
+        uploader.resume();
         compact = getSharedPreferences("ramen_overlay",MODE_PRIVATE).getBoolean("compact",true);
         try {
             JSONObject initialOptions = EngineSettings.read(this); createWindows();

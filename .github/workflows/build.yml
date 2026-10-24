@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
   workflow_call:
+    secrets:
+      DATA_UPLOAD_TOKEN:
+        required: false
 
 permissions:
   contents: read
@@ -79,7 +82,19 @@ jobs:
         run: cargo test --release --locked -p umaai_runtime -p umaai_review
       - name: JNI tests
         run: cargo test --release --locked --manifest-path rust/Cargo.toml
+      - name: Report ingestion credential presence
+        env:
+          DATA_UPLOAD_TOKEN: ${{ secrets.DATA_UPLOAD_TOKEN }}
+        # 只报告是否配置，绝不回显凭证本身。
+        run: |
+          if [ -n "${DATA_UPLOAD_TOKEN:-}" ]; then
+            echo "DATA_UPLOAD_TOKEN 已配置：完成局将自动打包上传到 uma-data/training_sessions/Ramen/packs/"
+          else
+            echo "DATA_UPLOAD_TOKEN 未配置：局包只留在设备 runs/ 下，不会自动入库"
+          fi
       - name: Native build, Java tests and APK verification
+        env:
+          DATA_UPLOAD_TOKEN: ${{ secrets.DATA_UPLOAD_TOKEN }}
         run: python scripts/build_android.py --skip-prepare
       - name: Collect immutable provenance
         run: |

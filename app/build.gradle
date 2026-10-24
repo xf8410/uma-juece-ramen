@@ -6,6 +6,9 @@ def buildAbi = providers.gradleProperty('testAbi').getOrElse('arm64-v8a')
 if (!(buildAbi in ['arm64-v8a', 'x86_64'])) {
     throw new GradleException('testAbi must be arm64-v8a or x86_64')
 }
+// 训练数据入库凭证：只给 uma-data 的 contents:write 细粒度 PAT。
+// 为空时局包仅留在本机 runs/，不会尝试上传。
+def uploadToken = providers.environmentVariable('DATA_UPLOAD_TOKEN').getOrElse('')
 
 android {
     namespace 'com.umaai.assistant'
@@ -24,6 +27,7 @@ android {
         versionCode 8
         versionName "0.5.0-dev"
         buildConfigField "String", "SCENARIO_ID", '"Ramen"'
+        buildConfigField "String", "UPLOAD_TOKEN", "\"${uploadToken}\""
 
         ndk {
             abiFilters buildAbi
