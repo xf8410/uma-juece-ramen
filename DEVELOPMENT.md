@@ -21,6 +21,15 @@
 - 引擎全局数据与配置按进程加载一次；设置变更重启引擎。复盘复用同目录数据，不修改 cwd。
 - `umaai_review` 可分析标准 ZIP 或局目录，并嵌入模板生成本地事实报告。
 
+## 局包自动入库
+
+每局结束（结算、切局或进程退出）时，`RunArchive` 回调 `RunUploader`，把 `files/runs/game<id>/` 原样打包为 `game<id>.zip`，经 GitHub Contents API 上传到 `xf8410/uma-data` 的 `training_sessions/Ramen/packs/`。队列落盘在 `files/pending_packs/`，网络失败下次启动续传；上传成功后删除本地包，原始局记录仍保留在 `runs/`。
+
+- 凭证由构建环境变量 `DATA_UPLOAD_TOKEN` 注入 `BuildConfig.UPLOAD_TOKEN`；未配置时完全停用（开发包默认停用），不产生任何队列文件。
+- CI 只报告是否配置，不回显凭证；`release-apk.yml` 通过 `secrets: inherit` 传递。
+- 建议使用仅限 `xf8410/uma-data`、`contents: write` 的细粒度 PAT，不要复用全仓 token。
+- 局包是 zip（`meta.json`、`envelopes/*.json`、`decisions.csv`、`events.jsonl`），保留完整观测与决策，不做有损转换；`meta.json.complete` 区分完整局与中断局。
+
 ## 当前硬性阻塞
 
 1. **真实完整快照尚未获得。** 旧采集摘要不能证明局标识、阶段、所有人员/继承信息和原子捕获。新采集端如实返回 `ready:false` 和 `missing_fields`，不会填零或模拟历史。本轮不能宣称完成 P2 或真实整局辅助。

@@ -15,7 +15,18 @@ public final class RunArchive {
     private final Map<String,JSONObject> configurations=new HashMap<>();
     private Long activeRun;
     private final Set<Long> seenRuns=new HashSet<>();
+    /** 一局结束（完整结束 / 切局 / 进程退出）时回调；由服务层接到局包上传队列。 */
+    public interface RunFinishedListener { void onRunFinished(File runDirectory, long runId, boolean complete); }
+    private RunFinishedListener finishedListener;
+    /** capture 会把未完成局的 end_reason 预写成 incomplete，故用内存标记保证每局只通知一次。 */
+    private final Set<Long> announcedRuns = new HashSet<>();
     public RunArchive(File filesDirectory) { root = new File(filesDirectory, "runs"); }
+    public synchronized void setRunFinishedListener(RunFinishedListener listener) { finishedListener = listener; }
+    private void announceFinished(File directory, long runId, boolean complete) {
+        if (finishedListener == null || !announcedRuns.add(runId)) return;
+        try { finishedListener.onRunFinished(directory, runId, complete); }
+        catch (RuntimeException error) { android.util.Log.w("RamenArchive", "局结束回调失败 game" + runId, error); }
+    }
     public File root() { return root; }
     public File run(long id) { return new File(root, "game" + id); }
     public synchronized void registerConfiguration(JSONObject options,JSONObject values) throws Exception {
@@ -60,11 +71,13 @@ public final class RunArchive {
             .put("game_version", snapshot.json.optString("game_version", "unknown"))
             .put("updated_at_ms", System.currentTimeMillis());
         applyConfiguration(meta,options);
+        boolean wasComplete = meta.optBoolean("complete");
         boolean finished = "settlement".equals(snapshot.stage) && snapshot.turn() == 77
                 && snapshot.json.optBoolean("game_complete", false);
         if(finished)meta.put("end_reason","game_end").put("complete",true);
         else if(!meta.optBoolean("complete")&&activeRun==snapshot.runId)meta.put("end_reason","incomplete").put("complete",false);
         PrivateFiles.write(new File(directory, "meta.json"), meta.toString(2));
+        if (finished && !wasComplete) announceFinished(directory, snapshot.runId, true);
         return envelope;
     }
     public synchronized void event(EngineClient.Task task, JSONObject event) throws Exception {
@@ -112,6 +125,7 @@ public final class RunArchive {
         if(activeRun==null)return;
         File directory=run(activeRun);JSONObject meta = readMeta(directory);
         if (!meta.optBoolean("complete")) { meta.put("end_reason", reason); PrivateFiles.write(new File(directory,"meta.json"),meta.toString(2)); }
+        announceFinished(directory, activeRun, meta.optBoolean("complete"));
     }
     public static String stateName(SnapshotEnvelope s) { return "game" + s.runId + "_turn" + Math.max(0,s.turn()) + "_" + s.snapshotId + ".json"; }
     private static JSONObject readMeta(File directory) throws Exception {
